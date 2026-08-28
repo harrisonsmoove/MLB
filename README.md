@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 144 tests, no network required
+uv run pytest                      # 162 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -82,6 +82,25 @@ quota off the API's response header and spreads it over the days to
 going dark. A paid tier restores 15-minute polling with no config change.
 Details and the arithmetic are in [`deploy/README.md`](deploy/README.md).
 
+## Park orientations
+
+`cf_bearing_deg` (home plate to dead centre, degrees true north) is unset for
+all 30 active parks, so wind components resolve to null and
+`require_orientation` raises rather than guessing. A wrong bearing does not
+degrade gracefully: a 180-degree error is a plausible number that silently
+inverts every wind adjustment at that park.
+
+```bash
+mlb-edge parks bearings --missing-only         # what is left
+uv run pytest tests/test_wind_sign_convention.py
+```
+
+The convention is pinned by tests written before any bearing was entered:
+meteorological direction is where the wind blows **from**, so a 90-degree wind
+at a 90-degree-bearing park blows *in* from centre. Enter `wrigley_field`
+first — the suite checks it against the fact that a south-westerly blows out
+there, which is what catches a 180-degree flip.
+
 ## Design rules the code enforces
 
 These are not conventions. Breaking them requires editing code that exists to
@@ -150,5 +169,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          144 tests, all offline, fixtures under tests/fixtures/
+tests/          162 tests, all offline, fixtures under tests/fixtures/
 ```

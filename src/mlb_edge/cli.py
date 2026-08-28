@@ -333,6 +333,59 @@ def probe(
     warehouse.close()
 
 
+parks_app = typer.Typer(help="Park metadata and orientation.", no_args_is_help=True)
+app.add_typer(parks_app, name="parks")
+
+
+@parks_app.command("bearings")
+def parks_bearings(
+    season: Annotated[int, typer.Option(help="Season whose active parks to report.")] = 2026,
+    missing_only: Annotated[bool, typer.Option(help="List only the unmeasured parks.")] = False,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Report cf_bearing_deg coverage across active parks.
+
+    The wind feature stays disabled until these are measured -- a guessed
+    bearing is worse than a missing one, because a 180-degree error is a
+    plausible number that silently inverts every wind adjustment at that park.
+    """
+    from mlb_edge.features.park import active_parks, orientation_coverage
+
+    settings = load_settings(root)
+    have, missing = orientation_coverage(settings, season)
+    total = len(active_parks(settings, season))
+
+    table = Table(title=f"cf_bearing_deg coverage, {season} ({len(have)}/{total} measured)")
+    table.add_column("park")
+    table.add_column("bearing", justify="right")
+    table.add_column("source")
+
+    shown = missing if missing_only else sorted(have + missing, key=lambda p: p.slug)
+    for park in shown:
+        if park.has_orientation:
+            table.add_row(park.slug, f"{park.cf_bearing_deg:.0f}deg", park.orientation_source)
+        else:
+            table.add_row(park.slug, "[yellow]unset[/yellow]", "-")
+    console.print(table)
+
+    if missing:
+        console.print(
+            f"\n[yellow]{len(missing)} of {total} still unmeasured.[/yellow] Wind components "
+            "resolve to null at those parks, and features/environment raises rather than "
+            "guessing."
+        )
+        console.print(
+            "Measure home plate -> dead centre off true north, set orientation_source, "
+            "then: uv run pytest tests/test_wind_sign_convention.py"
+        )
+        console.print(
+            "[dim]Enter wrigley_field first: the suite checks it against a south-west "
+            "wind blowing out, which is what catches a 180-degree flip.[/dim]"
+        )
+    else:
+        console.print(f"\n[green]all {total} active parks measured[/green]")
+
+
 @app.command(name="build-umpire-ratings")
 def build_umpire_ratings(
     start: Annotated[str, typer.Option()],

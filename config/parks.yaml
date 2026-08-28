@@ -27,6 +27,19 @@
 #                     `mlb-edge parks derive-orientation` (OSM stadium
 #                     footprints) before enabling wind adjustments.
 
+#   HOW TO FILL cf_bearing_deg
+#   Open the park in satellite view, draw a line from home plate through second
+#   base to dead centre, and read the bearing off true north (0 = N, 90 = E,
+#   180 = S, 270 = W). Set orientation_source to say where it came from.
+#
+#   Then run: mlb-edge parks bearings
+#   and:      uv run pytest tests/test_wind_sign_convention.py
+#
+#   The test suite checks each bearing you enter against the physical fact that
+#   a wind FROM the south-west blows out at Wrigley. That is the check that
+#   catches a 180-degree flip, which is the error that matters and the one that
+#   is invisible in the number itself.
+
 defaults:
   roof: none
   cf_bearing_deg: null
@@ -152,6 +165,7 @@ parks:
     match: {venue_name: "George M. Steinbrenner Field"}
     altitude_ft: 25
     active_from: 2025
+    active_through: 2025
     notes: Rays home park for 2025. Spring training park, open air, Florida summer - a very different run environment from the Trop dome.
   - slug: sahlen_field
     match: {venue_name: "Sahlen Field"}
@@ -167,20 +181,27 @@ parks:
     notes: Blue Jays home games, early 2021.
 
   # --- neutral sites: low volume, high leverage if mis-keyed ---
+  # neutral_site excludes these from the active-park bearing coverage target.
+  # They still need a bearing if their games are ever priced on wind.
   - slug: estadio_alfredo_harp_helu
+    neutral_site: true
     match: {venue_name: "Estadio Alfredo Harp Helu"}
     altitude_ft: 7350
     notes: Mexico City. Higher than Coors. A handful of games with an extreme run environment - exclude from park factor pooling, do not let them contaminate a team's home factor.
   - slug: london_stadium
+    neutral_site: true
     match: {venue_name: "London Stadium"}
     altitude_ft: 20
   - slug: field_of_dreams
+    neutral_site: true
     match: {venue_name: "Field of Dreams"}
     altitude_ft: 1150
   - slug: rickwood_field
+    neutral_site: true
     match: {venue_name: "Rickwood Field"}
     altitude_ft: 600
   - slug: bmw_park_bowman
+    neutral_site: true
     match: {venue_name: ["BB&T Ballpark at Bowman Field", "Muncy Bank Ballpark at Bowman Field"]}
     altitude_ft: 525
     notes: Little League Classic.
