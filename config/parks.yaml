@@ -1,0 +1,186 @@
+# Park metadata that the MLB Stats API does NOT provide.
+#
+# Deliberately minimal. Anything the API is authoritative for (venue_id, name,
+# lat/lon, field dimensions) is pulled by `mlb-edge parks sync` and reconciled
+# against this file, rather than transcribed here where it would silently rot.
+#
+# Parks are keyed by venue_id (filled in by `parks sync` via match.venue_name).
+# NOTE: parks are keyed by VENUE, never by team. Teams move: the Blue Jays
+# played 2021 home games in Dunedin and Buffalo, the Athletics moved to
+# Sacramento in 2025, and the Rays played 2025 at Steinbrenner Field. Neutral
+# site games (London, Mexico City, Field of Dreams, Rickwood) are real
+# regular-season games with real park effects.
+#
+# FIELD STATUS
+#   altitude_ft     - approximate (±25 ft except Coors/Mexico City which are
+#                     the only two where the error would matter). Verify via
+#                     `parks sync` against venue lat/lon + a DEM if precision
+#                     is ever needed.
+#   roof            - none | retractable | fixed. High confidence.
+#   cf_bearing_deg  - compass bearing home plate -> centre field, degrees true.
+#                     *** UNSET FOR EVERY PARK. *** This value is required to
+#                     resolve a wind vector into an "out to centre / in from
+#                     left" component. It is NOT guessed here: a wrong bearing
+#                     produces a confidently wrong wind feature, which is worse
+#                     than no wind feature. features/environment.py raises
+#                     OrientationUnknown if it is null. Populate via
+#                     `mlb-edge parks derive-orientation` (OSM stadium
+#                     footprints) before enabling wind adjustments.
+
+defaults:
+  roof: none
+  cf_bearing_deg: null
+  orientation_source: unset
+
+parks:
+  - slug: angel_stadium
+    match: {venue_name: "Angel Stadium"}
+    altitude_ft: 160
+  - slug: busch_stadium
+    match: {venue_name: "Busch Stadium"}
+    altitude_ft: 465
+  - slug: chase_field
+    match: {venue_name: "Chase Field"}
+    altitude_ft: 1059
+    roof: retractable
+  - slug: citi_field
+    match: {venue_name: "Citi Field"}
+    altitude_ft: 20
+  - slug: citizens_bank_park
+    match: {venue_name: "Citizens Bank Park"}
+    altitude_ft: 20
+  - slug: comerica_park
+    match: {venue_name: "Comerica Park"}
+    altitude_ft: 600
+  - slug: coors_field
+    match: {venue_name: "Coors Field"}
+    altitude_ft: 5200
+    notes: >
+      The one park where altitude dominates. Needs its own handling for both
+      carry (offense up) and breaking-ball movement (pitcher stuff down), plus
+      the humidor. Do not model as a scalar multiplier.
+  - slug: daikin_park
+    match: {venue_name: ["Daikin Park", "Minute Maid Park"]}
+    altitude_ft: 45
+    roof: retractable
+    notes: Renamed from Minute Maid Park ahead of the 2025 season.
+  - slug: dodger_stadium
+    match: {venue_name: "Dodger Stadium"}
+    altitude_ft: 500
+  - slug: fenway_park
+    match: {venue_name: "Fenway Park"}
+    altitude_ft: 20
+  - slug: globe_life_field
+    match: {venue_name: "Globe Life Field"}
+    altitude_ft: 550
+    roof: retractable
+  - slug: great_american_ball_park
+    match: {venue_name: "Great American Ball Park"}
+    altitude_ft: 490
+  - slug: rate_field
+    match: {venue_name: ["Rate Field", "Guaranteed Rate Field"]}
+    altitude_ft: 595
+  - slug: kauffman_stadium
+    match: {venue_name: "Kauffman Stadium"}
+    altitude_ft: 750
+  - slug: loandepot_park
+    match: {venue_name: "loanDepot park"}
+    altitude_ft: 10
+    roof: retractable
+  - slug: american_family_field
+    match: {venue_name: "American Family Field"}
+    altitude_ft: 635
+    roof: retractable
+  - slug: nationals_park
+    match: {venue_name: "Nationals Park"}
+    altitude_ft: 25
+  - slug: oracle_park
+    match: {venue_name: "Oracle Park"}
+    altitude_ft: 10
+  - slug: camden_yards
+    match: {venue_name: "Oriole Park at Camden Yards"}
+    altitude_ft: 20
+    notes: Left field wall moved back before 2022 and partially back in 2025 - park factors are NOT stable across the backfill window.
+  - slug: petco_park
+    match: {venue_name: "Petco Park"}
+    altitude_ft: 20
+  - slug: pnc_park
+    match: {venue_name: "PNC Park"}
+    altitude_ft: 730
+  - slug: progressive_field
+    match: {venue_name: "Progressive Field"}
+    altitude_ft: 660
+  - slug: rogers_centre
+    match: {venue_name: "Rogers Centre"}
+    altitude_ft: 250
+    roof: retractable
+    notes: Outfield fully reconfigured for 2023 and again for 2024 - treat pre/post separately.
+  - slug: t_mobile_park
+    match: {venue_name: "T-Mobile Park"}
+    altitude_ft: 10
+    roof: retractable
+  - slug: target_field
+    match: {venue_name: "Target Field"}
+    altitude_ft: 815
+  - slug: tropicana_field
+    match: {venue_name: "Tropicana Field"}
+    altitude_ft: 15
+    roof: fixed
+    notes: Unused in 2025 (hurricane roof damage); Rays played at Steinbrenner Field.
+  - slug: truist_park
+    match: {venue_name: "Truist Park"}
+    altitude_ft: 1050
+  - slug: wrigley_field
+    match: {venue_name: "Wrigley Field"}
+    altitude_ft: 600
+    notes: The park where the wind component matters most. Orientation is a blocking gap here.
+  - slug: yankee_stadium
+    match: {venue_name: "Yankee Stadium"}
+    altitude_ft: 55
+
+  # --- venues used only for part of the 2021-2025 window ---
+  - slug: oakland_coliseum
+    match: {venue_name: ["Oakland Coliseum", "RingCentral Coliseum", "Oakland-Alameda County Coliseum"]}
+    altitude_ft: 10
+    active_through: 2024
+  - slug: sutter_health_park
+    match: {venue_name: "Sutter Health Park"}
+    altitude_ft: 25
+    active_from: 2025
+    notes: Athletics home park from 2025. Minor league park, different dimensions and a grass/turf change - park factors must be estimated from scratch, not inherited from Oakland.
+  - slug: steinbrenner_field
+    match: {venue_name: "George M. Steinbrenner Field"}
+    altitude_ft: 25
+    active_from: 2025
+    notes: Rays home park for 2025. Spring training park, open air, Florida summer - a very different run environment from the Trop dome.
+  - slug: sahlen_field
+    match: {venue_name: "Sahlen Field"}
+    altitude_ft: 600
+    active_from: 2021
+    active_through: 2021
+    notes: Blue Jays home games, 2021.
+  - slug: td_ballpark
+    match: {venue_name: "TD Ballpark"}
+    altitude_ft: 10
+    active_from: 2021
+    active_through: 2021
+    notes: Blue Jays home games, early 2021.
+
+  # --- neutral sites: low volume, high leverage if mis-keyed ---
+  - slug: estadio_alfredo_harp_helu
+    match: {venue_name: "Estadio Alfredo Harp Helu"}
+    altitude_ft: 7350
+    notes: Mexico City. Higher than Coors. A handful of games with an extreme run environment - exclude from park factor pooling, do not let them contaminate a team's home factor.
+  - slug: london_stadium
+    match: {venue_name: "London Stadium"}
+    altitude_ft: 20
+  - slug: field_of_dreams
+    match: {venue_name: "Field of Dreams"}
+    altitude_ft: 1150
+  - slug: rickwood_field
+    match: {venue_name: "Rickwood Field"}
+    altitude_ft: 600
+  - slug: bmw_park_bowman
+    match: {venue_name: ["BB&T Ballpark at Bowman Field", "Muncy Bank Ballpark at Bowman Field"]}
+    altitude_ft: 525
+    notes: Little League Classic.

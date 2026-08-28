@@ -1,0 +1,24 @@
+{
+  "markets": [
+    {
+      "ticker": "KXMLBGAME-25APR01NYYBOS-NYY",
+      "event_ticker": "KXMLBGAME-25APR01NYYBOS",
+      "title": "Will the New York Yankees win?",
+      "close_time": "2025-04-01T21:00:00Z",
+      "yes_bid": 59,
+      "yes_ask": 62,
+      "last_price": 60,
+      "volume": 4210,
+      "status": "active"
+    },
+    {
+      "ticker": "KXMLBGAME-UNPARSEABLE",
+      "event_ticker": "KXMLBGAME-XX",
+      "title": "Something the parser has never seen",
+      "close_time": "2025-04-01T21:00:00Z",
+      "yes_bid": 40,
+      "yes_ask": 44
+    }
+  ],
+  "cursor": ""
+}

@@ -1,0 +1,291 @@
+# mlb-edge settings.
+# Secrets are NEVER stored here. Any value of the form ${ENV_VAR} is resolved
+# from the process environment at load time and is required to be present only
+# if the owning source is enabled.
+
+project:
+  timezone: America/New_York        # scheduling / "game date" boundary
+  seasons: [2021, 2022, 2023, 2024, 2025]
+  # 2020 is deliberately excluded: 60-game season, no fans, 7-inning
+  # doubleheaders and a runner-on-2nd rule that differs from later years.
+
+paths:
+  raw: data/raw
+  warehouse: data/warehouse/mlb_edge.duckdb
+  reports: reports
+
+http:
+  timeout_seconds: 30
+  max_attempts: 5
+  backoff_initial_seconds: 2
+  backoff_max_seconds: 60
+  user_agent: "mlb-edge/0.1 (research; contact via repo owner)"
+  # The CA bundle is picked up from SSL_CERT_FILE / REQUESTS_CA_BUNDLE when set.
+
+# ---------------------------------------------------------------------------
+# Sources. `enabled: false` sources are skipped by the backfill orchestrator
+# rather than failing it.
+# ---------------------------------------------------------------------------
+sources:
+
+  mlb_statsapi:
+    enabled: true
+    base_url: https://statsapi.mlb.com/api/v1
+    rate_limit_per_minute: 120
+    # Endpoint templates. Kept in config so a shape/route change is a config
+    # edit, not a code edit.
+    endpoints:
+      schedule: "/schedule?sportId=1&startDate={start}&endDate={end}&hydrate=probablePitcher(note),linescore,venue,weather,game(content(summary)),seriesStatus"
+      game_feed: "/game/{game_pk}/feed/live"
+      boxscore: "/game/{game_pk}/boxscore"
+      venues: "/venues?hydrate=location,fieldInfo"
+      teams: "/teams?sportId=1&season={season}"
+      people: "/people?personIds={person_ids}&hydrate=stats(group=[hitting,pitching],type=[season])"
+      transactions: "/transactions?startDate={start}&endDate={end}"
+    # Lineups are only trustworthy once the API marks them official.
+    lineup_confirmed_status_codes: ["P", "PW", "S", "I", "IR", "IH", "MC", "MA", "MB", "MF", "MO", "MR", "MW"]
+
+  statcast:
+    enabled: true
+    # Baseball Savant CSV export. This is the same endpoint pybaseball drives;
+    # we call it directly so that the raw payload is cached verbatim and
+    # version-stamped before parsing (Savant silently revises history).
+    base_url: https://baseballsavant.mlb.com
+    endpoints:
+      search_csv: "/statcast_search/csv"
+    row_cap: 30000          # Savant truncates silently above this
+    chunk_days: 3           # conservative; a busy day is ~4.5k pitches
+    rate_limit_per_minute: 20
+    # Base query for the CSV export. Kept in config so a parameter rename
+    # upstream is a config edit rather than a code change.
+    query_params:
+      all: "true"
+      type: details
+      player_type: pitcher
+      min_pitches: "0"
+      min_results: "0"
+      group_by: name
+      sort_col: pitches
+      player_event_sort: api_p_release_speed
+      sort_order: desc
+      hfGT: "R|"
+    # Statcast is retroactively revised. A cached chunk is re-pulled if older
+    # than this, and any change lands as a new version rather than an overwrite.
+    revision_recheck_days: 30
+    recent_window_days: 21   # inside this window, re-pull daily
+
+  fangraphs:
+    enabled: true
+    base_url: https://www.fangraphs.com
+    endpoints:
+      projections: "/api/projections"
+    # Depth Charts is a 50/50 Steamer/ZiPS blend prorated to RosterResource
+    # playing time. THE BAT X is hitters only.
+    systems:
+      batting: [steamer, zips, thebatx, atc, fangraphsdc]
+      pitching: [steamer, zips, thebat, atc, fangraphsdc]
+    rate_limit_per_minute: 10
+    request:
+      # UNVERIFIED against live: this session had no egress to fangraphs.com.
+      # Run `mlb-edge probe fangraphs` after the first live fetch to dump the
+      # observed keys, then correct `field_map` below. The parser tolerates a
+      # wrong map by leaving columns null rather than crashing, and
+      # `mlb-edge verify` reports the null rate so a bad map is visible.
+      pos: all
+      team: "0"
+      players: "0"
+      lg: all
+    # Candidate source keys per warehouse column, tried in order. FanGraphs has
+    # changed capitalisation and naming across API versions; listing aliases is
+    # cheaper than pinning one and being wrong.
+    field_map:
+      player_id_mlbam: [xMLBAMID, mlbamid, MLBAMID, mlbam_id]
+      player_id_fangraphs: [playerid, PlayerId, playerids, PlayerID]
+      player_name: [PlayerName, Name, playerName]
+      team: [Team, team, ShortName]
+      pa: [PA]
+      ab: [AB]
+      ip: [IP]
+      tbf: [TBF]
+      k: [SO, K]
+      bb: [BB]
+      hbp: [HBP]
+      doubles: ["2B"]
+      triples: ["3B"]
+      hr: [HR]
+      hits: [H]
+      woba: [wOBA]
+      wrc_plus: [wRCplus, "wRC+", wRC_plus]
+      era: [ERA]
+      fip: [FIP]
+      k_pct: [Kpct, "K%", K_pct]
+      bb_pct: [BBpct, "BB%", BB_pct]
+      gb_pct: [GBpct, "GB%", GB_pct]
+      fb_pct: [FBpct, "FB%", FB_pct]
+
+  retrosheet:
+    enabled: true
+    base_url: https://www.retrosheet.org
+    endpoints:
+      event_zip: "/events/{season}eve.zip"
+    # Retrosheet publishes a season's event files the following spring. Stamping
+    # as_of at retrieval time would claim we knew 2024's events during 2024;
+    # this is the honest availability date and it keeps transition matrices for
+    # season N fit on seasons < N.
+    publication_mmdd: "04-01"
+    publication_year_offset: 1
+    # Retrosheet publishes a season's events the following spring.
+    seasons: [2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024]
+
+  weather:
+    enabled: true
+    # Open-Meteo: free, no key. Forecast endpoint for live use, archive
+    # endpoint for backfill (ERA5 reanalysis, ~5 day lag).
+    base_url: https://api.open-meteo.com/v1
+    archive_url: https://archive-api.open-meteo.com/v1
+    endpoints:
+      forecast: "/forecast"
+      archive: "/archive"
+    hourly_variables:
+      - temperature_2m
+      - relative_humidity_2m
+      - surface_pressure
+      - wind_speed_10m
+      - wind_direction_10m
+      - precipitation_probability
+      - cloud_cover
+    rate_limit_per_minute: 60
+
+  umpires:
+    enabled: true
+    # Home-plate umpire assignment comes from the StatsAPI game feed
+    # (officials block). Umpire *ratings* are derived in-house from Statcast
+    # called-strike data rather than scraped, so there is no third-party
+    # endpoint here.
+    derive_from: statcast
+    min_called_pitches_for_rating: 1500
+    shrinkage_prior_pitches: 3000
+
+  odds:
+    enabled: false            # requires ODDS_API_KEY
+    provider: the_odds_api
+    base_url: https://api.the-odds-api.com/v4
+    api_key: ${ODDS_API_KEY}
+    endpoints:
+      sports: "/sports"
+      odds: "/sports/{sport}/odds"
+      event_odds: "/sports/{sport}/events/{event_id}/odds"
+      historical_odds: "/historical/sports/{sport}/odds"
+    sport_key: baseball_mlb
+    # Tier 0 (free) = moneyline only, forward archive, no historical backfill.
+    tier: 0
+    regions_by_tier:
+      0: [us, eu]
+      1: [us, us2, eu, uk]
+    markets_by_tier:
+      0: [h2h]
+      1: [h2h, spreads, totals, team_totals]
+    rate_limit_per_minute: 10
+    monthly_request_budget: 500     # free tier; the poller refuses to exceed it
+
+  kalshi:
+    enabled: false            # requires KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH
+    base_url: https://api.elections.kalshi.com/trade-api/v2
+    api_key_id: ${KALSHI_API_KEY_ID}
+    private_key_path: ${KALSHI_PRIVATE_KEY_PATH}
+    endpoints:
+      exchange_status: "/exchange/status"
+      series: "/series"
+      markets: "/markets"
+      market: "/markets/{ticker}"
+      orderbook: "/markets/{ticker}/orderbook"
+      fee_schedule: "/exchange/schedule"
+    series_tickers: [KXMLBGAME, KXMLBWINNER, KXMLBTOTAL]
+    orderbook_depth: 10
+    # UNVERIFIED against live: this session had no egress to Kalshi. Ticker and
+    # title formats are matched by these patterns; run `mlb-edge probe kalshi`
+    # after the first live fetch and correct them. A market that matches none of
+    # them is counted as unmapped and skipped, never guessed into a game.
+    market_parsers:
+      - market_type: h2h
+        title_pattern: "(?i)will the (?P<team>.+?) (?:win|beat)"
+        side: team
+      - market_type: totals
+        title_pattern: "(?i)(?:total runs|combined runs).*?(?P<line>\\d+(?:\\.\\d+)?)"
+        side: over
+      - market_type: spreads
+        title_pattern: "(?i)(?P<team>.+?) (?:by|cover).*?(?P<line>[-+]?\\d+(?:\\.\\d+)?)"
+        side: team
+    # Fees are FETCHED, never hardcoded. If the fetch fails the trading path
+    # halts rather than assuming a formula.
+    fees:
+      source: fetch
+      cache_ttl_hours: 24
+      allow_hardcoded_fallback: false
+    rate_limit_per_minute: 60
+
+  polymarket:
+    enabled: false            # requires POLYMARKET_* credentials for trading
+    base_url: https://clob.polymarket.com
+    gamma_url: https://gamma-api.polymarket.com
+    endpoints:
+      markets: "/markets"
+      book: "/book"
+      books: "/books"
+      gamma_events: "/events"
+    rate_limit_per_minute: 60
+    fees:
+      source: fetch
+      cache_ttl_hours: 24
+      allow_hardcoded_fallback: false
+
+# ---------------------------------------------------------------------------
+# Downstream parameters. Not used by Milestone 1 ingestion, defined here so the
+# model/strategy layers never invent a constant inline.
+# ---------------------------------------------------------------------------
+simulation:
+  n_sims: 25000
+  random_seed: 20260101
+  extra_innings_runner_on_second: true
+
+market:
+  # Book-name to MLB-name aliases, applied after normalisation. Only entries
+  # that a name-based match genuinely cannot resolve belong here; the matcher
+  # builds the rest from the teams table so franchise renames resolve for the
+  # seasons in which each name was current.
+  team_aliases:
+    oaklandathletics: athletics
+    lasvegasathletics: athletics
+    sacramentoathletics: athletics
+    clevelandindians: cleveland guardians
+    laangels: los angeles angels
+    losangelesangelsofanaheim: los angeles angels
+
+  devig_method: power              # multiplicative | additive | power | shin
+  devig_method_by_market:
+    h2h: power
+    totals: multiplicative
+    spreads: multiplicative
+
+blend:
+  # logit(p_final) = w*logit(p_model) + (1-w)*logit(p_market) + beta
+  # w is FIT out of sample. These are inert placeholders; a fitted value near
+  # 1.0 should be treated as a bug, not a triumph.
+  weight: null
+  intercept: null
+  refit_frequency_days: 30
+
+strategy:
+  edge_shrinkage: 0.5
+  kelly_fraction: 0.25
+  min_edge_after_shrinkage: 0.015
+  max_stake_fraction_of_bankroll: 0.02
+  max_exposure_per_game_fraction: 0.04
+  max_daily_exposure_fraction: 0.10
+  drawdown_halt_fraction: 0.20     # halts and requires manual re-enable
+  paper_mode: true
+  min_paper_bets_before_live: 400
+
+eval:
+  min_bets_for_roi_claim: 500
+  bootstrap_iterations: 10000

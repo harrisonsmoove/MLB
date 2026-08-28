@@ -1,0 +1,25 @@
+# Data is never committed. The raw cache is many GB after a full backfill, and
+# the warehouse is rebuildable from it -- committing either would put a binary
+# blob in history that nobody can diff and everybody has to clone.
+data/raw/
+data/warehouse/
+*.duckdb
+*.duckdb.wal
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+.env
+*.pem
+*.key
+
+.ipynb_checkpoints/
+.DS_Store

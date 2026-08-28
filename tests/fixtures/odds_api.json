@@ -1,0 +1,83 @@
+[
+  {
+    "id": "abc123",
+    "sport_key": "baseball_mlb",
+    "commence_time": "2025-04-01T17:05:00Z",
+    "home_team": "New York Yankees",
+    "away_team": "Boston Red Sox",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2025-04-01T16:50:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2025-04-01T16:50:00Z",
+            "outcomes": [
+              {
+                "name": "New York Yankees",
+                "price": -155
+              },
+              {
+                "name": "Boston Red Sox",
+                "price": 141
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "key": "draftkings",
+        "title": "DraftKings",
+        "last_update": "2025-04-01T16:48:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2025-04-01T16:48:00Z",
+            "outcomes": [
+              {
+                "name": "New York Yankees",
+                "price": -170
+              },
+              {
+                "name": "Boston Red Sox",
+                "price": 144
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "abc124",
+    "sport_key": "baseball_mlb",
+    "commence_time": "2025-04-01T23:05:00Z",
+    "home_team": "New York Yankees",
+    "away_team": "Boston Red Sox",
+    "bookmakers": [
+      {
+        "key": "pinnacle",
+        "title": "Pinnacle",
+        "last_update": "2025-04-01T22:50:00Z",
+        "markets": [
+          {
+            "key": "h2h",
+            "last_update": "2025-04-01T22:50:00Z",
+            "outcomes": [
+              {
+                "name": "New York Yankees",
+                "price": -120
+              },
+              {
+                "name": "Boston Red Sox",
+                "price": 110
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "playerid": "19755",
+    "xMLBAMID": 600001,
+    "PlayerName": "Home Batter 1",
+    "Team": "NYY",
+    "PA": 640,
+    "AB": 560,
+    "H": 152,
+    "2B": 30,
+    "3B": 2,
+    "HR": 28,
+    "BB": 68,
+    "SO": 140,
+    "HBP": 6,
+    "wOBA": 0.352,
+    "wRCplus": 128
+  },
+  {
+    "playerid": "99999",
+    "PlayerName": "Unmapped Player",
+    "Team": "BOS",
+    "PA": 400,
+    "H": 90,
+    "2B": 18,
+    "3B": 1,
+    "HR": 12,
+    "BB": 30,
+    "SO": 95,
+    "wOBA": 0.31
+  }
+]

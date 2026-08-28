@@ -1,0 +1,157 @@
+{
+  "totalGames": 3,
+  "dates": [
+    {
+      "date": "2025-04-01",
+      "games": [
+        {
+          "gamePk": 776001,
+          "season": "2025",
+          "gameType": "R",
+          "gameDate": "2025-04-01T17:05:00Z",
+          "officialDate": "2025-04-01",
+          "status": {
+            "detailedState": "Final",
+            "statusCode": "F"
+          },
+          "teams": {
+            "home": {
+              "team": {
+                "id": 147,
+                "name": "New York Yankees"
+              },
+              "probablePitcher": {
+                "id": 543037,
+                "fullName": "Gerrit Cole",
+                "pitchHand": {
+                  "code": "R"
+                }
+              }
+            },
+            "away": {
+              "team": {
+                "id": 111,
+                "name": "Boston Red Sox"
+              },
+              "probablePitcher": {
+                "id": 605483,
+                "fullName": "Brayan Bello",
+                "pitchHand": {
+                  "code": "R"
+                }
+              }
+            }
+          },
+          "venue": {
+            "id": 3313,
+            "name": "Yankee Stadium"
+          },
+          "doubleHeader": "S",
+          "gameNumber": 1,
+          "seriesGameNumber": 1,
+          "gamesInSeries": 3,
+          "dayNight": "day",
+          "scheduledInnings": 9
+        },
+        {
+          "gamePk": 776002,
+          "season": "2025",
+          "gameType": "R",
+          "gameDate": "2025-04-01T23:05:00Z",
+          "officialDate": "2025-04-01",
+          "status": {
+            "detailedState": "Final",
+            "statusCode": "F"
+          },
+          "teams": {
+            "home": {
+              "team": {
+                "id": 147,
+                "name": "New York Yankees"
+              },
+              "probablePitcher": {
+                "id": 592332,
+                "fullName": "Carlos Rodon",
+                "pitchHand": {
+                  "code": "L"
+                }
+              }
+            },
+            "away": {
+              "team": {
+                "id": 111,
+                "name": "Boston Red Sox"
+              },
+              "probablePitcher": {
+                "id": 656302,
+                "fullName": "Tanner Houck",
+                "pitchHand": {
+                  "code": "R"
+                }
+              }
+            }
+          },
+          "venue": {
+            "id": 3313,
+            "name": "Yankee Stadium"
+          },
+          "doubleHeader": "S",
+          "gameNumber": 2,
+          "seriesGameNumber": 2,
+          "gamesInSeries": 3,
+          "dayNight": "night",
+          "scheduledInnings": 9
+        },
+        {
+          "gamePk": 776003,
+          "season": "2025",
+          "gameType": "R",
+          "gameDate": "2025-04-02T02:10:00Z",
+          "officialDate": "2025-04-01",
+          "status": {
+            "detailedState": "Final",
+            "statusCode": "F"
+          },
+          "teams": {
+            "home": {
+              "team": {
+                "id": 119,
+                "name": "Los Angeles Dodgers"
+              },
+              "probablePitcher": {
+                "id": 477132,
+                "fullName": "Clayton Kershaw",
+                "pitchHand": {
+                  "code": "L"
+                }
+              }
+            },
+            "away": {
+              "team": {
+                "id": 137,
+                "name": "San Francisco Giants"
+              },
+              "probablePitcher": {
+                "id": 664062,
+                "fullName": "Logan Webb",
+                "pitchHand": {
+                  "code": "R"
+                }
+              }
+            }
+          },
+          "venue": {
+            "id": 22,
+            "name": "Dodger Stadium"
+          },
+          "doubleHeader": "N",
+          "gameNumber": 1,
+          "seriesGameNumber": 1,
+          "gamesInSeries": 3,
+          "dayNight": "night",
+          "scheduledInnings": 9
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,835 @@
+{
+  "gamePk": 776001,
+  "gameData": {
+    "game": {
+      "pk": 776001,
+      "type": "R",
+      "season": "2025"
+    },
+    "datetime": {
+      "dateTime": "2025-04-01T17:05:00Z",
+      "officialDate": "2025-04-01"
+    },
+    "status": {
+      "detailedState": "Final",
+      "statusCode": "F"
+    },
+    "players": {
+      "ID600001": {
+        "id": 600001,
+        "fullName": "Home Batter 1",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID600002": {
+        "id": 600002,
+        "fullName": "Home Batter 2",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID600003": {
+        "id": 600003,
+        "fullName": "Home Batter 3",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID600004": {
+        "id": 600004,
+        "fullName": "Home Batter 4",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID600005": {
+        "id": 600005,
+        "fullName": "Home Batter 5",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID600006": {
+        "id": 600006,
+        "fullName": "Home Batter 6",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID600007": {
+        "id": 600007,
+        "fullName": "Home Batter 7",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID600008": {
+        "id": 600008,
+        "fullName": "Home Batter 8",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID600009": {
+        "id": 600009,
+        "fullName": "Home Batter 9",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID700001": {
+        "id": 700001,
+        "fullName": "Away Batter 1",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID700002": {
+        "id": 700002,
+        "fullName": "Away Batter 2",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID700003": {
+        "id": 700003,
+        "fullName": "Away Batter 3",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID700004": {
+        "id": 700004,
+        "fullName": "Away Batter 4",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID700005": {
+        "id": 700005,
+        "fullName": "Away Batter 5",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID700006": {
+        "id": 700006,
+        "fullName": "Away Batter 6",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID700007": {
+        "id": 700007,
+        "fullName": "Away Batter 7",
+        "batSide": {
+          "code": "L"
+        }
+      },
+      "ID700008": {
+        "id": 700008,
+        "fullName": "Away Batter 8",
+        "batSide": {
+          "code": "R"
+        }
+      },
+      "ID700009": {
+        "id": 700009,
+        "fullName": "Away Batter 9",
+        "batSide": {
+          "code": "L"
+        }
+      }
+    }
+  },
+  "liveData": {
+    "boxscore": {
+      "teams": {
+        "home": {
+          "team": {
+            "id": 147,
+            "name": "New York Yankees"
+          },
+          "battingOrder": [
+            600001,
+            600002,
+            600003,
+            600004,
+            600005,
+            600006,
+            600007,
+            600008,
+            600009
+          ],
+          "pitchers": [
+            543037,
+            543038
+          ],
+          "players": {
+            "ID600001": {
+              "person": {
+                "id": 600001,
+                "fullName": "Home Batter 1"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600002": {
+              "person": {
+                "id": 600002,
+                "fullName": "Home Batter 2"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600003": {
+              "person": {
+                "id": 600003,
+                "fullName": "Home Batter 3"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 1,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 1,
+                  "rbi": 1
+                }
+              }
+            },
+            "ID600004": {
+              "person": {
+                "id": 600004,
+                "fullName": "Home Batter 4"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600005": {
+              "person": {
+                "id": 600005,
+                "fullName": "Home Batter 5"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600006": {
+              "person": {
+                "id": 600006,
+                "fullName": "Home Batter 6"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600007": {
+              "person": {
+                "id": 600007,
+                "fullName": "Home Batter 7"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600008": {
+              "person": {
+                "id": 600008,
+                "fullName": "Home Batter 8"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID600009": {
+              "person": {
+                "id": 600009,
+                "fullName": "Home Batter 9"
+              },
+              "position": {
+                "abbreviation": "LF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID543037": {
+              "person": {
+                "id": 543037,
+                "fullName": "Gerrit Cole"
+              },
+              "position": {
+                "abbreviation": "P"
+              },
+              "stats": {
+                "pitching": {
+                  "inningsPitched": "6.2",
+                  "battersFaced": 26,
+                  "numberOfPitches": 98,
+                  "strikeOuts": 9,
+                  "baseOnBalls": 1,
+                  "hits": 4,
+                  "homeRuns": 1,
+                  "earnedRuns": 2
+                }
+              }
+            },
+            "ID543038": {
+              "person": {
+                "id": 543038,
+                "fullName": "Relief Arm"
+              },
+              "position": {
+                "abbreviation": "P"
+              },
+              "stats": {
+                "pitching": {
+                  "inningsPitched": "2.1",
+                  "battersFaced": 8,
+                  "numberOfPitches": 31,
+                  "strikeOuts": 3,
+                  "baseOnBalls": 0,
+                  "hits": 1,
+                  "homeRuns": 0,
+                  "earnedRuns": 0
+                }
+              }
+            }
+          }
+        },
+        "away": {
+          "team": {
+            "id": 111,
+            "name": "Boston Red Sox"
+          },
+          "battingOrder": [
+            700001,
+            700002,
+            700003,
+            700004,
+            700005,
+            700006,
+            700007,
+            700008,
+            700009
+          ],
+          "pitchers": [
+            605483
+          ],
+          "players": {
+            "ID700001": {
+              "person": {
+                "id": 700001,
+                "fullName": "Away Batter 1"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700002": {
+              "person": {
+                "id": 700002,
+                "fullName": "Away Batter 2"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700003": {
+              "person": {
+                "id": 700003,
+                "fullName": "Away Batter 3"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700004": {
+              "person": {
+                "id": 700004,
+                "fullName": "Away Batter 4"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700005": {
+              "person": {
+                "id": 700005,
+                "fullName": "Away Batter 5"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 1,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700006": {
+              "person": {
+                "id": 700006,
+                "fullName": "Away Batter 6"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700007": {
+              "person": {
+                "id": 700007,
+                "fullName": "Away Batter 7"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700008": {
+              "person": {
+                "id": 700008,
+                "fullName": "Away Batter 8"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID700009": {
+              "person": {
+                "id": 700009,
+                "fullName": "Away Batter 9"
+              },
+              "position": {
+                "abbreviation": "CF"
+              },
+              "batSide": {
+                "code": "R"
+              },
+              "stats": {
+                "batting": {
+                  "plateAppearances": 4,
+                  "atBats": 4,
+                  "hits": 1,
+                  "doubles": 0,
+                  "triples": 0,
+                  "homeRuns": 0,
+                  "baseOnBalls": 0,
+                  "strikeOuts": 1,
+                  "runs": 0,
+                  "rbi": 0
+                }
+              }
+            },
+            "ID605483": {
+              "person": {
+                "id": 605483,
+                "fullName": "Brayan Bello"
+              },
+              "position": {
+                "abbreviation": "P"
+              },
+              "stats": {
+                "pitching": {
+                  "inningsPitched": "5.0",
+                  "battersFaced": 22,
+                  "numberOfPitches": 89,
+                  "strikeOuts": 5,
+                  "baseOnBalls": 3,
+                  "hits": 6,
+                  "homeRuns": 1,
+                  "earnedRuns": 4
+                }
+              }
+            }
+          }
+        }
+      },
+      "officials": [
+        {
+          "official": {
+            "id": 427111,
+            "fullName": "Angel Hernandez"
+          },
+          "officialType": "Home Plate"
+        },
+        {
+          "official": {
+            "id": 427222,
+            "fullName": "First Base Ump"
+          },
+          "officialType": "First Base"
+        }
+      ]
+    },
+    "linescore": {
+      "currentInning": 9,
+      "teams": {
+        "home": {
+          "runs": 5
+        },
+        "away": {
+          "runs": 3
+        }
+      },
+      "innings": [
+        {
+          "num": 1,
+          "home": {
+            "runs": 1
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 2,
+          "home": {
+            "runs": 0
+          },
+          "away": {
+            "runs": 2
+          }
+        },
+        {
+          "num": 3,
+          "home": {
+            "runs": 2
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 4,
+          "home": {
+            "runs": 0
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 5,
+          "home": {
+            "runs": 1
+          },
+          "away": {
+            "runs": 1
+          }
+        },
+        {
+          "num": 6,
+          "home": {
+            "runs": 0
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 7,
+          "home": {
+            "runs": 1
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 8,
+          "home": {
+            "runs": 0
+          },
+          "away": {
+            "runs": 0
+          }
+        },
+        {
+          "num": 9,
+          "away": {
+            "runs": 0
+          }
+        }
+      ]
+    }
+  }
+}

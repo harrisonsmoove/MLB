@@ -1,0 +1,105 @@
+# Book roster, roles and consensus weights.
+#
+# The central discipline here: recreational books are TARGETS, not SIGNAL.
+# They get consensus_weight 0. Their price is what we bet into, never what we
+# believe. Market makers get the weight because they move first and are the
+# ones we are trying to agree with by close.
+#
+# `key` matches The Odds API bookmaker key. Adding a provider means adding a
+# key alias, not editing Python.
+
+roles:
+  market_maker: "Prices to a low margin, takes size, moves first. Signal."
+  sharp_retail: "Follows the makers within seconds. Weak signal, occasionally beatable."
+  recreational: "Prices to the public, high margin, low limits, slow to move. Target."
+  exchange: "Order book. Not a book at all - a venue where we can be the maker."
+
+consensus:
+  # Weights are renormalised over whichever books are actually present in a
+  # given snapshot. Missing Pinnacle is a loud warning, not a silent reweight.
+  method: weighted_logit_mean
+  require_market_maker: true
+  min_books_for_consensus: 2
+  weights:
+    pinnacle: 0.55
+    circasports: 0.15
+    bookmaker: 0.10
+    betonlineag: 0.10
+    lowvig: 0.05
+    prediction_market: 0.05     # only when depth clears min_depth_contracts
+  prediction_market_min_depth_contracts: 250
+
+books:
+  - key: pinnacle
+    name: Pinnacle
+    role: market_maker
+    region: eu
+    typical_hold_h2h: 0.020
+    notes: The benchmark. Its no-vig close is the CLV yardstick and the thing we are trying not to lose to.
+  - key: circasports
+    name: Circa Sports
+    role: market_maker
+    region: us
+    typical_hold_h2h: 0.025
+  - key: bookmaker
+    name: BookMaker
+    role: market_maker
+    region: us
+    typical_hold_h2h: 0.030
+  - key: betonlineag
+    name: BetOnline
+    role: sharp_retail
+    region: us
+    typical_hold_h2h: 0.035
+  - key: lowvig
+    name: LowVig
+    role: sharp_retail
+    region: us
+    typical_hold_h2h: 0.025
+
+  # --- recreational: zero consensus weight by construction ---
+  - key: draftkings
+    name: DraftKings
+    role: recreational
+    region: us
+    typical_hold_h2h: 0.045
+  - key: fanduel
+    name: FanDuel
+    role: recreational
+    region: us
+    typical_hold_h2h: 0.048
+  - key: betmgm
+    name: BetMGM
+    role: recreational
+    region: us
+    typical_hold_h2h: 0.046
+  - key: williamhill_us
+    name: Caesars
+    role: recreational
+    region: us
+    typical_hold_h2h: 0.045
+  - key: betrivers
+    name: BetRivers
+    role: recreational
+    region: us
+    typical_hold_h2h: 0.044
+
+  # --- exchanges / prediction markets: our execution venues ---
+  - key: kalshi
+    name: Kalshi
+    role: exchange
+    region: us
+    fee_model: fetched          # never hardcoded; see settings.sources.kalshi.fees
+    executable: true
+    notes: Newest MLB market, real depth data, and we can post passive inside the spread.
+  - key: polymarket
+    name: Polymarket
+    role: exchange
+    region: global
+    fee_model: fetched
+    executable: true
+
+# Only these venues may be routed an order. Everything else is signal-only,
+# and strategy/execution.py refuses to construct an order for a non-executable
+# venue even if a caller asks it to.
+executable_venues: [kalshi, polymarket]

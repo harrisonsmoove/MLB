@@ -1,0 +1,5 @@
+game_pk,game_date,at_bat_number,pitch_number,inning,inning_topbot,batter,pitcher,stand,p_throws,events,description,type,zone,balls,strikes,outs_when_up,on_1b,on_2b,on_3b,pitch_type,release_speed,plate_x,plate_z,sz_top,sz_bot,launch_speed,launch_angle,estimated_woba_using_speedangle,woba_value,woba_denom,delta_run_exp,bat_score,fld_score,bb_type
+776001,2025-04-01,1,1,1,Top,700001,543037,L,R,,called_strike,S,5,0,0,0,,,,FF,97.1,0.05,2.41,3.4,1.6,,,,,,-0.041,0,0,
+776001,2025-04-01,1,2,1,Top,700001,543037,L,R,strikeout,swinging_strike,S,14,0,2,0,,,,SL,88.2,0.61,1.42,3.4,1.6,,,,0,1,-0.118,0,0,
+776001,2025-04-01,2,1,1,Top,700002,543037,R,R,home_run,hit_into_play,X,5,0,0,1,,,,FF,96.4,-0.11,2.30,3.5,1.7,108.3,27,1.842,2.0,1,1.402,0,0,fly_ball
+776001,2025-04-01,3,1,1,Top,700003,543037,L,R,,ball,B,13,0,0,1,,,,CH,87.9,-1.42,0.91,3.4,1.6,,,,,,0.032,0,1,

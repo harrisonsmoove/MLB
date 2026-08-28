@@ -1,0 +1,21 @@
+[
+  {
+    "id": "evt1",
+    "title": "Yankees vs Red Sox",
+    "endDate": "2025-04-01T21:00:00Z",
+    "markets": [
+      {
+        "id": "m1",
+        "conditionId": "0xabc",
+        "question": "Will the New York Yankees win?",
+        "endDate": "2025-04-01T21:00:00Z",
+        "clobTokenIds": "[\"11111\",\"22222\"]",
+        "outcomes": "[\"Yes\",\"No\"]",
+        "outcomePrices": "[\"0.60\",\"0.40\"]",
+        "bestBid": 0.59,
+        "bestAsk": 0.62,
+        "volume": "18400"
+      }
+    ]
+  }
+]
