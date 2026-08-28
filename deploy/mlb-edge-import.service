@@ -1,0 +1,25 @@
+# Parse the poll archive into the warehouse.
+#
+# Separate from the poller on purpose. If this crashes, hangs, or holds the
+# DuckDB lock, the archive keeps filling regardless -- and because the archive
+# holds the original bytes, anything this misses can be imported later.
+
+[Unit]
+Description=mlb-edge poll archive import
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mlbedge
+Group=mlbedge
+WorkingDirectory=/opt/mlb-edge
+EnvironmentFile=/etc/mlb-edge/mlb-edge.env
+ExecStart=/opt/mlb-edge/.venv/bin/mlb-edge import-polls --root /opt/mlb-edge
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mlb-edge-import
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mlb-edge/data

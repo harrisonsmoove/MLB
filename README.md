@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 106 tests, no network required
+uv run pytest                      # 144 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -58,6 +58,29 @@ Kalshi and Polymarket are the execution venues. Both stay disabled until
 credentials are set and — for Kalshi — until the live fee schedule fetch
 succeeds. A failed fee fetch halts the trading path rather than falling back to
 a remembered formula.
+
+## The poller (start this first)
+
+The archive poller is the one component whose downtime cannot be recovered.
+It runs on a real box, not in a dev container:
+
+```bash
+sudo ./deploy/deploy.sh                        # see deploy/README.md
+mlb-edge poll-status                           # coverage + what the quota buys
+mlb-edge import-polls                          # parse the archive into the warehouse
+```
+
+It writes raw payloads to timestamped parquet and does no parsing at all, so a
+schema change, a parser bug, or a held DuckDB lock cannot stop the archive from
+growing. Failures are archived as rows, so a gap in the files means the daemon
+was down rather than the upstream being unhappy.
+
+The Odds API free tier is 500 credits/month and bills per region per market per
+call, which is **2.6 days** of 15-minute polling. The poller reads the remaining
+quota off the API's response header and spreads it over the days to
+`poller.season_end_date`, self-throttling to roughly three-hourly rather than
+going dark. A paid tier restores 15-minute polling with no config change.
+Details and the arithmetic are in [`deploy/README.md`](deploy/README.md).
 
 ## Design rules the code enforces
 
@@ -123,7 +146,9 @@ src/mlb_edge/
   pit.py        point-in-time reads and the leak guards
   integrity.py  the checks `verify` runs
   storage/      rawcache (append-only), schema registry, DuckDB warehouse
-  ingest/       one module per source, plus the game_pk matcher
+  poll.py       the standalone archive poller (no warehouse, no parsing)
+  ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
-tests/          106 tests, all offline, fixtures under tests/fixtures/
+deploy/         systemd units and the deploy script
+tests/          144 tests, all offline, fixtures under tests/fixtures/
 ```

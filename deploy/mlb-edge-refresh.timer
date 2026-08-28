@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh MLB schedule daily
+
+[Timer]
+# 09:00 ET, after probables are posted for the day.
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

@@ -452,3 +452,47 @@ def test_fangraphs_context_recovers_from_partition_without_a_task(settings, ware
     assert row["system"] == "fangraphsdc"
     assert row["player_type"] == "pitcher"
     assert row["snapshot_date"] == date(2025, 5, 14)
+
+
+def test_summary_and_book_quotes_coexist_in_the_same_tick(settings, loaded_warehouse):
+    """A venue's market summary and its order book are two observations, not one.
+
+    They share venue, game, market, side and timestamp, so without quote_source
+    in the key the book row is deduplicated away on insert -- silently
+    discarding the depth data that is the entire reason to poll an exchange.
+    """
+    from mlb_edge.ingest.kalshi import KalshiIngester
+
+    ingester = KalshiIngester(settings, warehouse=loaded_warehouse)
+    tick = FIRST_PITCH_G1 - timedelta(hours=2)
+
+    markets_entry = make_entry(
+        source="kalshi",
+        dataset="markets",
+        partition="KXMLBGAME_snap1",
+        retrieved_at=tick,
+        payload=fixture_bytes("kalshi_markets.json"),
+    )
+    for table, frame in ingester.parse(markets_entry, fixture_bytes("kalshi_markets.json")).items():
+        if not frame.is_empty():
+            loaded_warehouse.load(table, frame)
+
+    book_entry = make_entry(
+        source="kalshi",
+        dataset="orderbook",
+        partition="KXMLBGAME-25APR01NYYBOS-NYY_snap1",
+        # Identical timestamp: the collision case, not a convenient near-miss.
+        retrieved_at=tick,
+        payload=fixture_bytes("kalshi_orderbook.json"),
+    )
+    for table, frame in ingester.parse(book_entry, fixture_bytes("kalshi_orderbook.json")).items():
+        if not frame.is_empty():
+            loaded_warehouse.load(table, frame)
+
+    rows = loaded_warehouse.sql(
+        "SELECT quote_source, bid_size, ask_size FROM market_quotes ORDER BY quote_source"
+    )
+    assert rows.height == 2
+    assert list(rows["quote_source"]) == ["book", "summary"]
+    book = rows.filter(rows["quote_source"] == "book")
+    assert book["bid_size"][0] == 12 and book["ask_size"][0] == 500

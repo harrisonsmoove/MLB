@@ -5,7 +5,7 @@
 
 project:
   timezone: America/New_York        # scheduling / "game date" boundary
-  seasons: [2021, 2022, 2023, 2024, 2025]
+  seasons: [2021, 2022, 2023, 2024, 2025, 2026]
   # 2020 is deliberately excluded: 60-game season, no fans, 7-inning
   # doubleheaders and a runner-on-2nd rule that differs from later years.
 
@@ -13,6 +13,22 @@ paths:
   raw: data/raw
   warehouse: data/warehouse/mlb_edge.duckdb
   reports: reports
+
+# ---------------------------------------------------------------------------
+# The poller. A separate, deliberately dumb process: bytes to parquet on a
+# schedule, no parsing, no warehouse. The CLV dataset only accumulates in
+# wall-clock time, so this is the one component whose uptime cannot be made up
+# for later.
+# ---------------------------------------------------------------------------
+poller:
+  archive_dir: data/poll
+  odds_interval_seconds: 900        # 15 min -- the FLOOR, not the guarantee
+  kalshi_interval_seconds: 900      # Kalshi is not credit-metered
+  kalshi_max_orderbooks_per_tick: 120
+  # The budget horizon. The odds poller spreads its remaining credits evenly
+  # over the days to this date, so a free-tier key throttles itself to survive
+  # the season instead of burning out in 2.6 days. Update it each year.
+  season_end_date: "2026-09-28"
 
 http:
   timeout_seconds: 30

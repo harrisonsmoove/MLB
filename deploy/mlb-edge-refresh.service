@@ -1,0 +1,27 @@
+# Daily schedule refresh.
+#
+# Not optional. The poll archive stores a book's event id, two team names and a
+# commence time -- resolving those to a game_pk needs the schedule and the teams
+# dimension in the warehouse. Without this timer the archive keeps growing and
+# nothing in it can be joined to a game.
+
+[Unit]
+Description=mlb-edge schedule and probables refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mlbedge
+Group=mlbedge
+WorkingDirectory=/opt/mlb-edge
+EnvironmentFile=/etc/mlb-edge/mlb-edge.env
+ExecStart=/opt/mlb-edge/.venv/bin/mlb-edge refresh-schedule --root /opt/mlb-edge
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mlb-edge-refresh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mlb-edge/data

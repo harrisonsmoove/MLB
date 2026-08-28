@@ -223,6 +223,7 @@ class KalshiIngester(Ingester):
                     "market_type": mapped["market_type"],
                     "line": mapped["line"],
                     "side": mapped["side"],
+                    "quote_source": "summary",
                     "venue_ticker": market.get("ticker"),
                     # Kalshi quotes whole cents on a $1 contract, so a price is
                     # already a probability -- no devigging, just a spread.
@@ -279,6 +280,7 @@ class KalshiIngester(Ingester):
                     "market_type": resolved["market_type"],
                     "line": resolved["line"],
                     "side": resolved["side"],
+                    "quote_source": "book",
                     "venue_ticker": ticker,
                     "best_bid": _prob(best_bid),
                     "best_ask": _prob(best_ask),
@@ -380,7 +382,8 @@ class KalshiIngester(Ingester):
             return None
         rows = self.warehouse.sql(
             "SELECT game_pk, market_type, line, side FROM market_quotes "
-            "WHERE venue = 'kalshi' AND venue_ticker = ? ORDER BY as_of_ts DESC LIMIT 1",
+            "WHERE venue = 'kalshi' AND venue_ticker = ? AND quote_source = 'summary' "
+            "ORDER BY as_of_ts DESC LIMIT 1",
             [ticker],
         )
         return rows.row(0, named=True) if not rows.is_empty() else None

@@ -108,6 +108,28 @@ TABLES: tuple[TableSpec, ...] = (
         """,
     ),
     TableSpec(
+        name="poll_import_log",
+        kind=TableKind.META,
+        key=("archive_path", "content_sha256"),
+        as_of_column=None,
+        exempt_reason=(
+            "Bookkeeping for which poll-archive parquet files have been parsed "
+            "into the warehouse. Carries no game data and is never joined to one."
+        ),
+        ddl="""
+        CREATE TABLE IF NOT EXISTS poll_import_log (
+            archive_path      TEXT NOT NULL,
+            content_sha256    TEXT NOT NULL,
+            venue             TEXT,
+            records_read      BIGINT,
+            rows_written      BIGINT,
+            unresolved        BIGINT,
+            imported_at       TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY (archive_path, content_sha256)
+        )
+        """,
+    ),
+    TableSpec(
         name="ingest_runs",
         kind=TableKind.META,
         key=("run_id",),
@@ -570,11 +592,16 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         name="market_quotes",
         kind=TableKind.FACT,
-        key=("venue", "game_pk", "market_type", "line", "side", "as_of_ts"),
+        key=("venue", "game_pk", "market_type", "line", "side", "quote_source", "as_of_ts"),
         notes=(
             "Order-book venues. Depth is stored because it is the difference "
             "between a tradeable quote and a decoration: a 1-lot bid at 55 "
-            "against 500 offered at 58 does not mean fair value is 56.5."
+            "against 500 offered at 58 does not mean fair value is 56.5.\n\n"
+            "quote_source is part of the key because a venue's market summary "
+            "and its order book are two different observations of the same "
+            "market in the same tick: the summary carries top-of-book with no "
+            "sizes, the book carries depth. Keying without it deduplicates the "
+            "book away and silently discards the only reason to poll it."
         ),
         ddl="""
         CREATE TABLE IF NOT EXISTS market_quotes (
@@ -583,6 +610,7 @@ TABLES: tuple[TableSpec, ...] = (
             market_type       TEXT NOT NULL,
             line              DOUBLE,
             side              TEXT NOT NULL,
+            quote_source      TEXT NOT NULL DEFAULT 'summary',
             venue_ticker      TEXT,
             best_bid          DOUBLE,
             best_ask          DOUBLE,

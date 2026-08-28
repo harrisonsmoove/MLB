@@ -17,7 +17,7 @@ data. That is the half of Milestone 1 this environment could not prove.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -347,6 +347,158 @@ def build_umpire_ratings(
     builder = UmpireRatingBuilder(warehouse, settings)
     written = builder.build(_parse_date(start), _parse_date(end), cadence_days=cadence_days)
     console.print(f"umpire_ratings: {written:,} rows written")
+    warehouse.close()
+
+
+@app.command(name="poll-daemon")
+def poll_daemon(
+    once: Annotated[bool, typer.Option(help="Run a single tick per source and exit.")] = False,
+    max_ticks: Annotated[int | None, typer.Option(help="Stop after N total ticks.")] = None,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Run the archive poller. This is the process systemd supervises.
+
+    Writes raw payloads to timestamped parquet and nothing else -- no parsing,
+    no warehouse, no DuckDB lock. The CLV dataset only accumulates in wall-clock
+    time, so this process staying up matters more than anything downstream of it
+    being correct.
+    """
+    from mlb_edge.poll import PollDaemon
+
+    settings = load_settings(root)
+    daemon = PollDaemon(settings)
+    daemon.install_signal_handlers()
+    daemon.run(once=once, max_ticks=max_ticks)
+
+
+@app.command(name="refresh-schedule")
+def refresh_schedule(
+    days_ahead: Annotated[int, typer.Option(help="How far forward to pull the slate.")] = 7,
+    days_back: Annotated[int, typer.Option(help="How far back to re-pull for status changes.")] = 2,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Refresh teams, venues and the schedule around today.
+
+    Run daily. Not optional if the poll archive is to be usable: the archive
+    stores a book's team names and commence time, and resolving those to a
+    game_pk needs the schedule and teams dimension present. Looking backwards a
+    couple of days catches postponements and suspended games that get a
+    resumption date after the fact.
+    """
+    today = utcnow().date()
+    backfill(
+        start=(today - timedelta(days=days_back)).isoformat(),
+        end=(today + timedelta(days=days_ahead)).isoformat(),
+        sources="teams,venues,schedule",
+        force_refresh=False,
+        dry_run=False,
+        root=root,
+    )
+
+
+@app.command(name="poll-status")
+def poll_status(root: Annotated[Path | None, typer.Option()] = None) -> None:
+    """Archive coverage and what the odds budget still buys."""
+    from mlb_edge.poll import PollArchive, budget_forecast, season_days_remaining
+
+    settings = load_settings(root)
+    archive_root = Path(settings.section("poller").get("archive_dir", "data/poll"))
+    archive = PollArchive(
+        archive_root if archive_root.is_absolute() else settings.root / archive_root
+    )
+
+    stats = archive.stats()
+    if not stats:
+        console.print("[yellow]archive is empty -- the poller has never written a file[/yellow]")
+    else:
+        table = Table(title=f"poll archive: {archive.root}")
+        table.add_column("venue")
+        table.add_column("files", justify="right")
+        table.add_column("size", justify="right")
+        table.add_column("first")
+        table.add_column("last")
+        for venue, entry in sorted(stats.items()):
+            table.add_row(
+                venue,
+                f"{entry['files']:,}",
+                f"{entry['bytes'] / 1e6:,.1f} MB",
+                entry["first"] or "-",
+                entry["last"] or "-",
+            )
+        console.print(table)
+
+    console.print(f"\ndays left in season window: {season_days_remaining(settings)}")
+
+    quota = _latest_quota(archive)
+    if quota is None:
+        console.print(
+            "[yellow]no odds quota observed yet[/yellow] -- the poller reads it from the "
+            "API response header on its first successful call"
+        )
+        return
+
+    forecast = budget_forecast(settings, quota)
+    console.print(
+        f"odds quota remaining: [bold]{quota:,}[/bold] credits "
+        f"({forecast['credits_per_call']} per call = "
+        f"{forecast['calls_affordable']:,.0f} calls)"
+    )
+    sustainable = forecast["sustainable_interval_minutes"]
+    configured = forecast["configured_interval_minutes"]
+    if sustainable > configured:
+        console.print(
+            f"[yellow]throttled[/yellow]: sustaining the season needs "
+            f"{sustainable:,.0f} min between polls, not the configured {configured:.0f} min. "
+            f"At {configured:.0f} min this quota lasts "
+            f"{forecast['days_at_configured_interval']:.1f} days."
+        )
+    else:
+        console.print(
+            f"[green]quota is ample[/green]: polling at the configured "
+            f"{configured:.0f} min ({sustainable:,.0f} min would be sustainable)"
+        )
+
+
+def _latest_quota(archive: Any) -> int | None:
+    """Most recent non-null quota_remaining in the odds archive."""
+    import polars as pl
+
+    files = archive.files("odds")
+    for path in reversed(files):
+        frame = pl.read_parquet(path, columns=["quota_remaining"])
+        values = frame["quota_remaining"].drop_nulls()
+        if len(values):
+            return int(values[-1])
+    return None
+
+
+@app.command(name="import-polls")
+def import_polls(
+    venue: Annotated[str | None, typer.Option(help="Restrict to one venue.")] = None,
+    reimport: Annotated[
+        bool, typer.Option(help="Re-parse files already imported (after a parser fix).")
+    ] = False,
+    limit: Annotated[int | None, typer.Option(help="Import at most N files.")] = None,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Parse the poll archive into the warehouse.
+
+    Incremental by default. Because the archive holds the original bytes, a
+    parser or field-map fix applies retroactively to everything ever polled --
+    run with ``--reimport`` after making one.
+    """
+    from mlb_edge.ingest.poll_import import PollImporter
+
+    settings, warehouse, _ = _context(root)
+    importer = PollImporter(settings, warehouse)
+    report = importer.run(venue=venue, reimport=reimport, limit=limit)
+    console.print(report.summary())
+    if report.unresolved:
+        console.print(
+            f"[yellow]{report.unresolved} records unresolved[/yellow] -- usually means the "
+            "schedule is stale. Run: mlb-edge backfill --sources teams,venues,schedule "
+            "then re-run with --reimport"
+        )
     warehouse.close()
 
 

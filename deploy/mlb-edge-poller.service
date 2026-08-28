@@ -1,0 +1,52 @@
+# The archive poller. Installed to /etc/systemd/system/ by deploy/deploy.sh.
+#
+# Restart=always with a short backoff is deliberate: this process losing an hour
+# loses an hour of closing-line data that cannot be bought back at any price, so
+# the correct response to almost any failure is to come straight back up. The
+# poller writes failures into the archive as rows, so a restart loop is visible
+# in the data rather than only in the journal.
+
+[Unit]
+Description=mlb-edge odds and orderbook archive poller
+Documentation=https://github.com/harrisonsmoove/MLB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mlbedge
+Group=mlbedge
+WorkingDirectory=/opt/mlb-edge
+
+# Secrets live outside the repo, readable only by the service user.
+EnvironmentFile=/etc/mlb-edge/mlb-edge.env
+
+# The venv binary directly: systemd has no PATH to find `uv` and no writable
+# HOME for it to cache in.
+ExecStart=/opt/mlb-edge/.venv/bin/mlb-edge poll-daemon --root /opt/mlb-edge
+
+Restart=always
+RestartSec=30
+# Never give up. The default burst limit would stop the unit permanently after
+# a handful of quick failures, which for this process is the worst outcome.
+StartLimitIntervalSec=0
+
+# SIGTERM lets the daemon finish the tick in flight and rename its parquet;
+# killing mid-write is what the temp-and-rename dance exists to avoid.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mlb-edge-poller
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mlb-edge/data
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
