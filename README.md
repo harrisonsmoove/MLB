@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 162 tests, no network required
+uv run pytest                      # 214 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -81,6 +81,31 @@ quota off the API's response header and spreads it over the days to
 `poller.season_end_date`, self-throttling to roughly three-hourly rather than
 going dark. A paid tier restores 15-minute polling with no config change.
 Details and the arithmetic are in [`deploy/README.md`](deploy/README.md).
+
+## The projector
+
+In-house, Statcast-based, point-in-time. Produces the eight-way PA outcome
+multinomial the simulator draws from.
+
+```bash
+mlb-edge build-pa-outcomes                                  # pitches -> plate appearances
+mlb-edge build-projections --start 2021-04-01 --end 2026-09-28
+```
+
+Strikeouts, walks and hit-by-pitches are counted. Balls in play are **not**: the
+count of them is, and they are distributed across hit types by a league contact
+table applied to the player's own exit velocities and launch angles. A .380
+BABIP over 200 batted balls is mostly defence and park; his exit velocity is his
+own and settles far faster.
+
+Regression constants are fit by empirical Bayes at every snapshot, per bucket,
+rather than borrowed from published stabilisation points. `n_effective` in
+`pa_rates` is the Dirichlet concentration, so a 40-PA player produces a
+genuinely wider game distribution rather than a falsely confident one.
+
+See [`reports/milestone2-projector.md`](reports/milestone2-projector.md) — in
+particular the two silent bugs found on synthetic data, either of which would
+have made the projector inert while emitting plausible output.
 
 ## Park orientations
 
@@ -169,5 +194,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          162 tests, all offline, fixtures under tests/fixtures/
+tests/          214 tests, all offline, fixtures + a synthetic generator
 ```

@@ -364,6 +364,112 @@ TABLES: tuple[TableSpec, ...] = (
         """,
     ),
     TableSpec(
+        name="pa_outcomes",
+        kind=TableKind.FACT,
+        key=("game_pk", "at_bat_number"),
+        notes=(
+            "One row per plate appearance, collapsed from pitch-level Statcast. "
+            "The unit the projector and the simulator both work in.\n\n"
+            "Batted-ball columns are carried alongside the realised outcome on "
+            "purpose: exit velocity and launch angle are what the projector "
+            "actually leans on, because contact quality stabilises far faster "
+            "than the hits that happened to fall in."
+        ),
+        ddl="""
+        CREATE TABLE IF NOT EXISTS pa_outcomes (
+            game_pk           BIGINT NOT NULL,
+            at_bat_number     INTEGER NOT NULL,
+            game_date         DATE NOT NULL,
+            season            INTEGER NOT NULL,
+            batter_id         INTEGER,
+            pitcher_id        INTEGER,
+            bat_side          TEXT,
+            pit_throws        TEXT,
+            inning            INTEGER,
+            outcome           TEXT NOT NULL,
+            is_intentional_bb BOOLEAN DEFAULT FALSE,
+            launch_speed      DOUBLE,
+            launch_angle      DOUBLE,
+            bb_type           TEXT,
+            xwoba_con         DOUBLE,
+            pitches           INTEGER,
+            swings            INTEGER,
+            whiffs            INTEGER,
+            called_strikes    INTEGER,
+            as_of_ts          TIMESTAMPTZ NOT NULL,
+            """ + _PROVENANCE + """
+        )
+        """,
+    ),
+    TableSpec(
+        name="battedball_lookup",
+        kind=TableKind.FACT,
+        key=("through_date", "ev_bucket", "la_bucket"),
+        notes=(
+            "League-wide P(outcome | exit velocity, launch angle), fit on "
+            "batted balls strictly before through_date.\n\n"
+            "This is what turns contact quality into a hit-type distribution "
+            "without using the batter's own realised hits, which is the whole "
+            "point: a .380 BABIP on 200 balls in play is mostly the defence "
+            "and the ballpark, not the hitter."
+        ),
+        ddl="""
+        CREATE TABLE IF NOT EXISTS battedball_lookup (
+            through_date      DATE NOT NULL,
+            ev_bucket         INTEGER NOT NULL,
+            la_bucket         INTEGER NOT NULL,
+            n                 BIGINT NOT NULL,
+            p_1b              DOUBLE,
+            p_2b              DOUBLE,
+            p_3b              DOUBLE,
+            p_hr              DOUBLE,
+            p_out             DOUBLE,
+            as_of_ts          TIMESTAMPTZ NOT NULL,
+            """ + _PROVENANCE + """
+        )
+        """,
+    ),
+    TableSpec(
+        name="pa_rates",
+        kind=TableKind.FACT,
+        key=("system", "player_id", "player_type", "vs_hand", "through_date"),
+        notes=(
+            "The projector's output, and the simulator's direct input: a "
+            "multinomial over the eight PA outcomes.\n\n"
+            "n_effective is the Dirichlet concentration, not decoration. The "
+            "simulator draws rates from Dirichlet(n_effective * p) per "
+            "simulation, so a player with 40 PA of history produces a genuinely "
+            "wider game distribution than one with 4000 rather than a "
+            "falsely confident point estimate.\n\n"
+            "system is part of the key so the in-house projector and a "
+            "vendor projection can be stored side by side and scored against "
+            "each other after a season."
+        ),
+        ddl="""
+        CREATE TABLE IF NOT EXISTS pa_rates (
+            system            TEXT NOT NULL,
+            player_id         INTEGER NOT NULL,
+            player_type       TEXT NOT NULL,
+            vs_hand           TEXT NOT NULL,
+            through_date      DATE NOT NULL,
+            p_k               DOUBLE NOT NULL,
+            p_bb              DOUBLE NOT NULL,
+            p_hbp             DOUBLE NOT NULL,
+            p_1b              DOUBLE NOT NULL,
+            p_2b              DOUBLE NOT NULL,
+            p_3b              DOUBLE NOT NULL,
+            p_hr              DOUBLE NOT NULL,
+            p_out             DOUBLE NOT NULL,
+            n_observed        DOUBLE,
+            n_effective       DOUBLE,
+            prior_weight      DOUBLE,
+            prior_cell        TEXT,
+            as_of_ts          TIMESTAMPTZ NOT NULL,
+            """ + _PROVENANCE + """
+        )
+        """,
+    ),
+    TableSpec(
         name="projections",
         kind=TableKind.FACT,
         key=("system", "player_id", "player_type", "snapshot_date"),

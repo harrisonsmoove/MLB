@@ -5,9 +5,25 @@
 
 project:
   timezone: America/New_York        # scheduling / "game date" boundary
-  seasons: [2021, 2022, 2023, 2024, 2025, 2026]
-  # 2020 is deliberately excluded: 60-game season, no fans, 7-inning
+
+  # Data coverage. Statcast reaches back to 2015 and the projector needs those
+  # earlier seasons so that an expanding window has real depth by the time the
+  # evaluation period starts -- an April 2021 projection built on nothing is
+  # noise contaminating the earliest and most valuable walk-forward folds.
+  seasons: [2015, 2016, 2017, 2018, 2019, 2021, 2022, 2023, 2024, 2025, 2026]
+
+  # Walk-forward evaluation window. Deliberately narrower than the data: the
+  # earlier seasons exist to populate priors, not to be scored on.
+  eval_seasons: [2021, 2022, 2023, 2024, 2025, 2026]
+
+  # 2020 is excluded from both: 60-game season, no fans, seven-inning
   # doubleheaders and a runner-on-2nd rule that differs from later years.
+  #
+  # Known regime break: pitch tracking moved from Trackman to Hawk-Eye for
+  # 2020. Pre-2020 measurements are not perfectly comparable to later ones,
+  # which matters most for release-point and spin features. Batted-ball
+  # exit velocity and launch angle are the most stable across the change,
+  # which is part of why the projector leans on them.
 
 paths:
   raw: data/raw
@@ -254,6 +270,148 @@ sources:
       source: fetch
       cache_ttl_hours: 24
       allow_hardcoded_fallback: false
+
+# ---------------------------------------------------------------------------
+# Plate-appearance taxonomy.
+#
+# Statcast's `events` vocabulary maps onto the eight outcome buckets the
+# simulator draws from. Kept in config because the vocabulary grows: an event
+# that matches nothing here is COUNTED AND REPORTED, never quietly bucketed as
+# an out. A taxonomy that silently absorbs the unknown looks complete and is
+# not, and the error would land entirely in one bucket.
+# ---------------------------------------------------------------------------
+pa_outcomes:
+  buckets: [K, BB, HBP, 1B, 2B, 3B, HR, OUT]
+
+  events:
+    K: [strikeout, strikeout_double_play, strikeout_triple_play]
+    BB: [walk]
+    HBP: [hit_by_pitch]
+    1B: [single]
+    2B: [double]
+    3B: [triple]
+    HR: [home_run]
+    OUT:
+      - field_out
+      - force_out
+      - grounded_into_double_play
+      - double_play
+      - triple_play
+      - fielders_choice
+      - fielders_choice_out
+      - sac_fly
+      - sac_fly_double_play
+      - sac_bunt
+      - sac_bunt_double_play
+      - field_error
+      - other_out
+      - batter_out
+
+  # Ends a plate appearance but is not a batter outcome we model. Excluded from
+  # the denominator rather than dropped silently.
+  excluded_events: [catcher_interf, batter_interference]
+
+  # Appears in `events` on a pitch that does NOT end the plate appearance.
+  # Filtered out before PAs are counted; a runner's stolen base is not a PA.
+  non_pa_events:
+    - caught_stealing_2b
+    - caught_stealing_3b
+    - caught_stealing_home
+    - stolen_base_2b
+    - stolen_base_3b
+    - stolen_base_home
+    - pickoff_1b
+    - pickoff_2b
+    - pickoff_3b
+    - pickoff_caught_stealing_2b
+    - pickoff_caught_stealing_3b
+    - pickoff_caught_stealing_home
+    - pickoff_error_1b
+    - pickoff_error_2b
+    - pickoff_error_3b
+    - wild_pitch
+    - passed_ball
+    - balk
+    - runner_double_play
+    - other_advance
+    - defensive_indiff
+    - error
+    - cs_double_play
+    - stolen_base
+
+  # Intentional walks are a manager's decision about the situation, not a
+  # hitter's plate discipline. Flagged so the rate estimator can exclude them
+  # and leave the simulator to reintroduce them from base-out state.
+  intentional_walk_events: [intent_walk]
+  intentional_walk_descriptions: [intent_ball]
+
+  # Pitch-level `description` values, for the pitcher proxies. Whiff rate and
+  # called-strike rate stabilise much faster than strikeout rate, which is why
+  # they earn their own columns.
+  descriptions:
+    swing:
+      - swinging_strike
+      - swinging_strike_blocked
+      - foul
+      - foul_tip
+      - foul_bunt
+      - missed_bunt
+      - hit_into_play
+      - hit_into_play_score
+      - hit_into_play_no_out
+    whiff: [swinging_strike, swinging_strike_blocked, missed_bunt]
+    called_strike: [called_strike]
+
+# ---------------------------------------------------------------------------
+# The in-house projector.
+#
+# Statcast-based rather than Marcel: built on contact quality and plate
+# discipline, which stabilise far faster than the outcomes they produce, and
+# which are point-in-time computable back to 2015. Closer in spirit to THE BAT X
+# than to a three-year weighted average of results.
+#
+# Every regression constant below that could have been a hardcoded
+# "stabilisation point" is instead FIT from data by empirical Bayes. The
+# constants here are pooling strengths and window shapes -- structural choices,
+# not borrowed numbers.
+# ---------------------------------------------------------------------------
+projector:
+  system_name: inhouse_statcast
+
+  # Talent moves. Exponential rather than the usual fixed 5/4/3 season weights
+  # because there is nothing physically special about a January boundary, and a
+  # step function makes every projection jump on New Year's Day.
+  recency_halflife_days: 730
+
+  # Players below this weighted PA count do not inform the beta-binomial
+  # variance estimate. Selecting on playing time biases k upward (toward
+  # over-regression); letting 5-PA call-ups set the variance is worse.
+  min_trials_for_constant_fit: 200
+
+  # Pooling strength for league -> handedness -> experience cells.
+  hierarchy_pooling_k: 400
+
+  # Individual platoon splits need heavy shrinkage: most hitters have no stable
+  # personal platoon skill at the sample sizes available, so the prior is the
+  # player's own overall rate plus the league platoon delta for his handedness.
+  platoon_prior_k: 2000
+
+  rookie_pa_threshold: 500
+  # Pooling strength for contact-table cells toward their launch-angle band.
+  # Read as "observations at which a cell's own rate is worth as much as its
+  # band's". A few dozen batted balls already pin a five-way outcome split
+  # reasonably well, and 200 was strong enough to smooth a barrelled cell --
+  # which really is nearly all home runs -- back toward the band average.
+  # Should be tuned out-of-sample once real data exists.
+  battedball_pooling_k: 40
+
+  # How often to snapshot projections during a season. Weekly is finer than
+  # talent actually moves and keeps the table small enough to scan.
+  snapshot_cadence_days: 7
+
+  # Minimum weighted PAs before a player gets his own row rather than being
+  # served the prior cell directly.
+  min_pa_for_own_row: 1.0
 
 # ---------------------------------------------------------------------------
 # Downstream parameters. Not used by Milestone 1 ingestion, defined here so the

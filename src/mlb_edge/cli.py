@@ -386,6 +386,92 @@ def parks_bearings(
         console.print(f"\n[green]all {total} active parks measured[/green]")
 
 
+@app.command(name="build-pa-outcomes")
+def build_pa_outcomes(
+    seasons: Annotated[str | None, typer.Option(help="Comma-separated seasons; default all.")] = None,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Collapse pitch-level Statcast into plate appearances.
+
+    Reports taxonomy coverage. An `events` value matching nothing in the
+    configured taxonomy is counted and named rather than swept into OUT, so a
+    vocabulary change upstream shows up here instead of quietly biasing one
+    bucket.
+    """
+    from mlb_edge.features.pa_outcomes import PaOutcomeExtractor
+
+    settings, warehouse, _ = _context(root)
+    season_list = [int(s) for s in seasons.split(",")] if seasons else None
+
+    extractor = PaOutcomeExtractor(settings)
+    frame, report = extractor.extract(warehouse, seasons=season_list)
+    if frame.is_empty():
+        console.print("[yellow]no plate appearances extracted[/yellow] -- is statcast loaded?")
+        warehouse.close()
+        raise typer.Exit(code=1)
+
+    result = warehouse.load("pa_outcomes", frame)
+    console.print(report.summary())
+    console.print(f"pa_outcomes: {result.rows_written:,} rows written")
+    if report.unknown_events:
+        console.print(
+            f"[yellow]{len(report.unknown_events)} unrecognised event types[/yellow] -- "
+            "add them to pa_outcomes.events in settings.yaml, then re-run"
+        )
+        for event, count in report.unknown_events.most_common(15):
+            console.print(f"  {event}: {count:,}")
+    warehouse.close()
+
+
+@app.command(name="build-projections")
+def build_projections(
+    start: Annotated[str, typer.Option(help="First snapshot date, YYYY-MM-DD.")],
+    end: Annotated[str, typer.Option(help="Last snapshot date, YYYY-MM-DD.")],
+    player_types: Annotated[str, typer.Option(help="batter, pitcher, or both.")] = "batter,pitcher",
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Snapshot in-house projections on the configured cadence.
+
+    Each snapshot reads plate appearances strictly before its own date and
+    refits the contact table on the same restricted history, so a projection
+    dated 12 May knows nothing about 12 May. That is what makes these usable in
+    a walk-forward backtest rather than only going forward.
+    """
+    from mlb_edge.features.battedball import fit_batted_ball_model, model_to_frame
+    from mlb_edge.features.ratings import Projector
+
+    settings, warehouse, _ = _context(root)
+    projector = Projector(settings, warehouse)
+    dates = projector.snapshot_dates(_parse_date(start), _parse_date(end))
+    types = [t.strip() for t in player_types.split(",") if t.strip()]
+
+    console.print(f"{len(dates)} snapshots x {len(types)} player types")
+    total = 0
+    for snapshot in dates:
+        # One contact table per snapshot, shared by batters and pitchers: it is
+        # a league-wide table, and refitting it twice would only cost time.
+        model = fit_batted_ball_model(
+            warehouse,
+            through=snapshot,
+            pooling_k=float(settings.section("projector").get("battedball_pooling_k", 40)),
+        )
+        lookup = model_to_frame(model)
+        if not lookup.is_empty():
+            warehouse.load("battedball_lookup", lookup)
+
+        for player_type in types:
+            rates, report = projector.build(snapshot, player_type=player_type, model=model)
+            if rates.is_empty():
+                console.print(f"  {snapshot} {player_type}: no data")
+                continue
+            written = warehouse.load("pa_rates", rates).rows_written
+            total += written
+            console.print(f"  {player_type}: {report.summary()} -> {written:,} rows")
+
+    console.print(f"\npa_rates: {total:,} rows written")
+    warehouse.close()
+
+
 @app.command(name="build-umpire-ratings")
 def build_umpire_ratings(
     start: Annotated[str, typer.Option()],
