@@ -35,6 +35,19 @@ from mlb_edge.timeutil import utcnow
 
 
 @dataclass(frozen=True)
+class Fallback:
+    """A reduced request, and what using it costs.
+
+    The note is not decoration. An unannounced degrade is how a null in
+    ``probable_pitchers`` becomes "no starter announced" instead of "we did not
+    ask for it", and nothing downstream can tell those apart.
+    """
+
+    url: str
+    note: str
+
+
+@dataclass(frozen=True)
 class FetchTask:
     """One addressable unit of upstream data."""
 
@@ -51,14 +64,16 @@ class FetchTask:
     # it is pure waste. Statcast is the counterexample and sets a real TTL.
     max_age_seconds: float | None = None
     context: dict[str, Any] = field(default_factory=dict)
-    #: A reduced URL to retry with when the upstream rejects the full request.
-    #: StatsAPI answers an unrecognised hydrate term with 406 for the WHOLE
+    #: Reduced requests to try, in order, when the upstream rejects the full
+    #: one. StatsAPI answers an unrecognised hydrate term with 406 for the WHOLE
     #: request rather than ignoring the term, so one stale term otherwise
     #: returns nothing at all. Partial data with a named gap beats no data.
-    fallback_url: str | None = None
-    #: What is missing when the fallback is used. Printed and recorded -- an
-    #: unannounced degrade is how nulls become "no starter announced".
-    fallback_note: str = ""
+    #:
+    #: Ordered most-complete first, so a rejected sub-hydration costs only the
+    #: sub-hydration. Going straight to the barest option would have thrown away
+    #: the probable starters over a rejected `probablePitcher(note)` while bare
+    #: `probablePitcher` was returning 200.
+    fallbacks: tuple[Fallback, ...] = ()
 
 
 @dataclass
@@ -159,26 +174,36 @@ class Ingester(ABC):
             try:
                 entry, is_new = self._fetch_and_store(task, force_refresh=force_refresh)
             except UpstreamError as exc:
-                if task.fallback_url is None or not is_hydrate_rejection(exc.status):
+                if not task.fallbacks or not is_hydrate_rejection(exc.status):
                     report.failures.append(f"{task.dataset}/{task.partition}: {exc}")
                     continue
-                note = (
-                    f"{task.dataset}/{task.partition}: HTTP {exc.status} on the full "
-                    f"request; retried reduced. {task.fallback_note}"
-                )
-                print(f"[ingest] WARN: {note}", flush=True)
-                try:
-                    entry, is_new = self._fetch_and_store(
-                        replace(task, url=task.fallback_url, fallback_url=None),
-                        force_refresh=force_refresh,
+
+                # Walk the chain most-complete first and stop at the first one
+                # that works, so a rejection costs only what it has to.
+                entry = None
+                last = exc
+                for step in task.fallbacks:
+                    note = (
+                        f"{task.dataset}/{task.partition}: HTTP {exc.status} on the "
+                        f"full request; retried reduced. {step.note}"
                     )
-                except UpstreamError as inner:
+                    try:
+                        entry, is_new = self._fetch_and_store(
+                            replace(task, url=step.url, fallbacks=()),
+                            force_refresh=force_refresh,
+                        )
+                    except UpstreamError as inner:
+                        last = inner
+                        continue
+                    print(f"[ingest] WARN: {note}", flush=True)
+                    report.degraded.append(note)
+                    break
+                if entry is None:
                     report.failures.append(
-                        f"{task.dataset}/{task.partition}: {exc}; reduced retry also "
-                        f"failed: {inner}"
+                        f"{task.dataset}/{task.partition}: {exc}; every reduced retry "
+                        f"also failed, last: {last}"
                     )
                     continue
-                report.degraded.append(note)
 
             if is_new:
                 report.tasks_fetched += 1

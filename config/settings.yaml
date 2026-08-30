@@ -141,13 +141,31 @@ sources:
     # dropped individually instead of the request being abandoned. Order is
     # preserved. `mlb-edge probe-hydrate` tests each one against the live API
     # and prints the terms this list should contain.
+    # Measured against the live API on 2026-08-30 with `mlb-edge probe-hydrate`,
+    # not assumed. StatsAPI 406s the whole request on any term it does not
+    # accept, so this list is only what actually returned 200:
+    #
+    #   probablePitcher          200   <- bare works
+    #   probablePitcher(note)    406   <- the SUB-HYDRATION is what fails
+    #   linescore                200
+    #   venue                    406   (redundant anyway: the venues endpoint)
+    #   weather                  406   <- see note below
+    #   seriesStatus             406
+    #   game(content(summary))   406
+    #
+    # The first two lines are the reason probe-hydrate probes base terms
+    # separately. "probablePitcher(note) rejected" is not "probablePitcher
+    # rejected", and dropping the term over its sub-field would have cost the
+    # probable starters -- which the simulator keys on, and whose absence reads
+    # as "no starter announced" rather than as a bug.
+    #
+    # Losing `weather` here costs nothing: the weather source is a separate
+    # ingester writing weather_hourly, with its own forecast-vs-observation PIT
+    # rule. Losing `venue` costs nothing either -- the venues endpoint is the
+    # real source. Do not reintroduce either without re-probing.
     schedule_hydrate:
-      - probablePitcher(note)
+      - probablePitcher
       - linescore
-      - venue
-      - weather
-      - game(content(summary))
-      - seriesStatus
     # Lineups are only trustworthy once the API marks them official.
     lineup_confirmed_status_codes: ["P", "PW", "S", "I", "IR", "IH", "MC", "MA", "MB", "MF", "MO", "MR", "MW"]
 

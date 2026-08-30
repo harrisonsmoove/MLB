@@ -998,7 +998,7 @@ def probe_hydrate(
     from datetime import date as _date
 
     from mlb_edge.http import UpstreamError, client_for
-    from mlb_edge.hydrate import bisect_terms, hydrate_string
+    from mlb_edge.hydrate import Verdict, bisect_terms, hydrate_string
 
     settings = load_settings(root)
     source = settings.source("mlb_statsapi")
@@ -1040,18 +1040,39 @@ def probe_hydrate(
 
     result = bisect_terms(terms, probe)
 
+    colours = {
+        Verdict.KEEP: "green",
+        Verdict.STRIP: "yellow",
+        Verdict.DROP: "red",
+        Verdict.INCONCLUSIVE: "yellow",
+    }
     table = Table(title="hydrate terms")
-    table.add_column("term")
+    table.add_column("term as configured")
+    table.add_column("status", justify="right")
+    table.add_column("base term")
     table.add_column("status", justify="right")
     table.add_column("verdict")
     table.add_row(
         "[dim](none -- bare call)[/dim]",
         "",
-        "[green]accepted[/green]" if result.baseline_ok else f"[red]FAILED[/red] {result.baseline_detail}",
+        "",
+        "",
+        "[green]accepted[/green]"
+        if result.baseline_ok
+        else f"[red]FAILED[/red] {result.baseline_detail}",
     )
     for entry in result.terms:
-        colour = "green" if entry.ok else ("red" if entry.verdict == "REJECTED" else "yellow")
-        table.add_row(entry.term, str(entry.status or "-"), f"[{colour}]{entry.verdict}[/{colour}]")
+        # The base column is the whole point: "probablePitcher(note) rejected"
+        # is not "probablePitcher rejected", and collapsing the two costs the
+        # probable starters.
+        same = entry.base == entry.term
+        table.add_row(
+            entry.term,
+            str(entry.status or "-"),
+            "[dim]same[/dim]" if same else entry.base,
+            "" if entry.base_status is None else str(entry.base_status),
+            f"[{colours[entry.verdict]}]{entry.describe()}[/{colours[entry.verdict]}]",
+        )
     console.print(table)
 
     if result.combined_ok is False:
@@ -1060,14 +1081,19 @@ def probe_hydrate(
             "That points at the combination or the URL length, not one term."
         )
     console.print(f"\n{result.suggestion()}")
-    if result.rejected:
-        remaining = [x for x in terms if x not in result.rejected]
+    if result.stripped or result.rejected:
+        corrected = result.corrected_terms()
         console.print(
-            "\nThe games spine does not need any of these -- the completeness check "
-            "already uses the unhydrated endpoint, and the ingester degrades to it. "
-            "Fixing this restores probable pitchers, venue, weather and linescore."
+            "\nThe games spine needs none of these -- the completeness check uses "
+            "the unhydrated endpoint and the ingester degrades. What this restores "
+            "is the hydrated extras."
         )
-        console.print(f"\nResulting hydrate: [bold]{hydrate_string(remaining) or '(none)'}[/bold]")
+        console.print("\nsources.mlb_statsapi.schedule_hydrate should be:")
+        for term in corrected:
+            console.print(f"  - {term}")
+        if not corrected:
+            console.print("  [dim](empty -- every term was rejected)[/dim]")
+        console.print(f"\nResulting hydrate: [bold]{hydrate_string(corrected) or '(none)'}[/bold]")
         raise typer.Exit(1)
 
 

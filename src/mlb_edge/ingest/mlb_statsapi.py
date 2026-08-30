@@ -20,8 +20,8 @@ from typing import Any
 
 import polars as pl
 
-from mlb_edge.hydrate import hydrate_string
-from mlb_edge.ingest.base import FetchTask, Ingester, provenance_columns
+from mlb_edge.hydrate import hydrate_string, strip_sub_hydrations
+from mlb_edge.ingest.base import Fallback, FetchTask, Ingester, provenance_columns
 from mlb_edge.storage.rawcache import RawEntry
 from mlb_edge.timeutil import game_date_for, parse_iso_utc, utcnow
 
@@ -48,6 +48,52 @@ def _as_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _schedule_fallbacks(
+    config: Any, terms: list[str], start: date, end: date
+) -> tuple[Fallback, ...]:
+    """Reduced schedule requests to try, in order, when the full one is rejected.
+
+    Ordered by how much is kept. The first step drops only sub-hydrations, which
+    is the failure actually seen against the live API; the second drops hydrate
+    entirely and is the guaranteed floor.
+    """
+    steps: list[Fallback] = []
+    stripped = strip_sub_hydrations(terms)
+    if stripped and stripped != list(terms):
+        lost = [t for t in terms if t not in stripped]
+        steps.append(
+            Fallback(
+                url=config.endpoint(
+                    "schedule",
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    hydrate=hydrate_string(stripped),
+                ),
+                note=(
+                    "sub-hydrations dropped ("
+                    + ", ".join(lost)
+                    + "); the base terms and everything else are intact"
+                ),
+            )
+        )
+    steps.append(
+        Fallback(
+            url=config.endpoint(
+                "schedule_minimal", start=start.isoformat(), end=end.isoformat()
+            ),
+            note=(
+                "ALL hydration dropped: "
+                + (", ".join(terms) or "none configured")
+                + " are ABSENT for this range -- absent, not 'not announced'. Run "
+                "`mlb-edge probe-hydrate`, fix "
+                "sources.mlb_statsapi.schedule_hydrate, then re-run with "
+                "--force-refresh."
+            ),
+        )
+    )
+    return tuple(steps)
 
 
 class MlbScheduleIngester(Ingester):
@@ -77,20 +123,15 @@ class MlbScheduleIngester(Ingester):
                         hydrate=hydrate_string(terms),
                     ),
                     # StatsAPI 406s the whole request on one unrecognised
-                    # hydrate term. The games spine matters more than the
-                    # hydrated extras, so a rejection degrades to the bare call
-                    # rather than losing the range entirely.
-                    fallback_url=self.config.endpoint(
-                        "schedule_minimal",
-                        start=cursor.isoformat(),
-                        end=chunk_end.isoformat(),
-                    ),
-                    fallback_note=(
-                        "probable_pitchers, venue, weather and linescore are ABSENT "
-                        "for this range -- they are not 'not announced'. Run "
-                        "`mlb-edge probe-hydrate` to find the rejected term, fix "
-                        "sources.mlb_statsapi.schedule_hydrate, then re-run with "
-                        "--force-refresh."
+                    # hydrate term, so a rejection degrades rather than losing
+                    # the range. Two steps, not one: sub-hydrations are stripped
+                    # first, because the observed failure was a rejected
+                    # `probablePitcher(note)` while bare `probablePitcher`
+                    # returned 200. Going straight to the bare call would throw
+                    # away the probable starters over a sub-field -- and the
+                    # simulator keys on the starter matchup.
+                    fallbacks=_schedule_fallbacks(
+                        self.config, terms, cursor, chunk_end
                     ),
                     max_age_seconds=_schedule_ttl(chunk_end, today),
                     context={"start": cursor.isoformat(), "end": chunk_end.isoformat()},

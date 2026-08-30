@@ -195,6 +195,57 @@ class Settings:
         return value
 
 
+#: Deployment-local overrides, layered over settings.yaml. Git-ignored, and
+#: deploy.sh never writes it after creating it once.
+LOCAL_CONFIG_NAME = "local.yaml"
+
+_announced_overlays: set[Path] = set()
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any], prefix: str = "") -> tuple[dict[str, Any], list[str]]:
+    """Overlay wins at the leaves. Returns the merged mapping and what changed."""
+    merged = dict(base)
+    changed: list[str] = []
+    for key, value in overlay.items():
+        path = f"{prefix}{key}"
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key], nested = _deep_merge(merged[key], value, prefix=f"{path}.")
+            changed.extend(nested)
+        else:
+            if merged.get(key) != value:
+                changed.append(path)
+            merged[key] = value
+    return merged, changed
+
+
+def _apply_local_overlay(raw: dict[str, Any], path: Path) -> dict[str, Any]:
+    """Layer ``config/local.yaml`` over the repo settings, and say what it changed.
+
+    This exists because ``deploy.sh`` runs ``git reset --hard``, which reverted
+    hand-edited flags in ``settings.yaml`` on every deploy -- silently, and with
+    the line numbers moving each time. Splitting the two means shipped config
+    changes still land while deployment-local ones survive.
+
+    The override is announced. A file that quietly changes which sources are
+    enabled is exactly the kind of thing a future debugging session would not
+    think to look for; a single line naming the overridden paths costs nothing
+    and removes the surprise.
+    """
+    if not path.is_file():
+        return raw
+    overlay = _read_yaml(path)
+    merged, changed = _deep_merge(raw, overlay)
+    if changed and path not in _announced_overlays:
+        _announced_overlays.add(path)
+        print(
+            f"[config] {path} overrides {len(changed)} setting(s): "
+            + ", ".join(sorted(changed)[:8])
+            + (" ..." if len(changed) > 8 else ""),
+            flush=True,
+        )
+    return merged
+
+
 def load_settings(root: Path | None = None) -> Settings:
     """Load and validate configuration. Not cached -- tests build variants."""
     if root is None:
@@ -204,6 +255,7 @@ def load_settings(root: Path | None = None) -> Settings:
 
     config_dir = root / "config"
     settings_raw = _read_yaml(config_dir / "settings.yaml")
+    settings_raw = _apply_local_overlay(settings_raw, config_dir / LOCAL_CONFIG_NAME)
     parks_raw = _read_yaml(config_dir / "parks.yaml")
     books_raw = _read_yaml(config_dir / "books.yaml")
 

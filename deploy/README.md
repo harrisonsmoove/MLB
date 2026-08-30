@@ -166,3 +166,36 @@ unrepeatable; understanding them is neither.
 sudo systemctl stop mlb-edge-poller            # graceful: finishes the tick in flight
 sudo systemctl disable --now mlb-edge-poller mlb-edge-refresh.timer mlb-edge-import.timer
 ```
+
+
+## Box-specific config
+
+`deploy.sh` runs `git reset --hard`, so **hand edits to `config/settings.yaml`
+do not survive a deploy**. That is deliberate — it is how shipped config fixes
+reach the box — but it means local settings need somewhere else to live.
+
+That place is **`config/local.yaml`**, which is git-ignored, layered over
+`settings.yaml` at load time, and never rewritten by deploy after it is first
+created:
+
+```yaml
+sources:
+  odds:
+    enabled: true
+  kalshi:
+    enabled: true
+```
+
+The merge is deep, so overriding one key leaves its siblings alone, and the
+overridden paths are printed on load — a file that silently changes which
+sources are enabled is not something a later debugging session would think to
+look for.
+
+The first deploy writes this file, setting each `enabled` flag from whether the
+matching credential is actually present in `/etc/mlb-edge/mlb-edge.env`. A
+source enabled without its key fails config validation at startup, which is the
+right behaviour and an unhelpful thing to arrive at by default.
+
+If `config/` has uncommitted edits when you deploy, they are copied to
+`data/config-backups/<timestamp>/` (with a diff) before the reset, and the log
+says so.

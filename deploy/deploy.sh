@@ -55,6 +55,23 @@ log "uv: ${UV_BIN} ($("$UV_BIN" --version))"
 # --- 3. source -------------------------------------------------------------
 if [[ -d "$APP_DIR/.git" ]]; then
   log "updating ${APP_DIR} (${BRANCH})"
+  # `reset --hard` below discards working-tree changes. Tracked config edited by
+  # hand on the box is real work, and losing it silently on every deploy is how
+  # the same two enable flags got re-flipped three times with the line numbers
+  # moving each run. Preserve it and say where it went; the durable place for
+  # such edits is config/local.yaml, which is git-ignored and never reset.
+  DIRTY_CONFIG="$(git -C "$APP_DIR" status --porcelain -- config/ 2>/dev/null || true)"
+  if [[ -n "$DIRTY_CONFIG" ]]; then
+    BACKUP_DIR="$APP_DIR/data/config-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "$BACKUP_DIR"
+    git -C "$APP_DIR" diff -- config/ > "$BACKUP_DIR/config.diff" 2>/dev/null || true
+    while read -r _ file; do
+      [[ -f "$APP_DIR/$file" ]] && cp "$APP_DIR/$file" "$BACKUP_DIR/$(basename "$file")"
+    done <<< "$DIRTY_CONFIG"
+    warn "config/ had uncommitted edits; they are about to be reset."
+    warn "  saved to ${BACKUP_DIR}"
+    warn "  move them into ${APP_DIR}/config/local.yaml so they survive the next deploy"
+  fi
   git -C "$APP_DIR" fetch --depth 50 origin "$BRANCH"
   git -C "$APP_DIR" checkout -q "$BRANCH"
   git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
@@ -95,6 +112,36 @@ else
   [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || warn "TELEGRAM_BOT_TOKEN is empty; alerts go to the journal only"
   grep -q '^\s*push_command:\s*""' "$APP_DIR/config/settings.yaml" 2>/dev/null && \
     warn "backup.push_command is empty; backups stay on this box and will not survive it"
+fi
+
+# --- 5b. deployment-local config -------------------------------------------
+# Written once and never touched again, so `git reset --hard` above cannot
+# revert it. Which sources to enable is derived from which credentials exist
+# rather than guessed: a source enabled without its key fails config validation
+# at startup, which is correct but unhelpful to arrive at by default.
+LOCAL_CONFIG="$APP_DIR/config/local.yaml"
+if [[ -f "$LOCAL_CONFIG" ]]; then
+  log "keeping existing $LOCAL_CONFIG (deploy never overwrites it)"
+else
+  ODDS_ENABLED=false; [[ -n "${ODDS_API_KEY:-}" ]] && ODDS_ENABLED=true
+  KALSHI_ENABLED=false; [[ -n "${KALSHI_API_KEY_ID:-}" ]] && KALSHI_ENABLED=true
+  cat > "$LOCAL_CONFIG" <<LOCALEOF
+# Deployment-local overrides, layered over config/settings.yaml at load time.
+#
+# This file is git-ignored and deploy.sh never rewrites it, so edits here
+# survive the \`git reset --hard\` that every deploy performs. Put anything
+# box-specific here rather than editing settings.yaml, which is shipped.
+#
+# Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) from the credentials present in
+# ${ENV_FILE}. Change freely.
+sources:
+  odds:
+    enabled: ${ODDS_ENABLED}
+  kalshi:
+    enabled: ${KALSHI_ENABLED}
+LOCALEOF
+  chown "$SERVICE_USER":"$SERVICE_USER" "$LOCAL_CONFIG"
+  log "wrote $LOCAL_CONFIG (odds=${ODDS_ENABLED}, kalshi=${KALSHI_ENABLED})"
 fi
 
 # --- 6. data directories ---------------------------------------------------

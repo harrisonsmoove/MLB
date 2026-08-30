@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 
 #: Status codes StatsAPI uses to reject a hydrate string. 406 is what it
 #: actually returns; 400 is included because a rejected term is a malformed
@@ -40,19 +41,83 @@ def hydrate_string(terms: Sequence[str]) -> str:
     return ",".join(terms)
 
 
+def base_term(term: str) -> str:
+    """``probablePitcher(note)`` -> ``probablePitcher``.
+
+    The distinction that matters. A rejected sub-hydration does not mean the
+    term is gone: ``probablePitcher(note)`` returns 406 while
+    ``probablePitcher`` returns 200. Reporting the first as "probablePitcher
+    rejected" costs the probable starters -- which the simulator keys on, and
+    whose absence reads as "no starter announced" rather than as a bug.
+    """
+    head, _, _ = term.partition("(")
+    return head.strip()
+
+
+def strip_sub_hydrations(terms: Sequence[str]) -> list[str]:
+    """Every term reduced to its base, de-duplicated, order preserved."""
+    seen: list[str] = []
+    for term in terms:
+        base = base_term(term)
+        if base and base not in seen:
+            seen.append(base)
+    return seen
+
+
+class Verdict(StrEnum):
+    KEEP = "keep"
+    #: The sub-hydration is rejected but the base term is accepted. The term
+    #: stays, stripped -- this is the case that must never be reported as DROP.
+    STRIP = "strip"
+    DROP = "drop"
+    INCONCLUSIVE = "inconclusive"
+
+
 @dataclass(frozen=True)
 class TermResult:
     term: str
     status: int | None
     ok: bool
     detail: str = ""
+    #: Result of probing the bare base term, when the configured form failed
+    #: and differs from its base. ``None`` when that probe was not needed.
+    base_ok: bool | None = None
+    base_status: int | None = None
 
     @property
-    def verdict(self) -> str:
+    def base(self) -> str:
+        return base_term(self.term)
+
+    @property
+    def verdict(self) -> Verdict:
         if self.ok:
+            return Verdict.KEEP
+        if self.status not in HYDRATE_REJECTION_STATUSES:
+            return Verdict.INCONCLUSIVE
+        if self.base_ok:
+            return Verdict.STRIP
+        if self.base_ok is None and self.base != self.term:
+            return Verdict.INCONCLUSIVE
+        return Verdict.DROP
+
+    @property
+    def replacement(self) -> str | None:
+        """What this term should become in the config. ``None`` means remove it."""
+        if self.verdict is Verdict.KEEP:
+            return self.term
+        if self.verdict is Verdict.STRIP:
+            return self.base
+        if self.verdict is Verdict.INCONCLUSIVE:
+            return self.term
+        return None
+
+    def describe(self) -> str:
+        if self.verdict is Verdict.KEEP:
             return "accepted"
-        if self.status in HYDRATE_REJECTION_STATUSES:
-            return "REJECTED"
+        if self.verdict is Verdict.STRIP:
+            return f"sub-hydration REJECTED, base '{self.base}' accepted -> strip"
+        if self.verdict is Verdict.DROP:
+            return "REJECTED, base too -> remove"
         return f"inconclusive ({self.detail or self.status})"
 
 
@@ -65,19 +130,28 @@ class BisectResult:
 
     @property
     def accepted(self) -> list[str]:
-        return [t.term for t in self.terms if t.ok]
+        return [t.term for t in self.terms if t.verdict is Verdict.KEEP]
+
+    @property
+    def stripped(self) -> list[TermResult]:
+        return [t for t in self.terms if t.verdict is Verdict.STRIP]
 
     @property
     def rejected(self) -> list[str]:
-        return [t.term for t in self.terms if not t.ok and t.status in HYDRATE_REJECTION_STATUSES]
+        return [t.term for t in self.terms if t.verdict is Verdict.DROP]
 
     @property
     def inconclusive(self) -> list[str]:
-        return [
-            t.term
-            for t in self.terms
-            if not t.ok and t.status not in HYDRATE_REJECTION_STATUSES
-        ]
+        return [t.term for t in self.terms if t.verdict is Verdict.INCONCLUSIVE]
+
+    def corrected_terms(self) -> list[str]:
+        """The hydrate list this probe says the config should hold."""
+        out: list[str] = []
+        for entry in self.terms:
+            replacement = entry.replacement
+            if replacement and replacement not in out:
+                out.append(replacement)
+        return out
 
     def suggestion(self) -> str:
         if not self.baseline_ok:
@@ -90,36 +164,63 @@ class BisectResult:
                 "Some terms could not be classified (see above). Re-run before "
                 "changing the config -- a timeout is not a rejection."
             )
-        if not self.rejected:
+        lines: list[str] = []
+        for entry in self.stripped:
+            lines.append(
+                f"  {entry.term}  ->  {entry.base}   (keep the term, drop the "
+                "sub-hydration)"
+            )
+        for term in self.rejected:
+            lines.append(f"  {term}  ->  (remove)")
+        if not lines:
             return (
-                "Every term was accepted individually. If the combined call still "
+                "Every term was accepted as configured. If the combined call still "
                 "fails, the problem is the combination or its length, not one term."
             )
-        return "Remove from sources.mlb_statsapi.schedule_hydrate:\n  - " + "\n  - ".join(
-            self.rejected
-        )
+        return "Change sources.mlb_statsapi.schedule_hydrate:\n" + "\n".join(lines)
 
 
 def bisect_terms(
     terms: Sequence[str],
     probe: Callable[[list[str]], tuple[bool, int | None, str]],
 ) -> BisectResult:
-    """Find which hydrate terms the API no longer accepts.
+    """Find which hydrate terms the API no longer accepts, and in what form.
 
-    One request per term plus a bare baseline and a combined check. Linear
-    rather than a true binary bisect on purpose: with six terms it is eight
-    cheap unauthenticated requests, and it distinguishes *two* bad terms from
-    one, which a binary search reports as a single culprit.
+    Each term is probed **twice when it matters**: as configured, and -- if that
+    is rejected and the term carries a sub-hydration -- stripped to its base.
+    Without the second probe a rejected ``probablePitcher(note)`` is reported as
+    "probablePitcher rejected", and the probable starters get dropped from the
+    config over a sub-field.
+
+    Linear rather than a true binary bisect on purpose: with six terms it is a
+    handful of cheap unauthenticated requests, and it distinguishes *two* bad
+    terms from one, which a binary search reports as a single culprit.
 
     ``probe`` takes a term list and returns ``(ok, status, detail)``. The
     baseline is ``probe([])``.
     """
     baseline_ok, _, baseline_detail = probe([])
-    results = [
-        TermResult(term=term, status=status, ok=ok, detail=detail)
-        for term in terms
-        for ok, status, detail in [probe([term])]
-    ]
+
+    results: list[TermResult] = []
+    for term in terms:
+        ok, status, detail = probe([term])
+        base_ok: bool | None = None
+        base_status: int | None = None
+        if not ok and status in HYDRATE_REJECTION_STATUSES:
+            base = base_term(term)
+            if base and base != term:
+                base_ok, base_status, _ = probe([base])
+        results.append(
+            TermResult(
+                term=term,
+                status=status,
+                ok=ok,
+                detail=detail,
+                base_ok=base_ok,
+                base_status=base_status,
+            )
+        )
+
     combined_ok = None
     if baseline_ok and all(r.ok for r in results):
         combined_ok = probe(list(terms))[0]
