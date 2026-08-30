@@ -39,7 +39,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from mlb_edge.alerting import AlertThrottle, build_alerter, send_throttled
-from mlb_edge.completeness import SlateCache, coverage_for_venue, games_in_window
+from mlb_edge.completeness import (
+    SlateCache,
+    coverage_for_venue,
+    games_in_window,
+    split_by_quote_horizon,
+)
 from mlb_edge.config import Settings
 from mlb_edge.http import HttpClient, UpstreamError, client_for
 from mlb_edge.pollhealth import (
@@ -805,8 +810,21 @@ class PollDaemon:
                     hours=float(poller_config.get("completeness_slate_trail_hours", 5))
                 ),
             )
+            # A game eleven hours out that nobody has posted yet is not a
+            # shortfall. Split it out rather than demanding a quote that does
+            # not exist -- two venues "missing" the same late game is the
+            # schedule side talking, not either matcher.
+            expected_now, not_yet = split_by_quote_horizon(
+                relevant,
+                now=started,
+                horizon=timedelta(
+                    hours=float(poller_config.get("completeness_quote_horizon_hours", 6))
+                ),
+            )
             payloads = [r.payload for r in records if r.payload]
-            coverage = coverage_for_venue(name, payloads, relevant, slate=slate)
+            coverage = coverage_for_venue(
+                name, payloads, expected_now, slate=slate, not_yet_expected=not_yet
+            )
             print(f"[poll] {name} {coverage.line()}", flush=True)
             for alert in coverage_alerts([coverage]):
                 send_throttled(self.alerter, self.throttle, alert, now=started)

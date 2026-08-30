@@ -99,6 +99,18 @@ _TICKER = re.compile(
 )
 
 
+def codes_for(game: Any) -> set[str]:
+    """Every ticker code that could stand for either of a game's teams.
+
+    Used to tell "this game is not on the board" from "this game is on the
+    board behind a code we do not recognise". The second is a one-line fix and
+    nothing is lost; the first is real absence. Reporting them the same way
+    wastes the one alert anyone reads.
+    """
+    wanted = {canonical_name(game.home_team), canonical_name(game.away_team)}
+    return {code for code, name in TEAM_ALIASES.items() if name in wanted}
+
+
 def canonical_name(name: str) -> str:
     return NAME_ALIASES.get(name, name)
 

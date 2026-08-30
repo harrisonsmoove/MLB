@@ -257,3 +257,192 @@ def test_city_only_titles_no_longer_matter() -> None:
 
 def test_the_alias_table_covers_thirty_teams() -> None:
     assert len(set(TEAM_ALIASES.values())) == 30
+
+
+# --- a game nobody has quoted yet is not a shortfall -----------------------
+
+
+def test_a_late_game_is_not_yet_expected_rather_than_missing() -> None:
+    """Two venues independently "missing" the same late game points at the
+    schedule side, not at either matcher.
+
+    The window used to be a single cliff: inside twelve hours a game counted
+    fully. Books post a late game's market closer to first pitch, so an
+    eleven-hour-out game was demanded of everyone and its absence reported as a
+    shortfall. That is how a check earns its way into the ignored pile.
+    """
+    from datetime import timedelta
+
+    from mlb_edge.completeness import split_by_quote_horizon
+
+    now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    soon = _game(1, "Boston Red Sox", "Seattle Mariners", now + timedelta(hours=2))
+    late = _game(2, "Toronto Blue Jays", "Seattle Mariners", now + timedelta(hours=11))
+
+    expected_now, not_yet = split_by_quote_horizon(
+        [soon, late], now=now, horizon=timedelta(hours=6)
+    )
+    assert [g.game_pk for g in expected_now] == [1]
+    assert [g.game_pk for g in not_yet] == [2]
+
+
+def test_a_game_already_under_way_is_still_expected() -> None:
+    from datetime import timedelta
+
+    from mlb_edge.completeness import split_by_quote_horizon
+
+    now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
+    started = _game(1, "Boston Red Sox", "Seattle Mariners", now - timedelta(hours=1))
+    expected_now, not_yet = split_by_quote_horizon([started], now=now)
+    assert expected_now and not not_yet
+
+
+def test_pending_games_are_reported_but_not_counted_against_the_venue() -> None:
+    from mlb_edge.completeness import coverage_for_venue
+
+    games = [_game(1, "Boston Red Sox", "Seattle Mariners", SEP2)]
+    pending = [_game(2, "Toronto Blue Jays", "Seattle Mariners", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"}]}'
+
+    report = coverage_for_venue("kalshi", [payload], games, not_yet_expected=pending)
+
+    assert report.covered == 1 and report.expected == 1
+    assert report.complete
+    assert report.not_yet_expected == ["Seattle Mariners @ Toronto Blue Jays"]
+    assert "not yet expected" in report.line()
+
+
+def test_the_alert_separates_pending_from_missing() -> None:
+    from mlb_edge.completeness import Slate, coverage_for_venue
+    from mlb_edge.pollhealth import coverage_alerts
+
+    games = [
+        _game(1, "Boston Red Sox", "Seattle Mariners", SEP2),
+        _game(3, "Atlanta Braves", "Colorado Rockies", SEP2),
+    ]
+    pending = [_game(2, "Toronto Blue Jays", "Seattle Mariners", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"}]}'
+
+    report = coverage_for_venue(
+        "kalshi",
+        [payload],
+        games,
+        slate=Slate(day=SEP2.date(), games=tuple(games), in_progress=1),
+        not_yet_expected=pending,
+    )
+    body = coverage_alerts([report])[0].body
+
+    assert "NOT counted against this venue" in body
+    assert "Toronto Blue Jays" in body
+
+
+# --- the trace describes the matcher that actually runs --------------------
+
+
+def test_the_diagnostic_shows_tickers_not_fuzzy_tokens() -> None:
+    """A diagnostic reporting token searches beside a ticker join sends you to
+    debug a code path that no longer runs."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "Boston Red Sox", "Seattle Mariners", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
+
+    assert entry.method == "ticker"
+    assert entry.ticker_candidates
+    assert "SEA / BOS" in entry.ticker_candidates[0]
+    assert "2026-09-02" in entry.ticker_candidates[0]
+    assert "1610" in entry.ticker_candidates[0]
+
+
+def test_a_game_whose_ticker_is_absent_says_not_on_the_board() -> None:
+    """The Colorado @ Atlanta case: both codes are standard, so "no ticker
+    names either team" and "a ticker exists but did not join" are different
+    findings needing different fixes."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "Atlanta Braves", "Colorado Rockies", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
+    assert not entry.matched
+    assert entry.ticker_candidates == []
+    assert "not on the board" in entry.diagnosis
+
+
+def test_a_ticker_that_names_the_team_but_did_not_join_is_traced() -> None:
+    """Wrong date or wrong opponent -- the trace has to show which."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "Atlanta Braves", "Colorado Rockies", SEP2)]
+    # Same Braves, different opponent: the ticker exists but joins elsewhere.
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610ATLNYM"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
+    assert not entry.matched
+    assert entry.ticker_candidates
+    assert "did NOT join" in entry.diagnosis
+
+
+def test_orphan_tickers_are_listed() -> None:
+    from mlb_edge.completeness import unmatched_tickers
+
+    games = [_game(1, "Boston Red Sox", "Seattle Mariners", SEP2)]
+    payloads = [
+        '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"},'
+        '{"ticker":"KXMLBGAME-26SEP021905COLATL"}]}'
+    ]
+    orphans = unmatched_tickers(payloads, games)
+    assert len(orphans) == 1
+    assert "Colorado Rockies" in orphans[0] and "Atlanta Braves" in orphans[0]
+
+
+def test_col_atl_parses_cleanly_in_both_orders() -> None:
+    """Named in review as the remaining uncounted game. The codes are standard
+    and both orderings split correctly, so a parse failure is not the cause."""
+    for blob in ("COLATL", "ATLCOL"):
+        parsed = parse_ticker(f"KXMLBGAME-26SEP021905{blob}")
+        assert parsed is not None, blob
+        assert set(parsed.teams) == {"Colorado Rockies", "Atlanta Braves"}
+
+
+def test_a_game_behind_an_unmapped_code_is_not_reported_as_lost() -> None:
+    """One-line fix versus permanent loss. Reporting them alike wastes the one
+    alert anyone reads."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "New York Yankees", "Chicago Cubs", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610XYZNYY"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
+
+    assert not entry.matched
+    assert entry.blocked_by_unmapped_code == ["XYZ"]
+    assert entry.present, "the game is on the board, just unparseable"
+    assert "blocked by unmapped code" in entry.diagnosis
+
+
+def test_a_title_mention_does_not_count_as_present_for_a_ticker_venue() -> None:
+    """Restating the original bug inside the diagnostic would be a poor joke.
+
+    Titles are not what the join reads, so a team name in a title proves
+    nothing about whether the game is on the board.
+    """
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "New York Yankees", "Chicago Cubs", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS","title":"Yankees"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
+    assert entry.loose_hits, "the loose search does find it"
+    assert not entry.present, "but that is not evidence for a ticker join"
+    assert "not on the board" in entry.diagnosis
+
+
+def test_codes_for_covers_every_alias_of_both_teams() -> None:
+    from mlb_edge.kalshi_tickers import codes_for
+
+    codes = codes_for(_game(1, "Athletics", "Arizona Diamondbacks", SEP2))
+    assert {"ATH", "OAK", "AS"} <= codes
+    assert {"AZ", "ARI"} <= codes

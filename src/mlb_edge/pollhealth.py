@@ -254,6 +254,20 @@ def _shortfall_body(report: CoverageReport) -> str:
         )
         lines.extend(f"  {label}" for label in absent[:5])
 
+    if report.not_yet_expected:
+        lines.append(
+            f"\n{len(report.not_yet_expected)} further game(s) are not yet expected "
+            "and are NOT counted against this venue:"
+        )
+        lines.extend(f"  {label}" for label in report.not_yet_expected[:5])
+
+    if report.unmapped_codes:
+        lines.append(
+            "\nTicker codes not in the alias table (each one is a game that "
+            "cannot be counted, and a one-line fix):"
+        )
+        lines.extend(f"  {code}" for code in report.unmapped_codes[:8])
+
     if report.sample_labels:
         lines.append("\nWhat the payload actually contains:")
         lines.extend(f"  {value}" for value in report.sample_labels[:8])

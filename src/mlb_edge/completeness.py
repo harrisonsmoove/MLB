@@ -38,7 +38,15 @@ from enum import StrEnum
 from typing import Any
 
 from mlb_edge.hydrate import hydrate_string
-from mlb_edge.kalshi_tickers import match_to_games, tickers_from_payloads
+from mlb_edge.kalshi_tickers import (
+    MLB_SERIES_PREFIX,
+    canonical_name,
+    codes_for,
+    match_to_games,
+    parse_ticker,
+    tickers_from_payloads,
+    unmapped_codes,
+)
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
@@ -115,6 +123,10 @@ class CoverageReport:
     #: Ticker team codes seen on the board that the alias table does not know.
     #: Each one is a game that cannot be counted, and a one-line fix.
     unmapped_codes: list[str] = field(default_factory=list)
+    #: Games inside the slate window but too far from first pitch to expect a
+    #: quote yet. Reported, never counted as a shortfall -- see
+    #: :func:`split_by_quote_horizon`.
+    not_yet_expected: list[str] = field(default_factory=list)
     #: Games whose teams appear in the payload but were not counted.
     present_but_uncounted: list[str] = field(default_factory=list)
 
@@ -172,9 +184,14 @@ class CoverageReport:
                 "schedule, none near first pitch"
             )
         marker = "" if self.complete else f"  MISSING {self.shortfall}"
+        pending = (
+            f"  [+{len(self.not_yet_expected)} not yet expected]"
+            if self.not_yet_expected
+            else ""
+        )
         return (
             f"captured {self.covered}/{self.expected} games ({self.venue}, "
-            f"{precision}){marker}"
+            f"{precision}){marker}{pending}"
         )
 
 
@@ -390,12 +407,40 @@ def team_tokens(games: list[ExpectedGame]) -> dict[int, set[str]]:
     return tokens
 
 
+def split_by_quote_horizon(
+    games: list[ExpectedGame],
+    *,
+    now: datetime | None = None,
+    horizon: timedelta = timedelta(hours=6),
+) -> tuple[list[ExpectedGame], list[ExpectedGame]]:
+    """Split games into "expect a quote now" and "not yet".
+
+    The window used to be a single cliff: inside twelve hours a game counted
+    fully, outside it vanished. Books do not work that way. A market for a late
+    game opens closer to first pitch, so a game eleven hours out was demanded of
+    every venue and reported as MISSING when nobody had posted it yet.
+
+    That is not a shortfall, and calling it one is how a check earns its way
+    into the ignored pile. Two venues independently "missing" the same late game
+    is the signature -- it points at the schedule side, not at either matcher.
+
+    Returns ``(expected_now, not_yet)``. Only the first is a denominator.
+    """
+    reference = ensure_utc(now or utcnow())
+    expected_now: list[ExpectedGame] = []
+    not_yet: list[ExpectedGame] = []
+    for game in games:
+        (not_yet if game.start_ts - reference > horizon else expected_now).append(game)
+    return expected_now, not_yet
+
+
 def coverage_for_venue(
     venue: str,
     payloads: list[str],
     games: list[ExpectedGame],
     *,
     slate: Slate | None = None,
+    not_yet_expected: list[ExpectedGame] | None = None,
 ) -> CoverageReport:
     """How many of today's games this venue's payloads account for.
 
@@ -411,6 +456,7 @@ def coverage_for_venue(
         slate_size=len(slate.games) if slate is not None else len(games),
         in_progress=slate.in_progress if slate is not None else None,
         slate_error=slate.error if slate is not None else None,
+        not_yet_expected=[g.label for g in (not_yet_expected or [])],
     )
     if slate is not None and not slate.available:
         report.status = SlateStatus.UNAVAILABLE
@@ -564,17 +610,62 @@ def extract_labels(payloads: list[str], *, limit: int = 400) -> list[str]:
 
 @dataclass
 class GameEvidence:
-    """Whether a game's teams appear in the payload at all, and how."""
+    """What was actually attempted for one game, and what came back.
+
+    Whatever the venue's matcher is, this has to describe *that* matcher. A
+    diagnostic that reports fuzzy token searches while the counting joins on
+    tickers is worse than none: it sends you to debug a code path that no longer
+    runs.
+    """
 
     game: ExpectedGame
     matched: bool
-    strict_tokens: set[str]
-    loose_hits: list[str]
+    #: How the join was attempted: "ticker", "exact" or "team-mention".
+    method: str = "team-mention"
+    #: Team-mention only: the tokens the counting matcher searched for.
+    strict_tokens: set[str] = field(default_factory=set)
+    #: Loose search, used to tell "present but uncounted" from "absent".
+    loose_hits: list[str] = field(default_factory=list)
+    #: Ticker only: tickers on the board naming either of this game's teams,
+    #: with what each parsed to. This is the trace for a game that should have
+    #: joined and did not.
+    ticker_candidates: list[str] = field(default_factory=list)
+    #: Hours until first pitch. Negative means already under way.
+    hours_to_first_pitch: float = 0.0
+    #: Inside the slate window but too early to expect a quote.
+    not_yet_expected: bool = False
+    #: A ticker on the board carries one of this game's codes but could not be
+    #: parsed, because the OTHER code is not in the alias table. The game is
+    #: present, not lost -- and the fix is one line.
+    blocked_by_unmapped_code: list[str] = field(default_factory=list)
+
+    @property
+    def present(self) -> bool:  # noqa: D401
+        """Is this game in the payload, judged by the matcher that actually ran?
+
+        For a ticker venue a team name appearing in a title proves nothing --
+        titles are not what the join reads. Letting a loose string hit classify
+        a ticker-joined game would restate the original bug in the diagnostic.
+        """
+        if self.method == "ticker":
+            return bool(self.ticker_candidates or self.blocked_by_unmapped_code)
+        return bool(self.loose_hits)
 
     @property
     def diagnosis(self) -> str:
         if self.matched:
             return "counted"
+        if self.not_yet_expected:
+            return f"not yet expected ({self.hours_to_first_pitch:+.1f}h to first pitch)"
+        if self.blocked_by_unmapped_code:
+            return (
+                "on the board but blocked by unmapped code "
+                + "/".join(self.blocked_by_unmapped_code)
+            )
+        if self.ticker_candidates:
+            return "ticker on the board but did NOT join -- parse or join failure"
+        if self.method == "ticker":
+            return "no ticker names either team -- not on the board"
         if self.loose_hits:
             return "PRESENT but not counted -- matcher gap"
         return "ABSENT from the payload -- not fetched"
@@ -614,28 +705,110 @@ def loose_tokens(game: ExpectedGame) -> set[str]:
 
 
 def diagnose_coverage(
-    venue: str, payloads: list[str], games: list[ExpectedGame]
+    venue: str,
+    payloads: list[str],
+    games: list[ExpectedGame],
+    *,
+    now: datetime | None = None,
+    quote_horizon: timedelta = timedelta(hours=6),
 ) -> list[GameEvidence]:
-    """Split a shortfall into "captured but not counted" and "never fetched".
+    """Explain, per game, what the venue's own matcher tried and what it found.
 
-    The distinction the alert could not make. One is a counting bug with no data
-    lost; the other is real, permanent loss on a source with no historical
-    endpoint. Same log line, opposite responses.
+    Splits a shortfall three ways, because they need three different responses:
+    a game not yet quoted (wait), a game present but not counted (matcher gap,
+    nothing lost), and a game absent from the payload (real loss on a source
+    with no historical endpoint).
     """
+    reference = ensure_utc(now or utcnow())
     report = coverage_for_venue(venue, payloads, games)
     counted = {g.label for g in games} - set(report.missing)
     haystack = normalise(" ".join(payloads))
     strict = team_tokens(games)
 
+    ticker_index: dict[frozenset[str], list[str]] = {}
+    raw_tickers: list[str] = []
+    unparsed_tickers: list[str] = []
+    if venue in TICKER_VENUES:
+        raw_tickers = tickers_from_payloads(payloads)
+        unparsed_tickers = [
+            tk
+            for tk in raw_tickers
+            if tk.upper().startswith(MLB_SERIES_PREFIX) and parse_ticker(tk) is None
+        ]
+        for ticker in raw_tickers:
+            parsed = parse_ticker(ticker)
+            if parsed is not None:
+                ticker_index.setdefault(parsed.team_set, []).append(
+                    f"{ticker}  ->  {' / '.join(parsed.codes)}  "
+                    f"{parsed.game_date.isoformat()} {parsed.start_hhmm or '(no time)'}"
+                )
+
     evidence: list[GameEvidence] = []
     for game in games:
-        hits = sorted(tok for tok in loose_tokens(game) if tok in haystack)
+        hours = (game.start_ts - reference).total_seconds() / 3600.0
+        candidates: list[str] = []
+        if venue in TICKER_VENUES:
+            pair = frozenset({canonical_name(game.home_team), canonical_name(game.away_team)})
+            candidates = list(ticker_index.get(pair, []))
+            exact_hit = bool(candidates)
+            if not candidates and not (game.start_ts - reference) > quote_horizon:
+                # Fall back to naming either team, so a ticker that parsed to
+                # the wrong opponent still shows up in the trace.
+                for ticker in raw_tickers:
+                    parsed = parse_ticker(ticker)
+                    if parsed is None:
+                        continue
+                    if pair & parsed.team_set:
+                        candidates.append(
+                            f"{ticker}  ->  parsed as {' vs '.join(sorted(parsed.teams))}"
+                            f" on {parsed.game_date.isoformat()}"
+                        )
+            del exact_hit
+        blocked: list[str] = []
+        if venue in TICKER_VENUES and not candidates:
+            mine = codes_for(game)
+            for ticker in unparsed_tickers:
+                blob = ticker.upper().rsplit("-", 1)[-1]
+                if any(code in blob for code in mine):
+                    blocked.extend(unmapped_codes(ticker))
         evidence.append(
             GameEvidence(
                 game=game,
                 matched=game.label in counted,
+                method="ticker"
+                if venue in TICKER_VENUES
+                else ("exact" if venue in EXACT_VENUES else "team-mention"),
                 strict_tokens=strict.get(game.game_pk, set()),
-                loose_hits=hits,
+                loose_hits=sorted(tok for tok in loose_tokens(game) if tok in haystack),
+                ticker_candidates=candidates[:4],
+                hours_to_first_pitch=hours,
+                not_yet_expected=timedelta(hours=hours) > quote_horizon,
+                blocked_by_unmapped_code=sorted(set(blocked))[:2],
             )
         )
     return evidence
+
+
+def unmatched_tickers(payloads: list[str], games: list[ExpectedGame]) -> list[str]:
+    """Parsed tickers that joined to no game on the slate.
+
+    The other half of the trace: a game with no ticker and a ticker with no game
+    are usually the same fact seen from two sides.
+    """
+    matched, _, _ = match_to_games(tickers_from_payloads(payloads), games)
+    known = {g.game_pk for g in games if g.game_pk in matched}
+    pairs = {
+        frozenset({canonical_name(g.home_team), canonical_name(g.away_team)})
+        for g in games
+        if g.game_pk in known
+    }
+    out: list[str] = []
+    for ticker in tickers_from_payloads(payloads):
+        parsed = parse_ticker(ticker)
+        if parsed is None or parsed.team_set in pairs:
+            continue
+        out.append(
+            f"{ticker}  ->  {' vs '.join(sorted(parsed.teams))} "
+            f"{parsed.game_date.isoformat()} {parsed.start_hhmm or '(no time)'}"
+        )
+    return out

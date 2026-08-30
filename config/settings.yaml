@@ -73,6 +73,13 @@ poller:
   completeness_enabled: true
   completeness_slate_lead_hours: 12
   completeness_slate_trail_hours: 5
+  # A game this far out is reported as "not yet expected" rather than MISSING.
+  # Books post a late game's market closer to first pitch, so the old single
+  # 12-hour cliff demanded quotes that did not exist yet and reported their
+  # absence as a shortfall -- which is how a check earns its way into the
+  # ignored pile. Games between this and completeness_slate_lead_hours are
+  # shown but not counted against any venue.
+  completeness_quote_horizon_hours: 6
   schedule_cache_seconds: 1800
   # The schedule only feeds the completeness check, so it fails fast rather
   # than delaying the archive write behind a retry ladder.

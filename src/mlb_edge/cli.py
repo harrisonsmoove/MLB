@@ -947,11 +947,12 @@ def explain_coverage(
 
     from mlb_edge.completeness import (
         SlateCache,
+        coverage_for_venue,
         diagnose_coverage,
         extract_labels,
         games_in_window,
+        unmatched_tickers,
     )
-    from mlb_edge.http import client_for
     from mlb_edge.poll import PollArchive
 
     settings = load_settings(root)
@@ -972,7 +973,19 @@ def explain_coverage(
     console.print(f"tick: [bold]{newest.name}[/bold]  ({len(payloads)} payloads)\n")
 
     when = _date.fromisoformat(day) if day else _date.today()
-    slate = SlateCache(settings, client_for(settings, "mlb_statsapi")).slate_for(when)
+    # Low-retry: this is a diagnostic and the default five-attempt ladder makes
+    # it sit for a minute before saying the schedule is unreachable.
+    from mlb_edge.http import HttpClient
+
+    schedule_client = HttpClient(
+        user_agent=settings.section("http").get("user_agent", "mlb-edge/0.1"),
+        timeout_seconds=float(poller_config.get("schedule_timeout_seconds", 10)),
+        max_attempts=int(poller_config.get("schedule_max_attempts", 2)),
+        backoff_initial_seconds=1.0,
+        backoff_max_seconds=4.0,
+        rate_limit_per_minute=60,
+    )
+    slate = SlateCache(settings, schedule_client).slate_for(when)
     games = games_in_window(
         list(slate.games),
         lead=timedelta(hours=float(poller_config.get("completeness_slate_lead_hours", 12))),
@@ -982,25 +995,81 @@ def explain_coverage(
         console.print("[yellow]no games in the window to compare against[/yellow]")
         raise typer.Exit(1)
 
-    evidence = diagnose_coverage(venue, payloads, games)
+    evidence = diagnose_coverage(
+        venue,
+        payloads,
+        games,
+        quote_horizon=timedelta(
+            hours=float(poller_config.get("completeness_quote_horizon_hours", 6))
+        ),
+    )
 
-    table = Table(title=f"{venue}: {sum(e.matched for e in evidence)}/{len(evidence)} counted")
+    method = evidence[0].method if evidence else "team-mention"
+    table = Table(
+        title=f"{venue}: {sum(e.matched for e in evidence)}/{len(evidence)} counted "
+        f"(joined on {method})"
+    )
     table.add_column("game")
-    table.add_column("tokens searched")
-    table.add_column("found in payload")
+    table.add_column("first pitch", justify="right")
+    # The column must describe the matcher that actually ran. Showing fuzzy
+    # tokens beside a ticker join sends you to debug a dead code path.
+    table.add_column("tickers on the board" if method == "ticker" else "tokens searched")
     table.add_column("diagnosis")
-    for entry in sorted(evidence, key=lambda e: (e.matched, e.game.label)):
-        colour = "green" if entry.matched else ("yellow" if entry.loose_hits else "red")
+    for entry in sorted(
+        evidence, key=lambda e: (e.matched, e.not_yet_expected, e.game.label)
+    ):
+        if entry.matched:
+            colour = "green"
+        elif entry.not_yet_expected:
+            colour = "cyan"
+        elif entry.ticker_candidates or entry.loose_hits:
+            colour = "yellow"
+        else:
+            colour = "red"
+        if method == "ticker":
+            attempted = "\n".join(entry.ticker_candidates) or "[dim]none[/dim]"
+        else:
+            attempted = ", ".join(sorted(entry.strict_tokens)) or "[dim]none[/dim]"
         table.add_row(
             entry.game.label,
-            ", ".join(sorted(entry.strict_tokens)) or "[dim]none[/dim]",
-            ", ".join(entry.loose_hits) or "[dim]nothing[/dim]",
+            f"{entry.hours_to_first_pitch:+.1f}h",
+            attempted,
             f"[{colour}]{entry.diagnosis}[/{colour}]",
         )
     console.print(table)
 
-    absent = [e for e in evidence if not e.matched and not e.loose_hits]
-    gaps = [e for e in evidence if not e.matched and e.loose_hits]
+    pending = [e for e in evidence if e.not_yet_expected and not e.matched]
+    if pending:
+        console.print(
+            f"\n[cyan]{len(pending)} game(s) are not yet expected[/cyan] -- more than "
+            "the quote horizon from first pitch. Not a shortfall; books post a "
+            "late game's market closer to the start."
+        )
+
+    codes = coverage_for_venue(venue, payloads, games).unmapped_codes
+    if codes:
+        console.print(
+            f"\n[red]ticker codes not in the alias table: {', '.join(codes)}[/red]\n"
+            "Each one is a game that cannot be counted, and a one-line fix in "
+            "mlb_edge.kalshi_tickers.TEAM_ALIASES."
+        )
+
+    if method == "ticker":
+        orphans = unmatched_tickers(payloads, games)
+        if orphans:
+            console.print(
+                f"\ntickers that joined to no game on this slate ({len(orphans)}):"
+            )
+            for line in orphans[:12]:
+                console.print(f"  {line}")
+            console.print(
+                "[dim]A game with no ticker and a ticker with no game are usually "
+                "the same fact seen from two sides.[/dim]"
+            )
+
+    unresolved = [e for e in evidence if not e.matched and not e.not_yet_expected]
+    absent = [e for e in unresolved if not e.present]
+    gaps = [e for e in unresolved if e.present]
     if gaps:
         console.print(
             f"\n[yellow]{len(gaps)} game(s) are in the payload but not counted.[/yellow] "
