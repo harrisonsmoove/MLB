@@ -287,21 +287,31 @@ would have handed us a band 40% too wide.
 
 ### The bands
 
-| Check | Statistic | Band | Basis |
-|---|---|---|---|
-| Mean runs | \|Δ mean R/team-game\| | ≤ **0.13** | 2.9 SE |
-| Mean runs, home | \|Δ mean R/game, home only\| | ≤ **0.13** | 2.9 SE |
-| Mean runs, away | \|Δ mean R/game, away only\| | ≤ **0.13** | 2.9 SE |
-| Shutout rate | \|Δ P(0 runs)\| | ≤ **1.15 pp** | 3.0 SE |
-| Big games | \|Δ P(10+ runs)\| | ≤ **1.05 pp** | 3.1 SE |
-| Distribution shape | TVD over bins 0..9,10+ | ≤ **0.032** | p99.9 of null |
-| Home/away correlation | \|Δ rho\| | ≤ **0.06** | 3.0 SE |
+| Check | Statistic | Band | Basis | Role |
+|---|---|---|---|---|
+| Mean runs, home | \|Δ mean R/game, home only\| | ≤ **0.13** | 2.9 SE | primary |
+| Mean runs, away | \|Δ mean R/game, away only\| | ≤ **0.13** | 2.9 SE | primary |
+| Shutout rate | \|Δ P(0 runs)\| | ≤ **1.15 pp** | 3.0 SE | primary |
+| Big games | \|Δ P(10+ runs)\| | ≤ **1.05 pp** | 3.1 SE | primary |
+| Distribution shape | TVD over bins 0..9,10+ | ≤ **0.032** | p99.9 of null | primary |
+| Mean runs, pooled | \|Δ mean R/team-game\| | ≤ **0.13** | 2.9 SE | reported |
+| Home/away correlation | \|Δ rho\| | ≤ **0.06** | 3.0 SE | secondary |
 
 **Split the mean by home and away, do not pool it.** A simulator that wrongly
 plays the home half of the 9th adds roughly 0.2 R/game to the home side and
 nothing to the away side. Pooled, that is 0.10 — inside the band. Split, the
-home row fails cleanly. This is the diagnostic that actually catches the bug the
-correlation check was reaching for.
+home row fails cleanly.
+
+That makes the split means the **primary** check for the unplayed-half-inning
+bug and the correlation the **secondary** one. Rho was the diagnostic reaching
+for this bug; the split means catch it strictly harder, and unlike rho they do
+not require knowing the sign of anything in advance. Both are kept — rho still
+detects failure modes the means cannot, such as a park or weather term applied
+to one side only — but a rho breach with the means clean is a signal to
+investigate, and a means breach is a stop on its own.
+
+The pooled mean is kept as a reported line rather than a gate, precisely because
+this exercise showed it can pass while a component fails.
 
 ### The targets
 
@@ -344,6 +354,20 @@ that null. This is computed from season data alone — no model output enters it
 so it is computed and written into the repo **before the first simulator run**,
 alongside the targets. The iid figure 0.0321 is recorded here now so that any
 movement is visible.
+
+**The appeal runs in both directions.** It is a correction for effective N, not
+a ratchet toward whatever is easier to pass:
+
+| Block-bootstrap p99.9 | What happens |
+|---|---|
+| Wider than 0.0321 | It replaces 0.0321. The iid null understated the noise. |
+| Tighter than 0.0321 | **The tighter number is the band.** |
+
+The second row is the one that makes this an appeal rather than a loophole. If
+the correction had only ever been allowed to loosen, it would not be a
+correction — it would be a licence held in reserve, cashed in exactly when the
+first band failed. Both figures go in the repo, so which direction it moved is
+on the record either way.
 
 No other appeal. If the block-bootstrap band is also exceeded, (ii) has failed.
 
