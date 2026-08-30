@@ -99,6 +99,12 @@ class CoverageReport:
     #: ``totalGamesInProgress`` as reported by StatsAPI. ``None`` when unknown.
     in_progress: int | None = None
     slate_error: str | None = None
+    #: A few strings from the payload, so a shortfall alert can be acted on
+    #: without an ssh session. "MISSING 13" cannot distinguish a matcher gap
+    #: from a truncated board; the titles can.
+    sample_labels: list[str] = field(default_factory=list)
+    #: Games whose teams appear in the payload but were not counted.
+    present_but_uncounted: list[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
@@ -419,6 +425,16 @@ def coverage_for_venue(
 
     report.covered = len(covered)
     report.missing = [g.label for g in games if g.game_pk not in covered]
+    if report.missing:
+        # Only pay for this when something is wrong.
+        report.sample_labels = extract_labels(payloads, limit=12)
+        haystack = normalise(" ".join(payloads))
+        report.present_but_uncounted = [
+            game.label
+            for game in games
+            if game.game_pk not in covered
+            and any(tok in haystack for tok in loose_tokens(game))
+        ]
     return report
 
 
@@ -459,3 +475,139 @@ def games_in_window(
         for game in games
         if reference - trail <= game.start_ts <= reference + lead
     ]
+
+
+# ---------------------------------------------------------------------------
+# Diagnosing a shortfall
+# ---------------------------------------------------------------------------
+#: Keys whose string values are worth showing a human when coverage is short.
+#: Deliberately broad and shape-tolerant -- the point is to find out what the
+#: payload actually looks like, and a schema assumption here would defeat that.
+LABEL_KEYS = frozenset(
+    {
+        "title",
+        "subtitle",
+        "sub_title",
+        "yes_sub_title",
+        "no_sub_title",
+        "name",
+        "ticker",
+        "event_ticker",
+        "series_ticker",
+        "home_team",
+        "away_team",
+        "rules_primary",
+    }
+)
+
+
+def extract_labels(payloads: list[str], *, limit: int = 400) -> list[str]:
+    """Every human-readable string in the payloads, for eyeballing.
+
+    ``captured 1/14`` does not say whether the board was fetched and not
+    recognised or never fetched, and those need opposite fixes. Seeing the
+    actual strings settles it in one look.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def walk(node: Any) -> None:
+        if len(found) >= limit:
+            return
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in LABEL_KEYS and isinstance(value, str) and value:
+                    if value not in seen:
+                        seen.add(value)
+                        found.append(value)
+                else:
+                    walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    for payload in payloads:
+        try:
+            walk(json.loads(payload))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return found
+
+
+@dataclass
+class GameEvidence:
+    """Whether a game's teams appear in the payload at all, and how."""
+
+    game: ExpectedGame
+    matched: bool
+    strict_tokens: set[str]
+    loose_hits: list[str]
+
+    @property
+    def diagnosis(self) -> str:
+        if self.matched:
+            return "counted"
+        if self.loose_hits:
+            return "PRESENT but not counted -- matcher gap"
+        return "ABSENT from the payload -- not fetched"
+
+
+def loose_tokens(game: ExpectedGame) -> set[str]:
+    """Every plausible way a payload might name either team.
+
+    Full name, nickname, city, and the conventional three-letter abbreviation.
+    Deliberately including tokens too ambiguous to *count* with: for diagnosis
+    a false positive is informative and a false negative is not.
+    """
+    tokens: set[str] = set()
+    for team in (game.home_team, game.away_team):
+        parts = [p for p in team.split() if p]
+        if not parts:
+            continue
+        tokens.add(normalise(team))
+        tokens.add(normalise(parts[0]))
+        tokens.add(normalise(parts[-1]))
+        # Two-word nicknames ("Blue Jays", "Red Sox", "White Sox") mean the
+        # city is not simply "everything but the last word".
+        if len(parts) >= 2:
+            tokens.add(normalise(" ".join(parts[-2:])))
+        if len(parts) >= 3:
+            tokens.add(normalise(" ".join(parts[:-2])))
+        # Three-letter forms. Kalshi tickers use codes like TOR and SEA, which
+        # are not initials -- they are the leading letters of the city. Both
+        # are cheap to include and this is a diagnostic, where a false positive
+        # is informative and a false negative is not.
+        tokens.add(normalise(parts[0])[:3])
+        tokens.add(normalise(parts[-1])[:3])
+        initials = "".join(p[0] for p in parts)
+        if len(initials) >= 2:
+            tokens.add(normalise(initials))
+    return {tok for tok in tokens if len(tok) >= 3}
+
+
+def diagnose_coverage(
+    venue: str, payloads: list[str], games: list[ExpectedGame]
+) -> list[GameEvidence]:
+    """Split a shortfall into "captured but not counted" and "never fetched".
+
+    The distinction the alert could not make. One is a counting bug with no data
+    lost; the other is real, permanent loss on a source with no historical
+    endpoint. Same log line, opposite responses.
+    """
+    report = coverage_for_venue(venue, payloads, games)
+    counted = {g.label for g in games} - set(report.missing)
+    haystack = normalise(" ".join(payloads))
+    strict = team_tokens(games)
+
+    evidence: list[GameEvidence] = []
+    for game in games:
+        hits = sorted(tok for tok in loose_tokens(game) if tok in haystack)
+        evidence.append(
+            GameEvidence(
+                game=game,
+                matched=game.label in counted,
+                strict_tokens=strict.get(game.game_pk, set()),
+                loose_hits=hits,
+            )
+        )
+    return evidence

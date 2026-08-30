@@ -83,6 +83,28 @@ else
 fi
 log "at commit $(git -C "$APP_DIR" rev-parse --short HEAD)"
 
+# The script you invoked is not necessarily the script this commit ships. Deploy
+# is normally run from a clone at /tmp/mlb-edge made on some earlier day, so
+# every fix to deploy.sh would otherwise take effect one deploy late -- which is
+# exactly how the config/local.yaml step shipped, ran nothing, and logged
+# nothing. Hand over to the version that was just checked out.
+#
+# It also removes a quieter hazard: bash reads a script incrementally, so when
+# deploy is run from $APP_DIR the `reset --hard` above rewrites the file under
+# the interpreter mid-run and execution resumes at a byte offset into different
+# content. That failure has no error message at all.
+DEPLOYED_SELF="$APP_DIR/deploy/$(basename "$0")"
+if [[ -z "${MLB_EDGE_DEPLOY_REEXEC:-}" && -f "$DEPLOYED_SELF" ]]; then
+  if ! cmp -s "$0" "$DEPLOYED_SELF"; then
+    log "deploy script differs from the one at this commit; re-executing $DEPLOYED_SELF"
+    export MLB_EDGE_DEPLOY_REEXEC=1
+    exec bash "$DEPLOYED_SELF" "$@"
+  fi
+  log "deploy script matches this commit"
+else
+  [[ -n "${MLB_EDGE_DEPLOY_REEXEC:-}" ]] && log "running the checked-out deploy script"
+fi
+
 # A bundle has no branch tracking, so make sure the checkout is actually on the
 # branch rather than detached at whatever the bundle's HEAD happened to be.
 git -C "$APP_DIR" symbolic-ref -q HEAD >/dev/null || \
@@ -120,8 +142,15 @@ fi
 # rather than guessed: a source enabled without its key fails config validation
 # at startup, which is correct but unhelpful to arrive at by default.
 LOCAL_CONFIG="$APP_DIR/config/local.yaml"
+log "local config: $LOCAL_CONFIG"
 if [[ -f "$LOCAL_CONFIG" ]]; then
-  log "keeping existing $LOCAL_CONFIG (deploy never overwrites it)"
+  log "  found existing -- deploy never overwrites it. Enabled sources:"
+  grep -n "enabled" "$LOCAL_CONFIG" 2>/dev/null | sed 's/^/    /' || log "    (no enabled: lines)"
+elif [[ "$NEEDS_SECRETS" -eq 1 ]]; then
+  # Nothing to derive the flags from yet. Say so rather than writing a file of
+  # falses that then looks deliberate on the next run.
+  warn "  NOT created: ${ENV_FILE} has no credentials yet."
+  warn "  Fill it in and re-run deploy; this file is written from what it contains."
 else
   ODDS_ENABLED=false; [[ -n "${ODDS_API_KEY:-}" ]] && ODDS_ENABLED=true
   KALSHI_ENABLED=false; [[ -n "${KALSHI_API_KEY_ID:-}" ]] && KALSHI_ENABLED=true
@@ -160,6 +189,25 @@ for unit in mlb-edge-poller.service \
   install -m 644 "$SCRIPT_DIR/$unit" "$UNIT_DIR/$unit"
 done
 systemctl daemon-reload
+
+# --- 7b. did the deploy actually achieve anything? -------------------------
+# The same question the completeness check asks of the poller, asked of the
+# deploy. Everything above can print green while the result is a service that
+# starts, finds nothing enabled and restarts forever. Ask the config directly.
+if [[ "$NEEDS_SECRETS" -eq 0 ]]; then
+  log "verifying resolved configuration"
+  ENABLED_OUT="$(sudo -u "$SERVICE_USER" env \
+      ODDS_API_KEY="${ODDS_API_KEY:-}" \
+      KALSHI_API_KEY_ID="${KALSHI_API_KEY_ID:-}" \
+      KALSHI_PRIVATE_KEY_PATH="${KALSHI_PRIVATE_KEY_PATH:-}" \
+      "$APP_DIR/.venv/bin/mlb-edge" poll-sources --root "$APP_DIR" 2>&1)" || true
+  printf '%s\n' "$ENABLED_OUT" | sed 's/^/    /'
+  if ! printf '%s' "$ENABLED_OUT" | grep -q 'enabled: '; then
+    warn "no pollable source resolved as enabled."
+    warn "  The service will start, find nothing to poll and restart on a loop."
+    warn "  Edit ${LOCAL_CONFIG} and re-run, or check the credentials in ${ENV_FILE}."
+  fi
+fi
 
 if [[ "$NEEDS_SECRETS" -eq 1 ]]; then
   warn "units installed but NOT started -- add credentials to ${ENV_FILE} and re-run"

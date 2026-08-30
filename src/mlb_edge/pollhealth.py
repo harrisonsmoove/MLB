@@ -220,15 +220,50 @@ def coverage_alerts(
                 subject=(
                     f"{report.venue}: captured {report.covered}/{report.expected} games"
                 ),
-                body=(
-                    "Missing: " + ", ".join(report.missing[:8])
-                    + ("" if len(report.missing) <= 8 else f" (+{len(report.missing) - 8} more)")
-                    + "\nA shortfall here usually means pagination stopped early or a "
-                    "series ticker changed. The requests will still have returned 200."
-                ),
+                body=_shortfall_body(report),
             )
         )
     return alerts
+
+
+def _shortfall_body(report: CoverageReport) -> str:
+    """Enough to tell a matcher gap from a truncated board without an ssh session.
+
+    Those need opposite responses: one is a counting bug with the data safely
+    archived, the other is permanent loss on a source with no historical
+    endpoint. "MISSING 13" says nothing about which.
+    """
+    lines = [
+        "Missing: "
+        + ", ".join(report.missing[:8])
+        + ("" if len(report.missing) <= 8 else f" (+{len(report.missing) - 8} more)")
+    ]
+
+    uncounted = report.present_but_uncounted
+    absent = [m for m in report.missing if m not in set(uncounted)]
+    if uncounted:
+        lines.append(
+            f"\n{len(uncounted)} of these ARE in the payload but were not counted "
+            "-- a matcher gap, not data loss:"
+        )
+        lines.extend(f"  {label}" for label in uncounted[:5])
+    if absent:
+        lines.append(
+            f"\n{len(absent)} do not appear at all -- that is real loss, and Tier 0 "
+            "has no historical endpoint to re-poll:"
+        )
+        lines.extend(f"  {label}" for label in absent[:5])
+
+    if report.sample_labels:
+        lines.append("\nWhat the payload actually contains:")
+        lines.extend(f"  {value}" for value in report.sample_labels[:8])
+    else:
+        lines.append(
+            "\nNo recognisable title or ticker strings in the payload at all. "
+            "The shape is not what the matcher assumes."
+        )
+    lines.append("\n`mlb-edge explain-coverage --venue <venue>` for the full picture.")
+    return "\n".join(lines)
 
 
 def frozen_alerts(fingerprint: Any, identical_ticks: int, *, threshold: int = 2) -> list[Alert]:

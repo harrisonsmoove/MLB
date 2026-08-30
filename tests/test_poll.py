@@ -366,10 +366,19 @@ def test_daemon_survives_a_source_that_raises(tmp_path, settings_with_keys):
     assert "went sideways" in frame["error"][0], "the failure is archived, not swallowed"
 
 
-def test_daemon_with_no_enabled_sources_exits_cleanly(tmp_path, settings_with_keys):
+def test_daemon_with_no_enabled_sources_fails_loudly(tmp_path, settings_with_keys):
+    """It used to return 0, so systemd saw a clean exit and restarted it every
+    30 seconds forever while polling nothing. A poller with nothing to poll is
+    a config error, and it has to look like one."""
+    from mlb_edge.poll import NoSourcesEnabled
+
     daemon = PollDaemon(settings_with_keys, archive=PollArchive(tmp_path), slate=OfflineSlate())
     daemon.states.clear()
-    assert daemon.run(once=True) == 0
+    with pytest.raises(NoSourcesEnabled) as excinfo:
+        daemon.run(once=True)
+    # The message must name where to fix it -- settings.yaml does not survive a
+    # deploy, local.yaml does.
+    assert "local.yaml" in str(excinfo.value)
 
 
 def test_stop_request_ends_the_loop(tmp_path, settings_with_keys):

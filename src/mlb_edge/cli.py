@@ -25,7 +25,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from mlb_edge.config import ConfigError, Settings
+from mlb_edge.config import MISSING_SECRET, ConfigError, Settings
 from mlb_edge.config import load_settings as _load_settings_raw
 from mlb_edge.storage.rawcache import RawCache
 from mlb_edge.storage.warehouse import Warehouse
@@ -798,12 +798,19 @@ def poll_daemon(
     time, so this process staying up matters more than anything downstream of it
     being correct.
     """
-    from mlb_edge.poll import PollDaemon
+    from mlb_edge.poll import NoSourcesEnabled, PollDaemon
 
     settings = load_settings(root)
-    daemon = PollDaemon(settings)
-    daemon.install_signal_handlers()
-    daemon.run(once=once, max_ticks=max_ticks)
+    try:
+        daemon = PollDaemon(settings)
+        daemon.install_signal_handlers()
+        daemon.run(once=once, max_ticks=max_ticks)
+    except NoSourcesEnabled as exc:
+        # Exit non-zero so `systemctl status` shows a failure. Restart=always
+        # still brings it back -- credentials may arrive later -- but the unit
+        # no longer looks healthy while polling nothing.
+        console.print(f"[red]poller cannot start:[/red] {exc}")
+        raise typer.Exit(78) from None
 
 
 @app.command(name="refresh-schedule")
@@ -915,6 +922,141 @@ def test_alert(
         "dying costs you a night of closing lines that Tier 0 cannot re-collect."
     )
     raise typer.Exit(code=1)
+
+
+@app.command(name="explain-coverage")
+def explain_coverage(
+    venue: Annotated[str, typer.Option(help="Venue to explain, e.g. kalshi or odds.")] = "kalshi",
+    day: Annotated[str | None, typer.Option(help="Slate date, YYYY-MM-DD. Defaults to today.")] = None,
+    labels: Annotated[int, typer.Option(help="How many payload strings to print.")] = 40,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Why a venue's coverage is short: not counted, or not fetched?
+
+    `captured 1/14` does not distinguish a matcher that failed to recognise
+    titles -- a counting bug, no data lost -- from a board that was never
+    fetched, which is permanent loss on a source with no historical endpoint.
+    Same log line, opposite responses.
+
+    Reads the newest archived tick off disk. No network, so it is safe to run
+    against a live poller.
+    """
+    from datetime import date as _date
+
+    import polars as pl
+
+    from mlb_edge.completeness import (
+        SlateCache,
+        diagnose_coverage,
+        extract_labels,
+        games_in_window,
+    )
+    from mlb_edge.http import client_for
+    from mlb_edge.poll import PollArchive
+
+    settings = load_settings(root)
+    poller_config = settings.section("poller")
+    archive_root = Path(poller_config.get("archive_dir", "data/poll"))
+    archive = PollArchive(
+        archive_root if archive_root.is_absolute() else settings.root / archive_root
+    )
+
+    files = archive.files(venue)
+    if not files:
+        console.print(f"[yellow]no archived ticks for {venue}[/yellow]")
+        raise typer.Exit(1)
+
+    newest = files[-1]
+    frame = pl.read_parquet(newest, columns=["payload", "error"])
+    payloads = [p for p in frame["payload"].to_list() if p]
+    console.print(f"tick: [bold]{newest.name}[/bold]  ({len(payloads)} payloads)\n")
+
+    when = _date.fromisoformat(day) if day else _date.today()
+    slate = SlateCache(settings, client_for(settings, "mlb_statsapi")).slate_for(when)
+    games = games_in_window(
+        list(slate.games),
+        lead=timedelta(hours=float(poller_config.get("completeness_slate_lead_hours", 12))),
+        trail=timedelta(hours=float(poller_config.get("completeness_slate_trail_hours", 5))),
+    )
+    if not games:
+        console.print("[yellow]no games in the window to compare against[/yellow]")
+        raise typer.Exit(1)
+
+    evidence = diagnose_coverage(venue, payloads, games)
+
+    table = Table(title=f"{venue}: {sum(e.matched for e in evidence)}/{len(evidence)} counted")
+    table.add_column("game")
+    table.add_column("tokens searched")
+    table.add_column("found in payload")
+    table.add_column("diagnosis")
+    for entry in sorted(evidence, key=lambda e: (e.matched, e.game.label)):
+        colour = "green" if entry.matched else ("yellow" if entry.loose_hits else "red")
+        table.add_row(
+            entry.game.label,
+            ", ".join(sorted(entry.strict_tokens)) or "[dim]none[/dim]",
+            ", ".join(entry.loose_hits) or "[dim]nothing[/dim]",
+            f"[{colour}]{entry.diagnosis}[/{colour}]",
+        )
+    console.print(table)
+
+    absent = [e for e in evidence if not e.matched and not e.loose_hits]
+    gaps = [e for e in evidence if not e.matched and e.loose_hits]
+    if gaps:
+        console.print(
+            f"\n[yellow]{len(gaps)} game(s) are in the payload but not counted.[/yellow] "
+            "That is a matcher gap, not data loss -- the archive has them."
+        )
+    if absent:
+        console.print(
+            f"\n[red]{len(absent)} game(s) do not appear at all.[/red] "
+            "That is real loss on a source with no historical endpoint."
+        )
+
+    strings = extract_labels(payloads)
+    console.print(f"\npayload strings ({len(strings)} distinct, showing {min(labels, len(strings))}):")
+    for value in strings[:labels]:
+        console.print(f"  {value}")
+    if not strings:
+        console.print(
+            "  [yellow]none[/yellow] -- no recognisable title or ticker keys. "
+            "The payload shape is not what the matcher assumes; that alone "
+            "explains the shortfall."
+        )
+
+
+@app.command(name="poll-sources")
+def poll_sources(root: Annotated[Path | None, typer.Option()] = None) -> None:
+    """Which venues the poller would actually poll, and why the others are out.
+
+    Deploy runs this to check it achieved something. A deploy that prints green
+    and leaves a service restarting on an empty source list is the same failure
+    shape as a poller reporting `captured 0/0`.
+    """
+    settings = load_settings(root)
+    any_enabled = False
+    for venue in ("odds", "kalshi", "polymarket"):
+        source = settings.source(venue)
+        if not source.enabled:
+            console.print(f"{venue:<12} [dim]disabled[/dim] (sources.{venue}.enabled)")
+            continue
+        missing = [
+            key for key in source.raw if source.raw[key] == MISSING_SECRET
+        ]
+        if missing:
+            console.print(
+                f"{venue:<12} [yellow]enabled but unusable[/yellow]: "
+                f"{', '.join(missing)} unset in the environment"
+            )
+            continue
+        any_enabled = True
+        console.print(f"{venue:<12} [green]enabled: will be polled[/green]")
+
+    if not any_enabled:
+        console.print(
+            "\n[red]nothing to poll.[/red] Set the flags in config/local.yaml "
+            "(git-ignored, survives deploy) and the keys in the environment file."
+        )
+        raise typer.Exit(1)
 
 
 @app.command(name="poll-status")

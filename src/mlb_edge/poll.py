@@ -70,6 +70,10 @@ ARCHIVE_SCHEMA = pa.schema(
 )
 
 
+class NoSourcesEnabled(RuntimeError):
+    """Nothing is enabled to poll. A configuration error, not a runtime one."""
+
+
 @dataclass
 class PollRecord:
     venue: str
@@ -840,12 +844,20 @@ class PollDaemon:
     def run(self, *, once: bool = False, max_ticks: int | None = None) -> int:
         """Main loop. Returns the number of ticks executed."""
         if not self.states:
-            print(
-                "[poll] no sources enabled. Set sources.odds.enabled / "
-                "sources.kalshi.enabled and export their credentials.",
-                flush=True,
+            # Returning 0 here made systemd see a clean exit and restart every
+            # 30s forever, quietly. A poller with nothing to poll is a config
+            # error, not a transient one, and it must look like one.
+            raise NoSourcesEnabled(
+                "no sources enabled -- the poller has nothing to poll.\n"
+                "  Set them in config/local.yaml (git-ignored, survives deploy):\n"
+                "    sources:\n"
+                "      odds:\n"
+                "        enabled: true\n"
+                "      kalshi:\n"
+                "        enabled: true\n"
+                "  and make sure ODDS_API_KEY / KALSHI_API_KEY_ID are in the "
+                "environment file systemd loads."
             )
-            return 0
 
         print(f"[poll] starting: {', '.join(sorted(self.states))}", flush=True)
         print(f"[poll] archive: {self.archive.root}", flush=True)

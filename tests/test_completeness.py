@@ -74,7 +74,7 @@ def test_a_truncated_board_raises_an_alert():
     assert len(alerts) == 1
     assert "1/5" in alerts[0].subject
     assert alerts[0].severity == Severity.WARN
-    assert "pagination" in alerts[0].body
+    assert "explain-coverage" in alerts[0].body
 
 
 def test_total_blackout_is_critical_not_a_warning():

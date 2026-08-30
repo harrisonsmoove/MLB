@@ -409,3 +409,107 @@ def test_missing_minimal_endpoint_warns_before_falling_back(capsys) -> None:
     out = capsys.readouterr().out
     assert "WARN" in out
     assert "schedule_minimal" in out
+
+
+# --- a shortfall must say WHICH shortfall ----------------------------------
+
+
+def _kalshi_markets(titles: list[str]) -> str:
+    return json.dumps({"markets": [{"ticker": f"KX-{i}", "title": t} for i, t in enumerate(titles)]})
+
+
+def _slate_games() -> list[ExpectedGame]:
+    return [
+        _game(1, "New York Yankees", "Boston Red Sox"),
+        _game(2, "Toronto Blue Jays", "Seattle Mariners"),
+        _game(3, "Chicago Cubs", "St. Louis Cardinals"),
+    ]
+
+
+def test_present_but_not_counted_is_distinguished_from_absent() -> None:
+    """`captured 1/14` cannot tell a matcher gap from a truncated board.
+
+    One is a counting bug with the data safely archived; the other is permanent
+    loss on a source with no historical endpoint. Opposite responses.
+    """
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = _slate_games()
+    # Yankees named in full; the Jays game present only as an abbreviation the
+    # strict matcher will not count; the Cubs game absent entirely.
+    payload = _kalshi_markets(
+        ["Will the New York Yankees win?", "TOR vs SEA winner"]
+    )
+
+    evidence = {e.game.game_pk: e for e in diagnose_coverage("kalshi", [payload], games)}
+
+    assert evidence[1].matched
+    assert not evidence[2].matched and evidence[2].loose_hits
+    assert "PRESENT but not counted" in evidence[2].diagnosis
+    assert not evidence[3].matched and not evidence[3].loose_hits
+    assert "ABSENT" in evidence[3].diagnosis
+
+
+def test_the_alert_carries_the_payload_strings() -> None:
+    """So a 3am alert is actionable without an ssh session."""
+    games = _slate_games()
+    payload = _kalshi_markets(["Will the New York Yankees win?", "TOR vs SEA winner"])
+    slate = Slate(day=date(2026, 8, 30), games=tuple(games), in_progress=3)
+
+    report = coverage_for_venue("kalshi", [payload], games, slate=slate)
+    alerts = coverage_alerts([report])
+
+    assert len(alerts) == 1
+    body = alerts[0].body
+    assert "TOR vs SEA winner" in body
+    assert "not counted" in body
+    assert "real loss" in body
+    assert "explain-coverage" in body
+
+
+def test_a_payload_with_no_recognisable_strings_says_so() -> None:
+    """Which by itself explains a shortfall -- the shape is not what we assume."""
+    games = _slate_games()
+    payload = json.dumps({"orderbook": {"yes": [[50, 10]], "no": [[49, 8]]}})
+    slate = Slate(day=date(2026, 8, 30), games=tuple(games), in_progress=3)
+
+    body = coverage_alerts([coverage_for_venue("kalshi", [payload], games, slate=slate)])[0].body
+    assert "No recognisable title or ticker strings" in body
+
+
+def test_a_complete_board_pays_nothing_for_diagnosis() -> None:
+    """The evidence gathering only runs when something is actually wrong."""
+    games = [_game(1, "New York Yankees", "Boston Red Sox")]
+    payload = _kalshi_markets(["Will the New York Yankees beat the Boston Red Sox?"])
+    report = coverage_for_venue("kalshi", [payload], games)
+
+    assert report.complete
+    assert report.sample_labels == []
+    assert report.present_but_uncounted == []
+
+
+def test_extract_labels_walks_nested_payloads() -> None:
+    from mlb_edge.completeness import extract_labels
+
+    payload = json.dumps(
+        {"data": {"markets": [{"title": "Yankees win?", "yes_sub_title": "NYY"}]}}
+    )
+    assert extract_labels([payload]) == ["Yankees win?", "NYY"]
+
+
+def test_extract_labels_survives_junk() -> None:
+    from mlb_edge.completeness import extract_labels
+
+    assert extract_labels(["{not json", "", "[]"]) == []
+
+
+def test_loose_tokens_include_abbreviations_and_cities() -> None:
+    """Deliberately looser than the counting matcher: for diagnosis a false
+    positive is informative and a false negative is not."""
+    from mlb_edge.completeness import loose_tokens
+
+    tokens = loose_tokens(_game(1, "Toronto Blue Jays", "Seattle Mariners"))
+    assert "tbj" in tokens          # initials
+    assert "toronto" in tokens      # city
+    assert "jays" in tokens         # nickname
+    assert "seattlemariners" in tokens
