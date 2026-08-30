@@ -980,6 +980,97 @@ def poll_status(root: Annotated[Path | None, typer.Option()] = None) -> None:
         )
 
 
+@app.command(name="probe-hydrate")
+def probe_hydrate(
+    day: Annotated[str | None, typer.Option(help="Date to probe, YYYY-MM-DD. Defaults to today.")] = None,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Find which StatsAPI hydrate terms are still accepted.
+
+    StatsAPI rejects the WHOLE request with 406 when it does not recognise one
+    hydrate term -- it does not ignore the term and return what it can. So one
+    stale term in a six-term string returns nothing at all, on a URL that
+    worked last season, with an error that says nothing about hydration.
+
+    This tries the bare call, then each term on its own, and prints which to
+    remove. Unauthenticated and about eight requests.
+    """
+    from datetime import date as _date
+
+    from mlb_edge.http import UpstreamError, client_for
+    from mlb_edge.hydrate import bisect_terms, hydrate_string
+
+    settings = load_settings(root)
+    source = settings.source("mlb_statsapi")
+    terms = list(source.get("schedule_hydrate") or [])
+    when = _date.fromisoformat(day) if day else _date.today()
+    client = client_for(settings, "mlb_statsapi")
+
+    def probe(subset: list[str]) -> tuple[bool, int | None, str]:
+        if subset:
+            url = source.endpoint(
+                "schedule",
+                start=when.isoformat(),
+                end=when.isoformat(),
+                hydrate=hydrate_string(subset),
+            )
+        else:
+            url = source.endpoint(
+                "schedule_minimal", start=when.isoformat(), end=when.isoformat()
+            )
+        try:
+            response = client.get(url)
+        except UpstreamError as exc:
+            return False, exc.status, str(exc)
+        except Exception as exc:  # noqa: BLE001 - a probe must report, not raise
+            return False, None, f"{type(exc).__name__}: {exc}"
+        return True, response.status, ""
+
+    console.print(f"probing {len(terms)} hydrate terms against {when.isoformat()}\n")
+
+    # StatsAPI usually names the offending field in the 406 body ("Invalid
+    # hydration: X"). One request may answer the question outright, so show it
+    # before spending eight more.
+    full_ok, full_status, full_detail = probe(terms)
+    if not full_ok:
+        console.print(f"[red]full hydrate string failed[/red] (HTTP {full_status}):")
+        console.print(f"  {full_detail}\n")
+    else:
+        console.print("[green]the full hydrate string is accepted[/green] -- nothing to fix.\n")
+
+    result = bisect_terms(terms, probe)
+
+    table = Table(title="hydrate terms")
+    table.add_column("term")
+    table.add_column("status", justify="right")
+    table.add_column("verdict")
+    table.add_row(
+        "[dim](none -- bare call)[/dim]",
+        "",
+        "[green]accepted[/green]" if result.baseline_ok else f"[red]FAILED[/red] {result.baseline_detail}",
+    )
+    for entry in result.terms:
+        colour = "green" if entry.ok else ("red" if entry.verdict == "REJECTED" else "yellow")
+        table.add_row(entry.term, str(entry.status or "-"), f"[{colour}]{entry.verdict}[/{colour}]")
+    console.print(table)
+
+    if result.combined_ok is False:
+        console.print(
+            "\n[yellow]Every term passes alone but the combination fails.[/yellow] "
+            "That points at the combination or the URL length, not one term."
+        )
+    console.print(f"\n{result.suggestion()}")
+    if result.rejected:
+        remaining = [x for x in terms if x not in result.rejected]
+        console.print(
+            "\nThe games spine does not need any of these -- the completeness check "
+            "already uses the unhydrated endpoint, and the ingester degrades to it. "
+            "Fixing this restores probable pitchers, venue, weather and linescore."
+        )
+        console.print(f"\nResulting hydrate: [bold]{hydrate_string(remaining) or '(none)'}[/bold]")
+        raise typer.Exit(1)
+
+
 def _latest_quota(archive: Any) -> int | None:
     """Most recent non-null quota_remaining in the odds archive."""
     import polars as pl

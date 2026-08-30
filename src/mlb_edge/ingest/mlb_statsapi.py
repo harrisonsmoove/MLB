@@ -20,6 +20,7 @@ from typing import Any
 
 import polars as pl
 
+from mlb_edge.hydrate import hydrate_string
 from mlb_edge.ingest.base import FetchTask, Ingester, provenance_columns
 from mlb_edge.storage.rawcache import RawEntry
 from mlb_edge.timeutil import game_date_for, parse_iso_utc, utcnow
@@ -64,12 +65,32 @@ class MlbScheduleIngester(Ingester):
             # that lands mid-slate is harmless because everything is keyed on
             # game_pk, not on which request happened to carry it.
             chunk_end = min(cursor + timedelta(days=6), end)
+            terms = self.config.get("schedule_hydrate") or []
             tasks.append(
                 FetchTask(
                     dataset="schedule",
                     partition=f"{cursor.isoformat()}_{chunk_end.isoformat()}",
                     url=self.config.endpoint(
-                        "schedule", start=cursor.isoformat(), end=chunk_end.isoformat()
+                        "schedule",
+                        start=cursor.isoformat(),
+                        end=chunk_end.isoformat(),
+                        hydrate=hydrate_string(terms),
+                    ),
+                    # StatsAPI 406s the whole request on one unrecognised
+                    # hydrate term. The games spine matters more than the
+                    # hydrated extras, so a rejection degrades to the bare call
+                    # rather than losing the range entirely.
+                    fallback_url=self.config.endpoint(
+                        "schedule_minimal",
+                        start=cursor.isoformat(),
+                        end=chunk_end.isoformat(),
+                    ),
+                    fallback_note=(
+                        "probable_pitchers, venue, weather and linescore are ABSENT "
+                        "for this range -- they are not 'not announced'. Run "
+                        "`mlb-edge probe-hydrate` to find the rejected term, fix "
+                        "sources.mlb_statsapi.schedule_hydrate, then re-run with "
+                        "--force-refresh."
                     ),
                     max_age_seconds=_schedule_ttl(chunk_end, today),
                     context={"start": cursor.isoformat(), "end": chunk_end.isoformat()},

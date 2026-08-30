@@ -87,16 +87,24 @@ class _Client:
 
 
 class _Settings:
-    def __init__(self, endpoint_template: str):
+    def __init__(self, endpoint_template: str, *, endpoints: dict | None = None):
         self._template = endpoint_template
+        self._endpoints = (
+            endpoints if endpoints is not None else {"schedule_minimal": endpoint_template}
+        )
 
     def source(self, name):
         template = self._template
+        endpoints = self._endpoints
 
         class _Source:
             @staticmethod
             def endpoint(_name, **kwargs):
                 return template.format(**kwargs)
+
+            @staticmethod
+            def get(key, default=None):
+                return {"endpoints": endpoints}.get(key, default)
 
         return _Source()
 
@@ -372,3 +380,32 @@ def test_items_is_none_when_payloads_are_not_arrays() -> None:
 )
 def test_every_state_reads_differently(report: CoverageReport, must_contain: str) -> None:
     assert must_contain in report.line()
+
+
+# --- the hydrate 406 that took the check offline ---------------------------
+
+
+def test_completeness_uses_the_unhydrated_endpoint() -> None:
+    """The check that watches for silent breakage must not share its failure mode.
+
+    StatsAPI rejects the whole request with 406 on one unrecognised hydrate
+    term. The completeness check needs game_pk, teams and start time, none of
+    which need hydration, so it asks for none -- and no hydrate term can take it
+    down again.
+    """
+    client = _Client(_schedule_payload(14))
+    SlateCache(SETTINGS, client, ttl_seconds=0).slate_for(date(2026, 8, 30), now=NOW)
+    assert "hydrate" not in client.urls[0]
+
+
+def test_missing_minimal_endpoint_warns_before_falling_back(capsys) -> None:
+    """An older config still works, but says what it is now exposed to."""
+    settings = _Settings(
+        "https://statsapi/schedule?startDate={start}&endDate={end}", endpoints={}
+    )
+    client = _Client(_schedule_payload(14))
+    SlateCache(settings, client, ttl_seconds=0).slate_for(date(2026, 8, 30), now=NOW)
+
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "schedule_minimal" in out

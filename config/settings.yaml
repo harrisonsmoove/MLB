@@ -119,13 +119,35 @@ sources:
     # Endpoint templates. Kept in config so a shape/route change is a config
     # edit, not a code edit.
     endpoints:
-      schedule: "/schedule?sportId=1&startDate={start}&endDate={end}&hydrate=probablePitcher(note),linescore,venue,weather,game(content(summary)),seriesStatus"
+      # Hydrated, for the ingester. StatsAPI rejects the WHOLE request with 406
+      # when it does not recognise one hydrate term -- it does not ignore the
+      # term -- so this string is a single point of failure for anything that
+      # sends it. Bisect it with `mlb-edge probe-hydrate` after any 406; the
+      # ingester also degrades to the bare call rather than returning nothing.
+      schedule: "/schedule?sportId=1&startDate={start}&endDate={end}&hydrate={hydrate}"
+      # Deliberately unhydrated, for the completeness check. The thing that
+      # watches for silent breakage must have fewer dependencies than what it
+      # watches, or it goes down with it: a hydrate term StatsAPI stopped
+      # accepting took the check offline for weeks while the poller kept
+      # writing, which is precisely the state the check exists to detect.
+      schedule_minimal: "/schedule?sportId=1&startDate={start}&endDate={end}"
       game_feed: "/game/{game_pk}/feed/live"
       boxscore: "/game/{game_pk}/boxscore"
       venues: "/venues?hydrate=location,fieldInfo"
       teams: "/teams?sportId=1&season={season}"
       people: "/people?personIds={person_ids}&hydrate=stats(group=[hitting,pitching],type=[season])"
       transactions: "/transactions?startDate={start}&endDate={end}"
+    # Hydrate terms as a LIST, not a baked string, so a rejected term can be
+    # dropped individually instead of the request being abandoned. Order is
+    # preserved. `mlb-edge probe-hydrate` tests each one against the live API
+    # and prints the terms this list should contain.
+    schedule_hydrate:
+      - probablePitcher(note)
+      - linescore
+      - venue
+      - weather
+      - game(content(summary))
+      - seriesStatus
     # Lineups are only trustworthy once the API marks them official.
     lineup_confirmed_status_codes: ["P", "PW", "S", "I", "IR", "IH", "MC", "MA", "MB", "MF", "MO", "MR", "MW"]
 

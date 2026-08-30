@@ -20,7 +20,7 @@ available, so it can only under-claim what we knew, never over-claim it.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Any
 
@@ -28,6 +28,7 @@ import polars as pl
 
 from mlb_edge.config import Settings
 from mlb_edge.http import HttpClient, UpstreamError, client_for
+from mlb_edge.hydrate import is_hydrate_rejection
 from mlb_edge.storage.rawcache import RawCache, RawEntry
 from mlb_edge.storage.warehouse import Warehouse
 from mlb_edge.timeutil import utcnow
@@ -50,6 +51,14 @@ class FetchTask:
     # it is pure waste. Statcast is the counterexample and sets a real TTL.
     max_age_seconds: float | None = None
     context: dict[str, Any] = field(default_factory=dict)
+    #: A reduced URL to retry with when the upstream rejects the full request.
+    #: StatsAPI answers an unrecognised hydrate term with 406 for the WHOLE
+    #: request rather than ignoring the term, so one stale term otherwise
+    #: returns nothing at all. Partial data with a named gap beats no data.
+    fallback_url: str | None = None
+    #: What is missing when the fallback is used. Printed and recorded -- an
+    #: unannounced degrade is how nulls become "no starter announced".
+    fallback_note: str = ""
 
 
 @dataclass
@@ -61,6 +70,9 @@ class IngestReport:
     versions_written: int = 0
     rows_written: dict[str, int] = field(default_factory=dict)
     failures: list[str] = field(default_factory=list)
+    #: Tasks that succeeded only after dropping part of the request. Not
+    #: failures, and emphatically not successes to be reported as clean.
+    degraded: list[str] = field(default_factory=list)
 
     def add_rows(self, table: str, n: int) -> None:
         self.rows_written[table] = self.rows_written.get(table, 0) + n
@@ -75,6 +87,7 @@ class IngestReport:
             f"{self.source}: planned={self.tasks_planned} fetched={self.tasks_fetched} "
             f"cached={self.tasks_from_cache} new_versions={self.versions_written} "
             f"rows[{rows}] failures={len(self.failures)}"
+            + (f" DEGRADED={len(self.degraded)}" if self.degraded else "")
         )
 
 
@@ -146,8 +159,26 @@ class Ingester(ABC):
             try:
                 entry, is_new = self._fetch_and_store(task, force_refresh=force_refresh)
             except UpstreamError as exc:
-                report.failures.append(f"{task.dataset}/{task.partition}: {exc}")
-                continue
+                if task.fallback_url is None or not is_hydrate_rejection(exc.status):
+                    report.failures.append(f"{task.dataset}/{task.partition}: {exc}")
+                    continue
+                note = (
+                    f"{task.dataset}/{task.partition}: HTTP {exc.status} on the full "
+                    f"request; retried reduced. {task.fallback_note}"
+                )
+                print(f"[ingest] WARN: {note}", flush=True)
+                try:
+                    entry, is_new = self._fetch_and_store(
+                        replace(task, url=task.fallback_url, fallback_url=None),
+                        force_refresh=force_refresh,
+                    )
+                except UpstreamError as inner:
+                    report.failures.append(
+                        f"{task.dataset}/{task.partition}: {exc}; reduced retry also "
+                        f"failed: {inner}"
+                    )
+                    continue
+                report.degraded.append(note)
 
             if is_new:
                 report.tasks_fetched += 1

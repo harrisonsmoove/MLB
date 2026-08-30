@@ -37,6 +37,7 @@ from datetime import date, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from mlb_edge.hydrate import hydrate_string
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
@@ -206,6 +207,36 @@ class SlateCache:
         self._slate: Slate | None = None
         self._fetched_at: datetime | None = None
         self.last_error: str | None = None
+        self._warned_minimal = False
+
+    def _url(self, start: date, end: date) -> str:
+        """The unhydrated schedule endpoint, or the hydrated one with a warning.
+
+        ``schedule_minimal`` carries no hydrate, so no hydrate term can take the
+        completeness check offline. Falling back to the hydrated endpoint keeps
+        an older config working, but says so: that endpoint is exactly the one
+        that returned 406 for weeks while the check reported ``captured 0/0``.
+        """
+        endpoints = self.config.get("endpoints") or {}
+        if "schedule_minimal" in endpoints:
+            return self.config.endpoint(
+                "schedule_minimal", start=start.isoformat(), end=end.isoformat()
+            )
+        if not self._warned_minimal:
+            self._warned_minimal = True
+            print(
+                "[slate] WARN: no schedule_minimal endpoint configured; falling back "
+                "to the hydrated schedule URL. A hydrate term StatsAPI stops "
+                "accepting will take the completeness check down with it. Add "
+                "sources.mlb_statsapi.endpoints.schedule_minimal.",
+                flush=True,
+            )
+        return self.config.endpoint(
+            "schedule",
+            start=start.isoformat(),
+            end=end.isoformat(),
+            hydrate=hydrate_string(self.config.get("schedule_hydrate") or []),
+        )
 
     def slate_for(self, day: date, *, now: datetime | None = None) -> Slate:
         reference = ensure_utc(now or utcnow())
@@ -221,9 +252,7 @@ class SlateCache:
 
         start, end = day - timedelta(days=1), day + timedelta(days=1)
         try:
-            url = self.config.endpoint(
-                "schedule", start=start.isoformat(), end=end.isoformat()
-            )
+            url = self._url(start, end)
             response = self.client.get(url)
             games = parse_slate(response.content)
             in_progress = parse_in_progress(response.content)
