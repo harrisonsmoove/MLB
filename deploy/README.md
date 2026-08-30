@@ -75,6 +75,33 @@ cheapest thing on the critical path.
 
 Kalshi is not credit-metered and polls at the full cadence regardless.
 
+## Alerting — set it up before you need it
+
+Alerts go to the journal always, and to Telegram if configured. Journal-only
+means nobody sees them at 3am.
+
+```bash
+# 1. @BotFather -> /newbot -> copy the token into TELEGRAM_BOT_TOKEN
+# 2. Send your bot any message (Telegram hides the chat id until you do)
+# 3. Find the chat id:
+mlb-edge test-alert --discover-chat --root /opt/mlb-edge
+# 4. Put it in TELEGRAM_CHAT_ID, then prove the whole path:
+mlb-edge test-alert --root /opt/mlb-edge
+```
+
+`test-alert` validates the token separately from delivery, so a failure tells
+you which thing is wrong rather than just "failed":
+
+| Symptom | Meaning |
+|---|---|
+| `token rejected (401)` | `TELEGRAM_BOT_TOKEN` is wrong |
+| `chat not found` | `TELEGRAM_CHAT_ID` is wrong, or you never messaged the bot |
+| `bot was blocked` | unblock it in Telegram |
+| `could not reach Telegram` | network or egress problem on the box |
+
+It exits non-zero if nothing reached a phone, so it is safe to put in a
+post-deploy check.
+
 ## Checking it works
 
 ```bash

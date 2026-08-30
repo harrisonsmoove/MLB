@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 303 tests, no network required
+uv run pytest                      # 318 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -225,6 +225,21 @@ stop you.
 | No hardcoded fee schedules | Kalshi fees are fetched or trading halts |
 | No hardcoded response shapes | endpoints and field maps live in `config/settings.yaml` |
 | Naive datetimes rejected | `timeutil.ensure_utc` raises rather than assuming UTC |
+| **Degraded paths announce themselves** | see below |
+
+### Standing rule: if it can be silently wrong, it gets a voice
+
+Three bugs in this repo had the same shape — code took a degraded path and
+reported success. A dropped Kalshi cursor returned HTTP 200 while discarding
+most of the board. A config key nested under the wrong block paced the odds
+budget against a guessed horizon. A saturated regression constant flattened
+every hitter to league average while emitting well-formed output.
+
+So: **any fallback, default, or degraded path announces itself at WARN and is
+pinned by a test.** Examples currently enforced —
+`poller.season_end_date` missing, Telegram unconfigured, Kalshi auth
+half-configured, a page-limit bound being hit, a backup that never left the box.
+
 
 ## Rebuilding from cache
 
@@ -278,5 +293,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          303 tests, all offline, fixtures + a synthetic generator
+tests/          318 tests, all offline, fixtures + a synthetic generator
 ```

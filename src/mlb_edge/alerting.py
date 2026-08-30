@@ -19,15 +19,17 @@ Two rules shape this module:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
@@ -54,6 +56,8 @@ class Alert:
 class Alerter(Protocol):
     def send(self, alert: Alert) -> bool: ...
 
+    def describe(self) -> str: ...
+
 
 class LogAlerter:
     """Writes to stdout. Under systemd that is journald, which is durable."""
@@ -61,6 +65,9 @@ class LogAlerter:
     def send(self, alert: Alert) -> bool:
         print(f"[alert] {alert.render()}", flush=True)
         return True
+
+    def describe(self) -> str:
+        return "journal (always available)"
 
 
 class TelegramAlerter:
@@ -77,6 +84,59 @@ class TelegramAlerter:
         self.token = token
         self.chat_id = chat_id
         self.timeout = timeout
+        self.last_error: str | None = None
+
+    def describe(self) -> str:
+        masked = f"{self.token[:8]}...{self.token[-4:]}" if len(self.token) > 14 else "set"
+        return f"telegram (token {masked}, chat {self.chat_id})"
+
+    def check(self) -> tuple[bool, str]:
+        """Validate the token without sending anything, via getMe."""
+        try:
+            with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{self.token}/getMe", timeout=self.timeout
+            ) as response:
+                payload = json.loads(response.read())
+            name = (payload.get("result") or {}).get("username", "?")
+            return True, f"token valid, bot is @{name}"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return False, "token rejected (401) -- TELEGRAM_BOT_TOKEN is wrong"
+            return False, f"HTTP {exc.code} from getMe"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"could not reach Telegram: {exc}"
+
+    def discover_chat_ids(self) -> tuple[list[dict[str, Any]], str]:
+        """Chat ids that have messaged this bot.
+
+        Telegram will not tell a bot its own chat id until someone messages it
+        first, which is the step people miss.
+        """
+        try:
+            with urllib.request.urlopen(
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
+                timeout=self.timeout,
+            ) as response:
+                payload = json.loads(response.read())
+        except Exception as exc:  # noqa: BLE001
+            return [], f"could not reach Telegram: {exc}"
+
+        chats: dict[Any, dict[str, Any]] = {}
+        for update in payload.get("result", []) or []:
+            message = update.get("message") or update.get("channel_post") or {}
+            chat = message.get("chat") or {}
+            if chat.get("id") is not None:
+                chats[chat["id"]] = {
+                    "id": chat["id"],
+                    "type": chat.get("type"),
+                    "title": chat.get("title") or chat.get("username") or chat.get("first_name"),
+                }
+        if not chats:
+            return [], (
+                "no chats found. Message your bot once from the account you want "
+                "alerts on, then run this again."
+            )
+        return list(chats.values()), f"{len(chats)} chat(s) found"
 
     @classmethod
     def from_env(cls) -> TelegramAlerter | None:
@@ -97,10 +157,34 @@ class TelegramAlerter:
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                self.last_error = None
                 return 200 <= response.status < 300
-        except Exception as exc:  # noqa: BLE001
-            print(f"[alert] telegram delivery failed: {exc}", flush=True)
+        except urllib.error.HTTPError as exc:
+            body = ""
+            with contextlib.suppress(Exception):
+                body = json.loads(exc.read()).get("description", "")
+            self.last_error = _diagnose(exc.code, body)
+            print(f"[alert] telegram delivery failed: {self.last_error}", flush=True)
             return False
+        except Exception as exc:  # noqa: BLE001
+            self.last_error = f"could not reach Telegram: {exc}"
+            print(f"[alert] telegram delivery failed: {self.last_error}", flush=True)
+            return False
+
+
+def _diagnose(status: int, description: str) -> str:
+    """Turn a Telegram error into the thing to actually go and fix."""
+    text = (description or "").lower()
+    if status == 401:
+        return "token rejected (401): TELEGRAM_BOT_TOKEN is wrong"
+    if "chat not found" in text:
+        return (
+            "chat not found: TELEGRAM_CHAT_ID is wrong, or you have not messaged "
+            "the bot yet. Run: mlb-edge test-alert --discover-chat"
+        )
+    if "bot was blocked" in text:
+        return "the bot is blocked by that chat; unblock it in Telegram"
+    return f"HTTP {status}: {description or 'no detail'}"
 
 
 @dataclass
@@ -119,6 +203,22 @@ class CompositeAlerter:
                 results.append(False)
         return any(results)
 
+    def send_per_backend(self, alert: Alert) -> list[tuple[str, bool, str]]:
+        """``(description, delivered, detail)`` for each backend."""
+        results: list[tuple[str, bool, str]] = []
+        for backend in self.backends:
+            description = backend.describe()
+            try:
+                delivered = bool(backend.send(alert))
+                detail = getattr(backend, "last_error", None) or ""
+            except Exception as exc:  # noqa: BLE001
+                delivered, detail = False, f"{type(exc).__name__}: {exc}"
+            results.append((description, delivered, detail))
+        return results
+
+    def describe(self) -> str:
+        return ", ".join(b.describe() for b in self.backends)
+
 
 def build_alerter(*, enable_telegram: bool = True) -> CompositeAlerter:
     backends: list[Alerter] = [LogAlerter()]
@@ -127,9 +227,12 @@ def build_alerter(*, enable_telegram: bool = True) -> CompositeAlerter:
         if telegram is not None:
             backends.append(telegram)
         else:
+            # Standing rule: a degraded path announces itself. Journal-only
+            # alerting means nothing reaches a phone at 3am, which is exactly
+            # when it matters.
             print(
-                "[alert] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; "
-                "alerts go to the journal only",
+                "[alert] WARN: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; "
+                "alerts go to the journal only and nobody will see them",
                 flush=True,
             )
     return CompositeAlerter(backends=backends)

@@ -794,6 +794,92 @@ def refresh_schedule(
     )
 
 
+@app.command(name="test-alert")
+def test_alert(
+    discover_chat: Annotated[
+        bool, typer.Option(help="List chat ids that have messaged your bot.")
+    ] = False,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Send a test alert through every configured backend.
+
+    Run this before you need it. Finding out that alerting was misconfigured
+    during the first outage means the outage already cost you the data it was
+    supposed to protect.
+    """
+    from mlb_edge.alerting import Alert, Severity, TelegramAlerter, build_alerter
+
+    load_settings(root)  # fail early on a broken config
+    telegram = TelegramAlerter.from_env()
+
+    if discover_chat:
+        if telegram is None:
+            console.print(
+                "[red]TELEGRAM_BOT_TOKEN is not set[/red] -- needed to look up chat ids"
+            )
+            raise typer.Exit(code=1)
+        chats, note = telegram.discover_chat_ids()
+        console.print(note)
+        for chat in chats:
+            console.print(
+                f"  [bold]{chat['id']}[/bold]  {chat.get('type', '?')}  "
+                f"{chat.get('title') or ''}"
+            )
+        if chats:
+            console.print(
+                f"\nSet [bold]TELEGRAM_CHAT_ID={chats[0]['id']}[/bold] "
+                "in /etc/mlb-edge/mlb-edge.env"
+            )
+        raise typer.Exit(code=0 if chats else 1)
+
+    console.print("[bold]configured backends[/bold]")
+    if telegram is None:
+        console.print(
+            "  [yellow]telegram: NOT configured[/yellow] -- set TELEGRAM_BOT_TOKEN "
+            "and TELEGRAM_CHAT_ID in /etc/mlb-edge/mlb-edge.env"
+        )
+    else:
+        ok, detail = telegram.check()
+        style = "green" if ok else "red"
+        console.print(f"  [{style}]telegram: {detail}[/{style}]")
+
+    alerter = build_alerter()
+    alert = Alert(
+        key="test-alert",
+        severity=Severity.INFO,
+        subject="mlb-edge test alert",
+        body=(
+            "If you are reading this on your phone, alerting works. "
+            "Sent by `mlb-edge test-alert`."
+        ),
+    )
+
+    console.print("\n[bold]delivery[/bold]")
+    # Deliberately bypasses the throttle: this is a test, and a throttled test
+    # that silently sends nothing would be worse than no test at all.
+    results = alerter.send_per_backend(alert)
+    for description, delivered, detail in results:
+        style = "green" if delivered else "red"
+        status = "delivered" if delivered else "FAILED"
+        console.print(f"  [{style}]{status}[/{style}]  {description}")
+        if detail:
+            console.print(f"    {detail}")
+
+    reached_phone = any(
+        delivered for description, delivered, _ in results if "telegram" in description
+    )
+    if reached_phone:
+        console.print("\n[green]alerting works[/green] -- check your phone")
+        return
+
+    console.print(
+        "\n[yellow]nothing reached a phone.[/yellow] The journal still has every "
+        "alert, but nobody reads the journal at 3am -- which is when the poller "
+        "dying costs you a night of closing lines that Tier 0 cannot re-collect."
+    )
+    raise typer.Exit(code=1)
+
+
 @app.command(name="poll-status")
 def poll_status(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Archive coverage and what the odds budget still buys."""
