@@ -489,7 +489,15 @@ projector:
 simulation:
   n_sims: 25000
   random_seed: 20260101
-  extra_innings_runner_on_second: true
+  # The automatic runner on second is SEASON-CONDITIONAL: regular season from
+  # 2020, never in the postseason. An unconditional flag silently applied it to
+  # 2018-2019, which compresses the extra-innings tail -- and the tail is
+  # precisely what the run-distribution validation checks. The rule itself lives
+  # in src/mlb_edge/rules.py so it cannot be flipped on by a single boolean.
+  #
+  # Same for the designated hitter, which moves league run scoring by roughly
+  # 0.2-0.3 R/G and would otherwise be attributed to the state machine.
+  season_rules_module: mlb_edge.rules
 
 market:
   # Book-name to MLB-name aliases, applied after normalisation. Only entries
