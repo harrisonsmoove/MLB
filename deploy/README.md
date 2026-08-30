@@ -12,6 +12,20 @@ git clone https://github.com/harrisonsmoove/MLB /tmp/mlb-edge
 sudo /tmp/mlb-edge/deploy/deploy.sh
 ```
 
+**If the branch has not reached GitHub yet**, deploy from a git bundle instead
+— `git clone` and `git fetch` both accept a bundle path, so nothing else
+changes:
+
+```bash
+scp mlb-edge.bundle you@box:/root/mlb-edge.bundle
+ssh you@box
+git clone --branch claude/mlb-simulation-betting-txwq10 /root/mlb-edge.bundle /tmp/mlb-edge
+sudo REPO_URL=/root/mlb-edge.bundle /tmp/mlb-edge/deploy/deploy.sh
+```
+
+Keep the bundle on disk: subsequent deploys fetch from the same path. Switch
+`REPO_URL` back to the GitHub URL once the branch is pushed.
+
 First run installs the units but does **not** start them — it creates
 `/etc/mlb-edge/mlb-edge.env` from the example and stops. Fill in credentials,
 then re-run the same script to start everything.

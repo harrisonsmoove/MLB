@@ -15,6 +15,14 @@ APP_DIR="${APP_DIR:-/opt/mlb-edge}"
 ENV_DIR="${ENV_DIR:-/etc/mlb-edge}"
 ENV_FILE="${ENV_DIR}/mlb-edge.env"
 SERVICE_USER="${SERVICE_USER:-mlbedge}"
+# Source of the code. Normally the GitHub remote, but a **git bundle file path
+# also works** -- `git clone` and `git fetch` both accept one. That matters when
+# the branch has not reached GitHub yet:
+#
+#   sudo REPO_URL=/root/mlb-edge.bundle ./deploy/deploy.sh
+#
+# Keep the bundle on disk if you use it; the update path fetches from the same
+# location on every subsequent deploy.
 REPO_URL="${REPO_URL:-https://github.com/harrisonsmoove/MLB}"
 BRANCH="${BRANCH:-claude/mlb-simulation-betting-txwq10}"
 UNIT_DIR=/etc/systemd/system
@@ -57,6 +65,11 @@ else
   git clone --depth 50 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 log "at commit $(git -C "$APP_DIR" rev-parse --short HEAD)"
+
+# A bundle has no branch tracking, so make sure the checkout is actually on the
+# branch rather than detached at whatever the bundle's HEAD happened to be.
+git -C "$APP_DIR" symbolic-ref -q HEAD >/dev/null || \
+  git -C "$APP_DIR" checkout -q -B "$BRANCH" FETCH_HEAD 2>/dev/null || true
 
 # --- 4. dependencies -------------------------------------------------------
 log "installing dependencies"
