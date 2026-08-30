@@ -39,6 +39,11 @@ from mlb_edge.config import Settings
 from mlb_edge.features.battedball import CONTACT_BUCKETS, BattedBallModel, fit_batted_ball_model
 from mlb_edge.features.pa_outcomes import BUCKETS
 from mlb_edge.features.pitcher_proxies import ProxyModel, fit_proxy_model
+from mlb_edge.features.preregistration import (
+    PreregistrationCheck,
+    check_constants,
+    gating_result,
+)
 from mlb_edge.features.shrinkage import (
     HierarchicalPrior,
     RegressionConstant,
@@ -62,6 +67,18 @@ class ProjectorReport:
     unmeasured_batted_balls: int = 0
     constants: dict[str, RegressionConstant] = field(default_factory=dict)
     proxy: ProxyModel | None = None
+
+    @property
+    def preregistration(self) -> list[PreregistrationCheck]:
+        """Fitted constants against targets fixed before any data was seen."""
+        return check_constants({name: c.k for name, c in self.constants.items()})
+
+    @property
+    def preregistration_passed(self) -> bool:
+        return gating_result(self.preregistration)[0]
+
+    def preregistration_lines(self) -> list[str]:
+        return [check.line() for check in self.preregistration]
 
     def summary(self) -> str:
         constants = ", ".join(
@@ -471,6 +488,35 @@ class Projector:
             "source_partition": through.isoformat(),
             "ingested_at": as_of,
         }
+
+
+def constants_frame(
+    report: ProjectorReport, *, system: str, player_type: str
+) -> pl.DataFrame:
+    """Serialise a snapshot's fitted constants for storage."""
+    as_of = datetime.combine(report.through_date, time.min, tzinfo=UTC)
+    return pl.DataFrame(
+        [
+            {
+                "system": system,
+                "player_type": player_type,
+                "through_date": report.through_date,
+                "bucket": name,
+                "k": constant.k,
+                "prior_mean": constant.prior_mean,
+                "var_observed": constant.var_observed,
+                "var_binomial": constant.var_binomial,
+                "var_true": constant.var_true,
+                "saturated": constant.saturated,
+                "n_players": constant.n_players,
+                "as_of_ts": as_of,
+                "source": "projector",
+                "source_partition": report.through_date.isoformat(),
+                "ingested_at": as_of,
+            }
+            for name, constant in sorted(report.constants.items())
+        ]
+    )
 
 
 @dataclass

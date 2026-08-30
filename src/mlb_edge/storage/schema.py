@@ -470,6 +470,36 @@ TABLES: tuple[TableSpec, ...] = (
         """,
     ),
     TableSpec(
+        name="projector_constants",
+        kind=TableKind.FACT,
+        key=("system", "player_type", "through_date", "bucket"),
+        notes=(
+            "The regression constants the projector fit at each snapshot.\n\n"
+            "Persisted rather than left in a log line for two reasons: the "
+            "pre-registered gate needs a machine-readable fitted k, and how k "
+            "moves across snapshots is itself diagnostic -- a constant that "
+            "lurches between weeks means the fit is unstable, whatever the "
+            "projections look like."
+        ),
+        ddl="""
+        CREATE TABLE IF NOT EXISTS projector_constants (
+            system            TEXT NOT NULL,
+            player_type       TEXT NOT NULL,
+            through_date      DATE NOT NULL,
+            bucket            TEXT NOT NULL,
+            k                 DOUBLE NOT NULL,
+            prior_mean        DOUBLE,
+            var_observed      DOUBLE,
+            var_binomial      DOUBLE,
+            var_true          DOUBLE,
+            saturated         BOOLEAN,
+            n_players         INTEGER,
+            as_of_ts          TIMESTAMPTZ NOT NULL,
+            """ + _PROVENANCE + """
+        )
+        """,
+    ),
+    TableSpec(
         name="projections",
         kind=TableKind.FACT,
         key=("system", "player_id", "player_type", "snapshot_date"),

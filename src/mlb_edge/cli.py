@@ -257,6 +257,58 @@ def verify(
         raise typer.Exit(code=1)
 
 
+@app.command(name="gate")
+def gate_command(
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Check whether work may begin under model/.
+
+    Two conditions, in this order: integrity clean, then the pre-registered
+    strikeout constant inside its ratio band. The order is enforced -- a
+    constant fitted on a warehouse that fails its own integrity checks is a
+    number derived from corrupted input, and letting it pass would look like
+    permission to proceed.
+
+    Writes reports/gate.json. The test suite refuses any module under model/
+    without a passing record, so this is a real gate rather than a reminder.
+    """
+    from mlb_edge import gate as gate_module
+
+    settings, warehouse, _ = _context(root)
+    result = gate_module.evaluate(warehouse)
+
+    console.print("[bold]1. integrity[/bold]")
+    if result.integrity_passed:
+        console.print("  [green]PASS[/green] no ERROR-level checks failed")
+    else:
+        console.print(f"  [red]FAIL[/red] {len(result.integrity_errors)} errors")
+        for line in result.integrity_errors[:10]:
+            console.print(f"    {line}")
+
+    console.print("\n[bold]2. pre-registered constant[/bold]")
+    if not result.integrity_passed:
+        console.print("  [dim]not evaluated -- integrity must pass first[/dim]")
+    elif not result.constant_lines:
+        console.print(f"  [yellow]not evaluated[/yellow] -- {result.blocked_reason}")
+    else:
+        for line in result.constant_lines:
+            style = "green" if line.startswith("PASS") else "red"
+            console.print(f"  [{style}]{line}[/{style}]")
+        for note in result.diagnosis:
+            console.print(f"  [dim]{note}[/dim]")
+
+    path = gate_module.write_record(result, settings.reports_dir)
+    verdict = "[green]GATE PASSED[/green]" if result.passed else "[red]GATE BLOCKED[/red]"
+    console.print(f"\n{verdict}")
+    if not result.passed:
+        console.print(f"  {result.blocked_reason}")
+    console.print(f"[dim]record: {path}[/dim]")
+
+    warehouse.close()
+    if not result.passed:
+        raise typer.Exit(code=1)
+
+
 @app.command()
 def status(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Row counts and as-of coverage per table."""
@@ -389,9 +441,16 @@ def parks_bearings(
 @app.command(name="build-pa-outcomes")
 def build_pa_outcomes(
     seasons: Annotated[str | None, typer.Option(help="Comma-separated seasons; default all.")] = None,
+    chunk_rows: Annotated[int, typer.Option(help="Rows per streamed chunk.")] = 250_000,
+    staging_dir: Annotated[Path | None, typer.Option(help="Where parquet chunks land.")] = None,
+    keep_staging: Annotated[bool, typer.Option(help="Keep the parquet chunks after loading.")] = False,
     root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Collapse pitch-level Statcast into plate appearances.
+
+    Streams through parquet in fixed-size chunks, so peak memory is one chunk
+    regardless of how many seasons are in scope -- running all eleven at once is
+    no heavier than running one.
 
     Reports taxonomy coverage. An `events` value matching nothing in the
     configured taxonomy is counted and named rather than swept into OUT, so a
@@ -402,17 +461,26 @@ def build_pa_outcomes(
 
     settings, warehouse, _ = _context(root)
     season_list = [int(s) for s in seasons.split(",")] if seasons else None
+    staging = Path(staging_dir) if staging_dir else settings.root / "data" / "staging" / "pa"
 
     extractor = PaOutcomeExtractor(settings)
-    frame, report = extractor.extract(warehouse, seasons=season_list)
-    if frame.is_empty():
+    report, rows = extractor.extract_to_warehouse(
+        warehouse,
+        staging_dir=staging,
+        seasons=season_list,
+        chunk_rows=chunk_rows,
+        keep_staging=keep_staging,
+        progress=lambda chunks, written: console.print(
+            f"  chunk {chunks}: {written:,} plate appearances staged", highlight=False
+        ),
+    )
+    if report.plate_appearances == 0:
         console.print("[yellow]no plate appearances extracted[/yellow] -- is statcast loaded?")
         warehouse.close()
         raise typer.Exit(code=1)
 
-    result = warehouse.load("pa_outcomes", frame)
     console.print(report.summary())
-    console.print(f"pa_outcomes: {result.rows_written:,} rows written")
+    console.print(f"pa_outcomes: {rows:,} rows written")
     if report.unknown_events:
         console.print(
             f"[yellow]{len(report.unknown_events)} unrecognised event types[/yellow] -- "
@@ -438,9 +506,16 @@ def build_projections(
     a walk-forward backtest rather than only going forward.
     """
     from mlb_edge.features.battedball import fit_batted_ball_model, model_to_frame
-    from mlb_edge.features.ratings import Projector
+    from mlb_edge.features.preregistration import (
+        GATING_PLAYER_TYPE,
+        gating_result,
+        interpret,
+    )
+    from mlb_edge.features.ratings import Projector, constants_frame
 
     settings, warehouse, _ = _context(root)
+    gating_report = None
+    other_reports: list[tuple[str, Any]] = []
     projector = Projector(settings, warehouse)
     dates = projector.snapshot_dates(_parse_date(start), _parse_date(end))
     types = [t.strip() for t in player_types.split(",") if t.strip()]
@@ -466,9 +541,51 @@ def build_projections(
                 continue
             written = warehouse.load("pa_rates", rates).rows_written
             total += written
+            warehouse.load(
+                "projector_constants",
+                constants_frame(
+                    report,
+                    system=str(settings.section("projector").get("system_name")),
+                    player_type=player_type,
+                ),
+            )
             console.print(f"  {player_type}: {report.summary()} -> {written:,} rows")
+            # Gate on the batter fit only: the pre-registered target is derived
+            # from hitter talent spread and does not transfer to pitchers.
+            if player_type == GATING_PLAYER_TYPE:
+                gating_report = report
+            else:
+                other_reports.append((player_type, report))
 
     console.print(f"\npa_rates: {total:,} rows written")
+
+    # The pre-registered check, printed without being asked for. The target was
+    # fixed before any real data was seen; see features/preregistration.py.
+    if gating_report is not None and gating_report.constants:
+        console.print(
+            f"\n[bold]pre-registered constant check[/bold] ({GATING_PLAYER_TYPE})"
+        )
+        for line in gating_report.preregistration_lines():
+            style = "green" if line.startswith("PASS") else "red"
+            console.print(f"  [{style}]{line}[/{style}]")
+        passed, reason = gating_result(gating_report.preregistration)
+        if passed:
+            console.print(f"  [green]gate: PASS[/green] ({reason})")
+        else:
+            console.print(f"  [red]gate: FAIL[/red] ({reason})")
+            for check in gating_report.preregistration:
+                if check.gating and not check.passed:
+                    console.print(f"  {interpret(check)}")
+    elif gating_report is None:
+        console.print(
+            f"\n[yellow]no {GATING_PLAYER_TYPE} fit ran, so the gate did not "
+            "evaluate.[/yellow] It cannot pass by not running."
+        )
+
+    for player_type, report in other_reports:
+        console.print(f"\n[dim]{player_type} constants (not gated):[/dim]")
+        for line in report.preregistration_lines():
+            console.print(f"  [dim]{line.replace('FAIL', 'n/a ').replace('PASS', 'n/a ')}[/dim]")
     warehouse.close()
 
 

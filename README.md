@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 214 tests, no network required
+uv run pytest                      # 242 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -92,6 +92,10 @@ mlb-edge build-pa-outcomes                                  # pitches -> plate a
 mlb-edge build-projections --start 2021-04-01 --end 2026-09-28
 ```
 
+`build-pa-outcomes` streams through Parquet in fixed-size chunks, so peak
+memory is one chunk regardless of scope — all eleven seasons at once is no
+heavier than one. Use `--keep-staging` to inspect the chunks.
+
 Strikeouts, walks and hit-by-pitches are counted. Balls in play are **not**: the
 count of them is, and they are distributed across hit types by a league contact
 table applied to the player's own exit velocities and launch angles. A .380
@@ -106,6 +110,44 @@ genuinely wider game distribution rather than a falsely confident one.
 See [`reports/milestone2-projector.md`](reports/milestone2-projector.md) — in
 particular the two silent bugs found on synthetic data, either of which would
 have made the projector inert while emitting plausible output.
+
+## The gate on `model/`
+
+No simulator code exists yet, and none may be written until, in this order:
+
+1. `mlb-edge verify` runs clean — zero ERRORs.
+2. The fitted strikeout constant passes the pre-registered ratio check.
+
+```bash
+mlb-edge gate          # runs both, writes reports/gate.json, exits non-zero if blocked
+```
+
+The order is enforced: a constant fitted on a warehouse that fails its own
+integrity checks is a number derived from corrupted input, so it is not
+evaluated at all until integrity passes.
+
+`tests/test_model_gate.py` refuses any module under `src/mlb_edge/model/`
+unless `reports/gate.json` exists and says the gate passed — so this is a test
+failure, not a note in a README.
+
+### The pre-registered target
+
+`features/preregistration.py` fixes the expected strikeout concentration
+**before** any real data is seen, derived rather than eyeballed:
+
+```
+k = mu(1-mu)/sd^2 - 1  =  0.22 x 0.78 / 0.055^2 - 1  =  55.7
+```
+
+from a hitter K% mean of ~22% and true-talent SD of ~5.5pp. For a
+beta-binomial, reliability is `n/(n+k)`, so k *is* the stabilisation point —
+and published work puts K% stabilisation at ~60 PA. Two unrelated routes
+agreeing to within 10% is the reason to trust the target.
+
+Fail condition, fixed in advance: **fitted/expected outside [0.5, 2.0]**.
+`build-projections` prints the comparison automatically. Hitters only —
+pitcher K% talent is spread differently, so pitcher constants are reported but
+never gated.
 
 ## Park orientations
 
@@ -194,5 +236,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          214 tests, all offline, fixtures + a synthetic generator
+tests/          242 tests, all offline, fixtures + a synthetic generator
 ```

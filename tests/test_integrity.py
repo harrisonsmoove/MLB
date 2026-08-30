@@ -204,3 +204,31 @@ def test_shifting_as_of_forward_hides_data_from_an_earlier_read(loaded_warehouse
     )
     after = pit.as_of(loaded_warehouse, "lineup_slots", NOW)
     assert after.is_empty()
+
+
+# ---------------------------------------------------------------------------
+# Thresholds are targets, not dials
+# ---------------------------------------------------------------------------
+def test_quality_thresholds_are_pinned():
+    """Makes lowering a threshold to make a run pass a visible, reviewable diff.
+
+    Retrosheet coverage is expected to land under 99.5% on first contact with
+    real event files -- rundowns, obstruction and interference are notation the
+    parser has never seen. The response is to identify those plays and extend
+    the parser, not to move the line down to meet them. A shortfall of 0.8
+    percentage points is 0.8pp of plays whose base-out transitions are being
+    guessed, and the advancement matrices carry that error into every simulated
+    game.
+    """
+    assert integrity.RETROSHEET_COVERAGE_THRESHOLD == 0.995
+    assert integrity.PROJECTION_ID_RESOLUTION_THRESHOLD == 0.95
+
+
+def test_coverage_check_uses_the_pinned_threshold(loaded_warehouse):
+    """The default argument must be the constant, not a copy of it."""
+    import inspect
+
+    signature = inspect.signature(integrity.check_retrosheet_parse_coverage)
+    assert signature.parameters["threshold"].default is (
+        integrity.RETROSHEET_COVERAGE_THRESHOLD
+    )

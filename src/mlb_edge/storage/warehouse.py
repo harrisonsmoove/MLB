@@ -164,6 +164,47 @@ class Warehouse:
             columns_added=tuple(added),
         )
 
+    def load_parquet(self, table: str, pattern: str) -> LoadResult:
+        """Bulk-load pre-aligned parquet files into a table.
+
+        The counterpart to a streaming writer: the frames were already projected
+        onto the table's columns before being written, so this is a straight
+        column-list insert that never materialises the whole set in Python. Same
+        key-based deduplication as :meth:`load`, so a re-run is a no-op.
+        """
+        spec = schema.get(table)
+        columns = self.columns(table)
+        col_list = ", ".join(f'"{c}"' for c in columns)
+
+        key_cols = list(spec.key)
+        if spec.as_of_column and spec.as_of_column not in key_cols:
+            key_cols.append(spec.as_of_column)
+        join_pred = " AND ".join(
+            f'(t."{c}" IS NOT DISTINCT FROM i."{c}")' for c in key_cols
+        )
+
+        before = self.count(table)
+        self.con.execute(
+            f"""
+            INSERT INTO {table} ({col_list})
+            SELECT {col_list} FROM (
+                SELECT {col_list}, row_number() OVER (
+                    PARTITION BY {", ".join(f'"{c}"' for c in key_cols)}
+                ) AS _dupe
+                FROM read_parquet(?)
+            ) i
+            WHERE i._dupe = 1
+              AND NOT EXISTS (SELECT 1 FROM {table} t WHERE {join_pred})
+            """,
+            [pattern],
+        )
+        after = self.count(table)
+        return LoadResult(table=table, rows_offered=-1, rows_written=after - before)
+
+    def align(self, table: str, frame: pl.DataFrame) -> pl.DataFrame:
+        """Public projection onto a table's columns, for streaming writers."""
+        return self._align(table, frame)
+
     def _add_missing_columns(self, table: str, frame: pl.DataFrame) -> list[str]:
         existing = set(self.columns(table))
         added: list[str] = []

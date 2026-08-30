@@ -27,6 +27,26 @@ from mlb_edge.storage.schema import TableKind
 from mlb_edge.storage.warehouse import Warehouse
 from mlb_edge.timeutil import utcnow
 
+# ---------------------------------------------------------------------------
+# Quality thresholds.
+#
+# Named constants rather than default arguments so that changing one is a
+# visible diff on a line that says what it is, not an inline edit inside a
+# function signature.
+#
+# These are targets, not dials. If Retrosheet coverage comes in at 98.7%, that
+# is 1.3 percentage points of unparsed events to identify -- probably rundowns,
+# obstruction and interference, which the parser has never seen. Lowering the
+# number to 0.985 would make the run green and leave the advancement matrices
+# quietly biased by whatever those plays are. The fix is always in the
+# taxonomy or the parser.
+# ---------------------------------------------------------------------------
+RETROSHEET_COVERAGE_THRESHOLD: float = 0.995
+"""Share of Retrosheet plays the event parser must handle without falling back."""
+
+PROJECTION_ID_RESOLUTION_THRESHOLD: float = 0.95
+"""Share of projection rows that must carry a joinable MLBAM id."""
+
 
 class Severity(StrEnum):
     ERROR = "ERROR"
@@ -330,7 +350,9 @@ def check_odds_snapshots_pregame(wh: Warehouse) -> CheckResult:
 # ---------------------------------------------------------------------------
 # Source-specific quality
 # ---------------------------------------------------------------------------
-def check_retrosheet_parse_coverage(wh: Warehouse, threshold: float = 0.995) -> CheckResult:
+def check_retrosheet_parse_coverage(
+    wh: Warehouse, threshold: float = RETROSHEET_COVERAGE_THRESHOLD
+) -> CheckResult:
     """Fraction of plays the event parser handled without falling back.
 
     Reported rather than assumed. A parser that silently mislabels a few percent
@@ -414,7 +436,9 @@ def check_statcast_revisions(wh: Warehouse) -> CheckResult:
     )
 
 
-def check_projection_id_resolution(wh: Warehouse, threshold: float = 0.95) -> CheckResult:
+def check_projection_id_resolution(
+    wh: Warehouse, threshold: float = PROJECTION_ID_RESOLUTION_THRESHOLD
+) -> CheckResult:
     """Share of projection rows carrying a usable MLBAM id.
 
     FanGraphs keys on its own player ids. A low rate here means the field map in
