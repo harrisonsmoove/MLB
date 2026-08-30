@@ -20,25 +20,52 @@ A healthy first cycle:
 ```
 [poll] starting: kalshi, odds
 [poll] archive: /opt/mlb-edge/data/poll
+[slate] schedule: 42 games 2026-08-29..2026-08-31, 3 in progress
 [poll] odds tick=1 records=1 errors=0 quota_remaining=498 -> odds-20260829T140000Z.parquet
+[poll] odds content keys=1 bodies=1 items=11 bytes=48,203 digest=9f2c1a0b4e77
 [poll] odds captured 11/11 games (odds, exact)
 [poll] odds next in 179.4 min
-[poll] kalshi tick=1 records=34 errors=0 -> kalshi-20260829T140000Z.parquet
+[poll] kalshi tick=1 records=214 errors=0 -> kalshi-20260829T140000Z.parquet
+[poll] kalshi content keys=214 bodies=209 bytes=1,104,882 digest=3d81ff40c2ae
 [poll] kalshi captured 11/11 games (kalshi, team-mention)
 [poll] kalshi next in 15.0 min
 ```
 
-Three things to read, in order of importance:
+Five things to read, in order of importance:
 
 | Line | What it tells you | Bad looks like |
 |---|---|---|
-| `captured X/Y games` | **whether the board is complete** | `captured 3/11` |
+| `[slate] schedule:` | **the denominator exists at all** | absent, or `WARN: schedule fetch failed` |
+| `captured X/Y games` | **whether the board is complete** | `captured 3/11`, or any line saying `UNKNOWN` |
+| `content ... digest=` | **whether the data is moving** | same digest two ticks running |
 | `records=N errors=0` | requests worked | `errors=34` |
 | `quota_remaining` | budget is being read from the API | absent after several cycles |
 
 **`captured X/Y` is the one that matters.** Requests returning 200 tells you
 almost nothing — the Kalshi cursor bug did exactly that while discarding most
 of the board. If `captured` is short and `errors=0`, that is the signature.
+
+**`captured 0/0` is not a pass.** It used to be, and that is how the check went
+blind on a 14-game slate and logged a clean cycle. A zero denominator now always
+says which zero it is:
+
+| Line | Meaning | Healthy? |
+|---|---|---|
+| `no games scheduled (odds)` | genuine off day | yes |
+| `0 games in window (odds); 14 on the schedule` | 6am, nothing near first pitch | yes |
+| `WARN: schedule UNAVAILABLE (...) -- coverage is UNKNOWN, not zero` | the fetch failed | **no** |
+| `WARN: N game(s) in progress but 0 expected` | the window is wrong | **no** |
+
+The last row is the cross-check that cannot be argued with. StatsAPI reports
+`totalGamesInProgress`; if games are being played and the check expects none,
+the check is broken, and no window or timezone setting makes that benign.
+
+**Identical numbers are not stability.** `records=123` on five consecutive
+Kalshi ticks looked like a stable board and was a saturated orderbook cap
+silently dropping every ticker past 120. Row count cannot tell those apart, so
+each tick now hashes its payloads. Two consecutive ticks with the same `digest`
+means every payload came back byte for byte identical — on an orderbook that is
+a cache, a replay, or a frozen upstream, never a quiet market — and it alerts.
 
 Expect `odds` to poll roughly three-hourly on the free tier and `kalshi` every
 15 minutes. `odds` at 15-minute intervals means the quota header was not read

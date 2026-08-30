@@ -25,7 +25,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from mlb_edge.config import Settings, load_settings
+from mlb_edge.config import ConfigError, Settings
+from mlb_edge.config import load_settings as _load_settings_raw
 from mlb_edge.storage.rawcache import RawCache
 from mlb_edge.storage.warehouse import Warehouse
 from mlb_edge.timeutil import utcnow
@@ -98,6 +99,42 @@ BACKFILL_ORDER = (
     "retrosheet",
     "weather",
 )
+
+
+#: Where deploy.sh writes the service environment file. Named in the error
+#: below so a hand-run command says what to do rather than what went wrong.
+ENV_FILE = Path("/etc/mlb-edge/mlb-edge.env")
+
+
+def _credentials_hint() -> str:
+    if ENV_FILE.is_file():
+        return (
+            f"\nThis command needs the service environment. Run:\n"
+            f"  set -a; . {ENV_FILE}; set +a\n"
+            "and try again. systemd loads it for the daemon; your shell does not."
+        )
+    return (
+        f"\nExpected credentials in {ENV_FILE}, which does not exist.\n"
+        "Copy deploy/mlb-edge.env.example to it, fill it in, then:\n"
+        f"  set -a; . {ENV_FILE}; set +a"
+    )
+
+
+def load_settings(root: Path | None = None) -> Settings:
+    """``config.load_settings`` with a human-readable failure.
+
+    Validation failing hard on an unset secret is correct for the daemon -- fail
+    at startup, not mid-backfill. As a stack trace to someone who has just
+    ssh-ed in and run ``poll-status`` it is useless: the answer is always "you
+    did not source the env file", and the traceback never says so.
+    """
+    try:
+        return _load_settings_raw(root)
+    except ConfigError as exc:
+        console.print(f"[red]config error:[/red] {exc}")
+        console.print(_credentials_hint())
+        raise typer.Exit(2) from None
+
 
 
 @app.command()
@@ -1037,5 +1074,20 @@ def budget(root: Annotated[Path | None, typer.Option()] = None) -> None:
     warehouse.close()
 
 
+def main() -> None:
+    """Console entry point.
+
+    The wrapper above catches the common case at every command. This catches
+    anything that reaches config validation by another route, so no path can
+    answer a missing credential with a stack trace.
+    """
+    try:
+        app()
+    except ConfigError as exc:
+        console.print(f"[red]config error:[/red] {exc}")
+        console.print(_credentials_hint())
+        raise typer.Exit(2) from None
+
+
 if __name__ == "__main__":
-    app()
+    main()

@@ -248,7 +248,45 @@ def test_kalshi_orderbook_cap_is_respected(settings_with_keys, monkeypatch):
     poller = KalshiPoller(settings_with_keys, client=client)
     poller.poll_config = dict(poller.poll_config) | {"kalshi_max_orderbooks_per_tick": 5}
     records = poller.poll()
-    assert sum(1 for r in records if r.endpoint == "orderbook") == 5
+    fetched = [r for r in records if r.endpoint == "orderbook" and not r.error]
+    assert len(fetched) == 5
+
+
+def test_saturated_orderbook_cap_is_archived_as_a_failure(settings_with_keys):
+    """A bound that binds is news.
+
+    The cap silently dropped every ticker past 120, which is how five
+    consecutive ticks returned an identical `records=123` and read as a stable
+    board rather than a truncated one.
+    """
+    many = {"markets": [{"ticker": f"T{i}"} for i in range(500)]}
+    client = StubClient({"/markets": many, "/orderbook": {"orderbook": {"yes": [], "no": []}}})
+    poller = KalshiPoller(settings_with_keys, client=client)
+    poller.poll_config = dict(poller.poll_config) | {"kalshi_max_orderbooks_per_tick": 5}
+
+    caps = [r for r in poller.poll() if r.key == "__cap__"]
+    assert len(caps) == 1
+    assert "saturated" in (caps[0].error or "")
+    assert "dropped" in (caps[0].error or "")
+
+
+def test_unsaturated_cap_archives_nothing_extra(settings_with_keys):
+    few = {"markets": [{"ticker": f"T{i}"} for i in range(3)]}
+    client = StubClient({"/markets": few, "/orderbook": {"orderbook": {"yes": [], "no": []}}})
+    poller = KalshiPoller(settings_with_keys, client=client)
+    poller.poll_config = dict(poller.poll_config) | {"kalshi_max_orderbooks_per_tick": 50}
+    assert [r for r in poller.poll() if r.key == "__cap__"] == []
+
+
+def test_saturated_cap_warns(settings_with_keys, capsys):
+    many = {"markets": [{"ticker": f"T{i}"} for i in range(500)]}
+    client = StubClient({"/markets": many, "/orderbook": {"orderbook": {"yes": [], "no": []}}})
+    poller = KalshiPoller(settings_with_keys, client=client)
+    poller.poll_config = dict(poller.poll_config) | {"kalshi_max_orderbooks_per_tick": 5}
+    poller.poll()
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "cap saturated" in out
 
 
 def test_kalshi_markets_failure_does_not_stop_the_tick(settings_with_keys):

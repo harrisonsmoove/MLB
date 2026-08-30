@@ -20,9 +20,10 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from mlb_edge.alerting import Alert, Severity
-from mlb_edge.completeness import CoverageReport, ExpectedGame
+from mlb_edge.completeness import CoverageReport, ExpectedGame, SlateStatus
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
 
@@ -166,9 +167,50 @@ def coverage_alerts(
 
     This is the check that catches a silently truncated board -- the failure
     that returns HTTP 200 on every request and logs a clean cycle.
+
+    It used to skip any report with ``expected == 0``, which meant the check
+    fell silent in exactly the state where it had gone blind. A missing
+    denominator now alerts louder than a shortfall does, because a shortfall is
+    a known quantity and a missing denominator is not.
     """
     alerts: list[Alert] = []
     for report in reports:
+        if report.status is SlateStatus.UNAVAILABLE:
+            alerts.append(
+                Alert(
+                    key=f"coverage:{report.venue}",
+                    severity=Severity.CRITICAL,
+                    subject=f"{report.venue}: schedule unavailable, coverage UNKNOWN",
+                    body=(
+                        f"The MLB schedule fetch failed: {report.slate_error}\n"
+                        "The poller is still archiving, but nothing is checking whether "
+                        "the board is complete. A truncated board would look clean "
+                        "until this is fixed."
+                    ),
+                )
+            )
+            continue
+
+        if report.contradicted:
+            alerts.append(
+                Alert(
+                    key=f"coverage:{report.venue}",
+                    severity=Severity.CRITICAL,
+                    subject=(
+                        f"{report.venue}: {report.in_progress} games in progress, "
+                        "0 expected"
+                    ),
+                    body=(
+                        f"StatsAPI reports {report.in_progress} game(s) under way and "
+                        f"the completeness check expects none, from a slate of "
+                        f"{report.slate_size}.\n"
+                        "No window or timezone setting makes that benign -- the slate "
+                        "window is wrong and coverage is not being checked."
+                    ),
+                )
+            )
+            continue
+
         if report.expected < min_expected or report.complete:
             continue
         alerts.append(
@@ -187,6 +229,39 @@ def coverage_alerts(
             )
         )
     return alerts
+
+
+def frozen_alerts(fingerprint: Any, identical_ticks: int, *, threshold: int = 2) -> list[Alert]:
+    """Alert when consecutive ticks return byte-identical payloads.
+
+    Row count cannot separate a healthy board from a frozen one: five ticks of
+    ``records=123`` looked like stability and was a saturated cap. Content can.
+    An orderbook whose every payload hashes the same twice running is not a
+    quiet market -- prices and depth move -- it is a cache, a replay, or an
+    upstream that has stopped updating.
+
+    ``threshold`` is 2 rather than 1 because a genuinely dead overnight board
+    can repeat once; twice is not chance.
+    """
+    if identical_ticks < threshold:
+        return []
+    return [
+        Alert(
+            key=f"frozen:{fingerprint.venue}",
+            severity=Severity.CRITICAL,
+            subject=(
+                f"{fingerprint.venue}: {identical_ticks} consecutive ticks byte-identical"
+            ),
+            body=(
+                f"{fingerprint.records} records, {fingerprint.keys} distinct keys, "
+                f"{fingerprint.bodies} distinct payloads, digest "
+                f"{fingerprint.digest[:12]}.\n"
+                "Identical content across polls means the archive is accumulating "
+                "duplicate rows with fresh timestamps, which is worse than a gap: it "
+                "looks like data."
+            ),
+        )
+    ]
 
 
 def _slate_active(

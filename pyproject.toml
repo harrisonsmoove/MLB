@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-mlb-edge = "mlb_edge.cli:app"
+mlb-edge = "mlb_edge.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.8.17,<0.9.0"]

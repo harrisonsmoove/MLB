@@ -34,6 +34,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from enum import StrEnum
 from typing import Any
 
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
@@ -60,6 +61,30 @@ class ExpectedGame:
         return f"{self.away_team} @ {self.home_team}"
 
 
+class SlateStatus(StrEnum):
+    """Why the denominator is what it is.
+
+    A zero denominator used to be indistinguishable from a clean cycle: the
+    report said ``captured 0/0`` and ``complete`` returned True whether the
+    schedule was genuinely empty or the fetch had thrown and been swallowed.
+    That is the same shape as the Kalshi cursor bug -- a degraded path
+    reporting success -- in the very check written to catch it.
+
+    So the denominator now carries its reason, and only one of these reasons
+    is healthy.
+    """
+
+    OK = "ok"
+    #: Slate known, games on it, but none near enough to first pitch to expect
+    #: quotes. Normal at 6am. Healthy.
+    NO_GAMES_IN_WINDOW = "no_games_in_window"
+    #: Slate known and genuinely empty. All-Star break, off day. Healthy.
+    NO_GAMES_TODAY = "no_games_today"
+    #: The schedule could not be established. Coverage is UNKNOWN, and unknown
+    #: is never healthy -- that is the whole point of this enum.
+    UNAVAILABLE = "unavailable"
+
+
 @dataclass
 class CoverageReport:
     venue: str
@@ -67,10 +92,40 @@ class CoverageReport:
     covered: int = 0
     exact: bool = False
     missing: list[str] = field(default_factory=list)
+    status: SlateStatus = SlateStatus.OK
+    #: Games on the fetched schedule, before the first-pitch window filter.
+    slate_size: int = 0
+    #: ``totalGamesInProgress`` as reported by StatsAPI. ``None`` when unknown.
+    in_progress: int | None = None
+    slate_error: str | None = None
 
     @property
     def complete(self) -> bool:
+        """Did we capture everything we expected? Numerator vs denominator only.
+
+        Says nothing about whether the denominator is trustworthy. Use
+        :attr:`healthy` for that, and for anything that suppresses an alert.
+        """
         return self.expected == 0 or self.covered >= self.expected
+
+    @property
+    def contradicted(self) -> bool:
+        """Games are being played right now and we expect none of them.
+
+        No window setting and no timezone argument can make this benign. It is
+        the signature of the bug that shipped: the check went blind during the
+        evening slate and called it healthy.
+        """
+        return bool(self.in_progress) and self.expected == 0
+
+    @property
+    def healthy(self) -> bool:
+        """Nothing here needs a human. The property alerting and throttling use."""
+        if self.status is SlateStatus.UNAVAILABLE:
+            return False
+        if self.contradicted:
+            return False
+        return self.complete
 
     @property
     def shortfall(self) -> int:
@@ -78,20 +133,69 @@ class CoverageReport:
 
     def line(self) -> str:
         precision = "exact" if self.exact else "team-mention"
-        status = "" if self.complete else f"  MISSING {self.shortfall}"
+        if self.status is SlateStatus.UNAVAILABLE:
+            return (
+                f"WARN: schedule UNAVAILABLE ({self.slate_error or 'no reason recorded'})"
+                f" -- coverage for {self.venue} is UNKNOWN, not zero"
+            )
+        if self.contradicted:
+            return (
+                f"WARN: {self.in_progress} game(s) in progress but 0 expected "
+                f"({self.venue}) -- the slate window is wrong, coverage is UNKNOWN"
+            )
+        if self.status is SlateStatus.NO_GAMES_TODAY:
+            return f"no games scheduled ({self.venue})"
+        if self.status is SlateStatus.NO_GAMES_IN_WINDOW:
+            return (
+                f"0 games in window ({self.venue}); {self.slate_size} on the "
+                "schedule, none near first pitch"
+            )
+        marker = "" if self.complete else f"  MISSING {self.shortfall}"
         return (
             f"captured {self.covered}/{self.expected} games ({self.venue}, "
-            f"{precision}){status}"
+            f"{precision}){marker}"
         )
 
 
+@dataclass(frozen=True)
+class Slate:
+    """What the schedule endpoint told us, including when it told us nothing."""
+
+    day: date
+    games: tuple[ExpectedGame, ...] = ()
+    #: ``totalGamesInProgress``. ``None`` means we could not ask.
+    in_progress: int | None = None
+    available: bool = True
+    error: str | None = None
+
+    def __len__(self) -> int:
+        return len(self.games)
+
+
 class SlateCache:
-    """Today's schedule, fetched from the MLB Stats API and held briefly.
+    """The schedule around today, fetched from the MLB Stats API and held briefly.
 
     Free, unauthenticated and small, but there is no reason to ask for it on
-    every tick. A failed fetch returns the previous slate rather than an empty
-    one: reporting "0 games expected" because the schedule endpoint blipped
-    would turn a clean cycle into a fake all-clear.
+    every tick. Two properties matter more than the caching:
+
+    **A failed fetch is loud and is not an empty slate.** Reporting "0 games
+    expected" because the endpoint blipped turns a blind cycle into a fake
+    all-clear. The failure is returned as ``available=False`` and announced at
+    WARN. Within the same day a stale slate is reused, because yesterday's
+    answer to today's question is better than no answer; *across* days it is
+    discarded, because yesterday's games measured against today's payloads is
+    not a check, it is noise.
+
+    **The fetch spans the day either side.** StatsAPI dates are the league's
+    own calendar, which is US Eastern; ``day`` here is the poller's UTC date.
+    Those disagree from 00:00 to 04:00 UTC -- 8pm to midnight Eastern, the
+    middle of the evening slate. Asking for the wrong calendar date there
+    returned tomorrow's games, every one of them outside the first-pitch
+    window, so the check went blind at exactly the hour it mattered most and
+    called it ``captured 0/0``. Fetching a three-day range and letting the
+    timestamp window do the filtering makes the calendar interpretation
+    irrelevant, which is better than getting it right: nothing to get wrong
+    later.
     """
 
     def __init__(self, settings: Any, client: Any, ttl_seconds: float = 1800.0) -> None:
@@ -99,31 +203,93 @@ class SlateCache:
         self.config = settings.source("mlb_statsapi")
         self.client = client
         self.ttl_seconds = ttl_seconds
-        self._games: list[ExpectedGame] = []
+        self._slate: Slate | None = None
         self._fetched_at: datetime | None = None
-        self._day: date | None = None
         self.last_error: str | None = None
 
-    def games_for(self, day: date, *, now: datetime | None = None) -> list[ExpectedGame]:
+    def slate_for(self, day: date, *, now: datetime | None = None) -> Slate:
         reference = ensure_utc(now or utcnow())
+        cached = self._slate
         fresh = (
             self._fetched_at is not None
-            and self._day == day
+            and cached is not None
+            and cached.day == day
             and (reference - self._fetched_at).total_seconds() < self.ttl_seconds
         )
-        if fresh:
-            return self._games
+        if fresh and cached is not None:
+            return cached
 
+        start, end = day - timedelta(days=1), day + timedelta(days=1)
         try:
-            url = self.config.endpoint("schedule", start=day.isoformat(), end=day.isoformat())
+            url = self.config.endpoint(
+                "schedule", start=start.isoformat(), end=end.isoformat()
+            )
             response = self.client.get(url)
-            self._games = parse_slate(response.content)
+            games = parse_slate(response.content)
+            in_progress = parse_in_progress(response.content)
+            self._slate = Slate(
+                day=day,
+                games=tuple(games),
+                in_progress=in_progress,
+                available=True,
+            )
             self._fetched_at = reference
-            self._day = day
             self.last_error = None
-        except Exception as exc:  # noqa: BLE001 - a schedule blip must not blank the check
+            print(
+                f"[slate] schedule: {len(games)} games {start.isoformat()}"
+                f"..{end.isoformat()}"
+                + (
+                    f", {in_progress} in progress"
+                    if in_progress is not None
+                    else ", in-progress count absent from payload"
+                ),
+                flush=True,
+            )
+            return self._slate
+        except Exception as exc:  # noqa: BLE001 - a blip must not blank the check silently
             self.last_error = f"{type(exc).__name__}: {exc}"
-        return self._games
+            print(
+                f"[slate] WARN: schedule fetch failed for {start.isoformat()}"
+                f"..{end.isoformat()}: {self.last_error}. Completeness cannot be "
+                "checked this cycle -- coverage is UNKNOWN, not zero.",
+                flush=True,
+            )
+
+        if cached is not None and cached.day == day:
+            # Same day, stale but real. Better than no denominator.
+            return cached
+        return Slate(day=day, available=False, error=self.last_error)
+
+    def games_for(self, day: date, *, now: datetime | None = None) -> list[ExpectedGame]:
+        return list(self.slate_for(day, now=now).games)
+
+
+def parse_in_progress(payload: bytes) -> int | None:
+    """``totalGamesInProgress`` from a StatsAPI schedule response.
+
+    The single most valuable field in the response for our purposes, because it
+    is the one cross-check that no window or timezone reasoning can explain
+    away: if games are being played and the check expects none, the check is
+    broken. ``None`` when the key is absent rather than 0, so "we could not ask"
+    never masquerades as "nothing is happening".
+    """
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    top = data.get("totalGamesInProgress")
+    if isinstance(top, int):
+        return top
+    # Older shapes report it per date block instead of at the top level.
+    per_date = [
+        block.get("totalGamesInProgress")
+        for block in (data.get("dates") or [])
+        if isinstance(block, dict)
+    ]
+    values = [v for v in per_date if isinstance(v, int)]
+    return sum(values) if values else None
 
 
 def parse_slate(payload: bytes) -> list[ExpectedGame]:
@@ -176,11 +342,34 @@ def team_tokens(games: list[ExpectedGame]) -> dict[int, set[str]]:
 
 
 def coverage_for_venue(
-    venue: str, payloads: list[str], games: list[ExpectedGame]
+    venue: str,
+    payloads: list[str],
+    games: list[ExpectedGame],
+    *,
+    slate: Slate | None = None,
 ) -> CoverageReport:
-    """How many of today's games this venue's payloads account for."""
-    report = CoverageReport(venue=venue, expected=len(games), exact=venue in EXACT_VENUES)
+    """How many of today's games this venue's payloads account for.
+
+    ``slate`` carries why the denominator is what it is. Passing it is what
+    keeps a zero from reading as a clean cycle; without it the report can only
+    say "expected 0" and cannot say whether that was checked or merely
+    returned.
+    """
+    report = CoverageReport(
+        venue=venue,
+        expected=len(games),
+        exact=venue in EXACT_VENUES,
+        slate_size=len(slate.games) if slate is not None else len(games),
+        in_progress=slate.in_progress if slate is not None else None,
+        slate_error=slate.error if slate is not None else None,
+    )
+    if slate is not None and not slate.available:
+        report.status = SlateStatus.UNAVAILABLE
+        return report
     if not games:
+        report.status = (
+            SlateStatus.NO_GAMES_IN_WINDOW if report.slate_size else SlateStatus.NO_GAMES_TODAY
+        )
         return report
 
     if venue in EXACT_VENUES:

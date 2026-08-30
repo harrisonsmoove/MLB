@@ -45,7 +45,10 @@ poller:
   season_end_date: "2026-09-28"
   odds_interval_seconds: 900        # 15 min -- the FLOOR, not the guarantee
   kalshi_interval_seconds: 900      # Kalshi is not credit-metered
-  kalshi_max_orderbooks_per_tick: 120
+  # Sized for a full slate, not a guess: ~15 games x winner/total/game markets
+  # runs well past 120. At kalshi rate_limit_per_minute=60 this is ~8 minutes of
+  # a 15-minute cycle, and saturating it is a WARN plus an archived failure row.
+  kalshi_max_orderbooks_per_tick: 500
   kalshi_markets_page_size: 200
   # Bounds the cursor loop. A capped single request silently drops everything
   # past the first page; an unbounded loop on a cursor that never clears spins

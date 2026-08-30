@@ -42,7 +42,12 @@ from mlb_edge.alerting import AlertThrottle, build_alerter, send_throttled
 from mlb_edge.completeness import SlateCache, coverage_for_venue, games_in_window
 from mlb_edge.config import Settings
 from mlb_edge.http import HttpClient, UpstreamError, client_for
-from mlb_edge.pollhealth import HealthState, coverage_alerts, staleness_alerts
+from mlb_edge.pollhealth import (
+    HealthState,
+    coverage_alerts,
+    frozen_alerts,
+    staleness_alerts,
+)
 from mlb_edge.timeutil import ensure_utc, utcnow
 
 # Deliberately flat and deliberately boring. Anything clever here is a schema
@@ -443,8 +448,36 @@ class KalshiPoller:
                     )
                 )
 
-        cap = int(self.poll_config.get("kalshi_max_orderbooks_per_tick", 120))
+        cap = int(self.poll_config.get("kalshi_max_orderbooks_per_tick", 500))
         depth = int(self.config.get("orderbook_depth", 10))
+
+        # The cursor fix made the market list complete and then this line threw
+        # most of it away again: `tickers[:cap]` with no voice, which is how a
+        # saturated cap produced an identical record count on every tick and
+        # read as a stable board. A bound is still right -- a runaway ticker
+        # list must not eat the whole cycle -- but a bound that binds is news.
+        if len(tickers) > cap:
+            dropped = len(tickers) - cap
+            print(
+                f"[poll] WARN: kalshi orderbook cap saturated: {len(tickers)} tickers, "
+                f"polling {cap}, DROPPING {dropped}. The archive is truncated for "
+                "this tick. Raise poller.kalshi_max_orderbooks_per_tick.",
+                flush=True,
+            )
+            records.append(
+                PollRecord.failure(
+                    venue=self.venue,
+                    endpoint="orderbook",
+                    url="",
+                    params={"cap": cap, "tickers": len(tickers)},
+                    error=(
+                        f"orderbook cap saturated: {len(tickers)} tickers on the board, "
+                        f"{cap} polled, {dropped} dropped"
+                    ),
+                    key="__cap__",
+                )
+            )
+
         for ticker in tickers[:cap]:
             path = (self.config.get("endpoints") or {})["orderbook"].format(ticker=ticker)
             url = f"{self.config.base_url}{path}"
@@ -524,6 +557,83 @@ def _header_int(headers: dict[str, str], name: str) -> int | None:
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class TickFingerprint:
+    """What a tick actually contained, beyond how many rows it had.
+
+    A row count cannot tell a healthy board from a frozen one. Kalshi returned
+    `records=123` on five consecutive ticks, which read as stability and was in
+    fact a saturated cap. The counts below are the ones that move when the data
+    is alive:
+
+    ``keys``       distinct market/series identifiers -- changes when the board
+                   opens or settles markets, stable within a slate.
+    ``bodies``     distinct payload hashes -- on a live orderbook this should be
+                   close to ``ok`` every tick, because depth and prices move.
+    ``digest``     one hash over all (key, payload-hash) pairs. Identical to the
+                   previous tick means every single payload came back byte for
+                   byte the same, which for an orderbook is not stability, it is
+                   a cache, a replay, or a frozen upstream.
+    """
+
+    venue: str
+    records: int
+    ok: int
+    errors: int
+    keys: int
+    bodies: int
+    items: int | None
+    bytes: int
+    digest: str
+
+    def line(self) -> str:
+        items = "" if self.items is None else f" items={self.items}"
+        return (
+            f"keys={self.keys} bodies={self.bodies}{items} "
+            f"bytes={self.bytes:,} digest={self.digest[:12]}"
+        )
+
+
+def _payload_items(records: list[PollRecord]) -> int | None:
+    """Top-level elements across JSON-array payloads.
+
+    The Odds API answers a whole slate in one response, so ``records=1`` is
+    correct and says nothing about whether 14 games or 1 came back. This counts
+    the events inside, which is the number that was actually in question.
+    """
+    total = 0
+    seen = False
+    for record in records:
+        if not record.payload:
+            continue
+        try:
+            parsed = json.loads(record.payload)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, list):
+            total += len(parsed)
+            seen = True
+    return total if seen else None
+
+
+def fingerprint_tick(venue: str, records: list[PollRecord]) -> TickFingerprint:
+    pairs = sorted(
+        f"{r.key or r.endpoint}:{r.content_sha256 or ''}" for r in records if not r.error
+    )
+    digest = hashlib.sha256("\n".join(pairs).encode("utf-8")).hexdigest()
+    return TickFingerprint(
+        venue=venue,
+        records=len(records),
+        ok=sum(1 for r in records if not r.error),
+        errors=sum(1 for r in records if r.error),
+        keys=len({r.key or r.endpoint for r in records if not r.error}),
+        bodies=len({r.content_sha256 for r in records if not r.error and r.content_sha256}),
+        items=_payload_items(records),
+        bytes=sum(len(r.payload or "") for r in records),
+        digest=digest,
+    )
+
+
 @dataclass
 class SourceState:
     poller: Any
@@ -533,6 +643,10 @@ class SourceState:
     failures: int = 0
     last_error: str | None = None
     intervals: list[float] = field(default_factory=list)
+    #: Digest of the previous tick's payloads. Identical twice running on a
+    #: live board is a finding, not a comfort.
+    last_digest: str | None = None
+    identical_ticks: int = 0
 
 
 class PollDaemon:
@@ -642,40 +756,64 @@ class PollDaemon:
             flush=True,
         )
 
+        fp = fingerprint_tick(name, records)
+        print(f"[poll] {name} content {fp.line()}", flush=True)
+        if state.last_digest is not None and fp.digest == state.last_digest and fp.ok:
+            state.identical_ticks += 1
+            print(
+                f"[poll] WARN: {name} payloads byte-identical to the previous tick "
+                f"({state.identical_ticks} in a row). Prices and depth move between "
+                "polls; identical content means a cache, a replay, or a frozen "
+                "upstream -- not a quiet market.",
+                flush=True,
+            )
+        else:
+            state.identical_ticks = 0
+        state.last_digest = fp.digest
+
         try:
-            self._assess(name, records, errors, started)
+            self._assess(name, records, errors, started, fp)
         except Exception as exc:  # noqa: BLE001 - the archive is already safe
             print(f"[poll] health check failed (archive unaffected): {exc}", flush=True)
         return len(records)
 
     def _assess(
-        self, name: str, records: list[PollRecord], errors: int, started: datetime
+        self,
+        name: str,
+        records: list[PollRecord],
+        errors: int,
+        started: datetime,
+        fingerprint: TickFingerprint | None = None,
     ) -> None:
         """Completeness, heartbeat and alerts. Runs only after bytes are on disk."""
         coverage = None
+        slate = None
         if self.slate is not None:
-            slate = self.slate.games_for(started.date(), now=started)
+            poller_config = self.settings.section("poller")
+            slate = self.slate.slate_for(started.date(), now=started)
             relevant = games_in_window(
-                slate,
+                list(slate.games),
                 now=started,
                 lead=timedelta(
-                    hours=float(self.settings.section("poller").get(
-                        "completeness_slate_lead_hours", 12
-                    ))
+                    hours=float(poller_config.get("completeness_slate_lead_hours", 12))
                 ),
                 trail=timedelta(
-                    hours=float(self.settings.section("poller").get(
-                        "completeness_slate_trail_hours", 5
-                    ))
+                    hours=float(poller_config.get("completeness_slate_trail_hours", 5))
                 ),
             )
             payloads = [r.payload for r in records if r.payload]
-            coverage = coverage_for_venue(name, payloads, relevant)
+            coverage = coverage_for_venue(name, payloads, relevant, slate=slate)
             print(f"[poll] {name} {coverage.line()}", flush=True)
             for alert in coverage_alerts([coverage]):
                 send_throttled(self.alerter, self.throttle, alert, now=started)
-            if coverage.complete:
+            if coverage.healthy:
                 self.throttle.clear(f"coverage:{name}")
+
+        if fingerprint is not None:
+            for alert in frozen_alerts(fingerprint, self.states[name].identical_ticks):
+                send_throttled(self.alerter, self.throttle, alert, now=started)
+            if not self.states[name].identical_ticks:
+                self.throttle.clear(f"frozen:{name}")
 
         self.health.record_attempt(
             name, records=len(records), errors=errors, coverage=coverage, now=started
@@ -690,7 +828,7 @@ class PollDaemon:
             )
             alerts = staleness_alerts(
                 self.health,
-                slate=self.slate.games_for(started.date(), now=started),
+                slate=list(slate.games) if slate is not None else [],
                 now=started,
                 threshold=threshold,
             )

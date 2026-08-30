@@ -11,6 +11,13 @@ Description=mlb-edge odds and orderbook archive poller
 Documentation=https://github.com/harrisonsmoove/MLB
 After=network-online.target
 Wants=network-online.target
+# Never give up. The default burst limit stops a unit permanently after a
+# handful of quick failures, which for this process is the worst outcome.
+# These belong in [Unit]: systemd ignores them under [Service] and logs a
+# warning on every start, which is how the limiter was inactive while looking
+# configured.
+StartLimitIntervalSec=0
+StartLimitBurst=0
 
 [Service]
 Type=simple
@@ -27,9 +34,6 @@ ExecStart=/opt/mlb-edge/.venv/bin/mlb-edge poll-daemon --root /opt/mlb-edge
 
 Restart=always
 RestartSec=30
-# Never give up. The default burst limit would stop the unit permanently after
-# a handful of quick failures, which for this process is the worst outcome.
-StartLimitIntervalSec=0
 
 # SIGTERM lets the daemon finish the tick in flight and rename its parquet;
 # killing mid-write is what the temp-and-rename dance exists to avoid.
