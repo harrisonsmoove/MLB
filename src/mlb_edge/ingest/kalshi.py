@@ -31,6 +31,7 @@ from typing import Any
 
 import polars as pl
 
+from mlb_edge.http import UpstreamError
 from mlb_edge.ingest.base import FetchTask, Ingester, provenance_columns
 from mlb_edge.ingest.matching import GameMatcher
 from mlb_edge.market.prices import cents_to_prob
@@ -89,6 +90,7 @@ class KalshiIngester(Ingester):
         self._matcher: GameMatcher | None = None
         self._auth: KalshiAuth | None = None
         self.unmapped_markets: list[str] = []
+        self._pending_pages: list[FetchTask] = []
 
     @property
     def matcher(self) -> GameMatcher:
@@ -159,21 +161,59 @@ class KalshiIngester(Ingester):
         market list has been parsed, so ``plan_orderbooks`` runs afterwards.
         """
         label = kwargs.get("label") or utcnow().strftime("%Y%m%dT%H%M%SZ")
+        page_size = int(self.config.get("markets_page_size", 200))
+        max_pages = int(self.config.get("max_pages", 25))
         tasks: list[FetchTask] = []
+
+        # Kalshi cursors cannot be planned ahead without fetching, and plan()
+        # is network-free by contract. So the first page is planned here and
+        # run() follows the cursor from the response -- the same division of
+        # labour the Statcast ingester uses for its row-cap splitting.
         for series in self.config.get("series_tickers", []) or []:
             path = (self.config.get("endpoints") or {})["markets"]
             tasks.append(
                 FetchTask(
                     dataset="markets",
-                    partition=f"{series}_{label}",
+                    partition=f"{series}_{label}_p0",
                     url=f"{self.config.base_url}{path}",
-                    params={"series_ticker": series, "status": "open", "limit": 200},
+                    params={
+                        "series_ticker": series,
+                        "status": "open",
+                        "limit": page_size,
+                    },
                     headers=self._signed_headers(path),
                     max_age_seconds=0.0,
-                    context={"series": series, "label": label},
+                    context={
+                        "series": series,
+                        "label": label,
+                        "page": 0,
+                        "page_size": page_size,
+                        "max_pages": max_pages,
+                    },
                 )
             )
         return tasks
+
+    def run(self, start: date, end: date, **kwargs: Any) -> Any:
+        """Fetch, following the markets cursor to the end of the board."""
+        report = super().run(start, end, **kwargs)
+        if kwargs.get("dry_run") or self.warehouse is None:
+            return report
+
+        # Drain as a queue: parsing page 2 can queue page 3, and iterating a
+        # snapshot taken up front would stop after the first follow-up.
+        while self._pending_pages:
+            task = self._pending_pages.pop(0)
+            try:
+                entry, is_new = self._fetch_and_store(task, force_refresh=True)
+            except UpstreamError as exc:
+                report.failures.append(f"{task.dataset}/{task.partition}: {exc}")
+                continue
+            report.tasks_fetched += 1
+            report.versions_written += int(is_new)
+            self.warehouse.record_raw_entries([entry])
+            self._parse_and_load(entry, task, report)
+        return report
 
     def plan_orderbooks(self, tickers: list[str], *, label: str | None = None) -> list[FetchTask]:
         label = label or utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -200,15 +240,18 @@ class KalshiIngester(Ingester):
     ) -> dict[str, pl.DataFrame]:
         data = json.loads(payload)
         if entry.dataset == "markets":
-            return {"market_quotes": self._parse_markets(data, entry)}
+            return {"market_quotes": self._parse_markets(data, entry, task)}
         if entry.dataset == "orderbook":
             return {"market_quotes": self._parse_orderbook(data, entry, task)}
         return {}
 
-    def _parse_markets(self, data: Any, entry: RawEntry) -> pl.DataFrame:
+    def _parse_markets(
+        self, data: Any, entry: RawEntry, task: FetchTask | None = None
+    ) -> pl.DataFrame:
         markets = data.get("markets") if isinstance(data, dict) else data
         if not isinstance(markets, list):
             return pl.DataFrame()
+        self._queue_next_page(data, task)
 
         prov = provenance_columns(entry, self.source_name)
         rows: list[dict[str, Any]] = []
@@ -368,6 +411,43 @@ class KalshiIngester(Ingester):
         row = rows.row(0, named=True)
         side = "home" if int(row["home_team_id"]) == team_id else "away"
         return int(row["game_pk"]), side
+
+    def _queue_next_page(self, data: Any, task: FetchTask | None) -> None:
+        """Plan a follow-up fetch when the response says there is more.
+
+        Context comes from the task that produced this payload, not from a side
+        table -- an earlier version kept one, and because ``plan()`` never
+        registered the first page in it, the cursor was read and then dropped
+        on the floor. The task already carries everything needed.
+        """
+        cursor = data.get("cursor") if isinstance(data, dict) else None
+        if not cursor or task is None or not task.context.get("series"):
+            return
+        context = task.context
+        page = int(context.get("page", 0)) + 1
+        if page >= int(context.get("max_pages", 25)):
+            return
+
+        series, label = context["series"], context["label"]
+        path = (self.config.get("endpoints") or {})["markets"]
+        partition = f"{series}_{label}_p{page}"
+        next_context = {**context, "page": page}
+        self._pending_pages.append(
+            FetchTask(
+                dataset="markets",
+                partition=partition,
+                url=f"{self.config.base_url}{path}",
+                params={
+                    "series_ticker": series,
+                    "status": "open",
+                    "limit": int(context.get("page_size", 200)),
+                    "cursor": str(cursor),
+                },
+                headers=self._signed_headers(path),
+                max_age_seconds=0.0,
+                context=next_context,
+            )
+        )
 
     def _remember_ticker(self, ticker: str, mapping: dict[str, Any]) -> None:
         self._ticker_map = getattr(self, "_ticker_map", {})

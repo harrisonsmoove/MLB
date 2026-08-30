@@ -65,18 +65,35 @@ class PolymarketIngester(Ingester):
 
     # -- planning ------------------------------------------------------------
     def plan(self, start: date, end: date, **kwargs: Any) -> list[FetchTask]:
+        """Offset-paginated event pages.
+
+        Gamma pages with limit/offset. Requesting one page and stopping takes
+        whatever the first page holds and silently drops the rest -- the same
+        shape of bug as an unfollowed cursor. Pages are planned eagerly up to a
+        bound; a page past the end returns an empty list and parses to nothing,
+        which costs one cheap request rather than a truncated board.
+        """
         label = kwargs.get("label") or utcnow().strftime("%Y%m%dT%H%M%SZ")
         gamma = str(self.config.get("gamma_url", "")).rstrip("/")
         path = (self.config.get("endpoints") or {})["gamma_events"]
+        page_size = int(self.config.get("events_page_size", 200))
+        max_pages = int(self.config.get("max_pages", 10))
+
         return [
             FetchTask(
                 dataset="events",
-                partition=label,
+                partition=f"{label}_p{page}",
                 url=f"{gamma}{path}",
-                params={"closed": "false", "limit": 500, "tag_slug": "mlb"},
+                params={
+                    "closed": "false",
+                    "limit": page_size,
+                    "offset": page * page_size,
+                    "tag_slug": "mlb",
+                },
                 max_age_seconds=0.0,
-                context={"label": label},
+                context={"label": label, "page": page},
             )
+            for page in range(max_pages)
         ]
 
     def plan_books(self, token_ids: list[str], *, label: str | None = None) -> list[FetchTask]:

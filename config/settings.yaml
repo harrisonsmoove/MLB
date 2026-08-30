@@ -41,6 +41,11 @@ poller:
   odds_interval_seconds: 900        # 15 min -- the FLOOR, not the guarantee
   kalshi_interval_seconds: 900      # Kalshi is not credit-metered
   kalshi_max_orderbooks_per_tick: 120
+  kalshi_markets_page_size: 200
+  # Bounds the cursor loop. A capped single request silently drops everything
+  # past the first page; an unbounded loop on a cursor that never clears spins
+  # forever. Hitting this limit is archived as a failure row, not ignored.
+  kalshi_max_pages: 25
   # The budget horizon. The odds poller spreads its remaining credits evenly
   # over the days to this date, so a free-tier key throttles itself to survive
   # the season instead of burning out in 2.6 days. Update it each year.
@@ -234,6 +239,8 @@ sources:
       fee_schedule: "/exchange/schedule"
     series_tickers: [KXMLBGAME, KXMLBWINNER, KXMLBTOTAL]
     orderbook_depth: 10
+    markets_page_size: 200
+    max_pages: 25
     # UNVERIFIED against live: this session had no egress to Kalshi. Ticker and
     # title formats are matched by these patterns; run `mlb-edge probe kalshi`
     # after the first live fetch and correct them. A market that matches none of
@@ -266,6 +273,8 @@ sources:
       books: "/books"
       gamma_events: "/events"
     rate_limit_per_minute: 60
+    events_page_size: 200
+    max_pages: 10
     fees:
       source: fetch
       cache_ttl_hours: 24
@@ -386,7 +395,23 @@ projector:
   # Players below this weighted PA count do not inform the beta-binomial
   # variance estimate. Selecting on playing time biases k upward (toward
   # over-regression); letting 5-PA call-ups set the variance is worse.
+  # This is the fit actually used for shrinkage.
   min_trials_for_constant_fit: 200
+
+  # Extra fits, computed and reported but never used to shrink anything.
+  # The point is diagnosis: published true-talent spreads are measured on
+  # qualified hitters, so fitting across everyone including call-ups widens the
+  # observed spread, raises sigma^2, and pulls k DOWN. A ratio that misses on
+  # the low side could therefore be sample composition rather than a
+  # mis-specified estimator -- and the only way to tell is to see whether the
+  # ratio moves with the population.
+  diagnostic_fit_thresholds: [0, 300]
+
+  # Which fit the pre-registered gate compares. 300 PA rather than the
+  # shrinkage fit's 200, because the target was derived from qualified-hitter
+  # spread and the comparison has to use a comparable population. Comparing an
+  # all-hitters fit against a qualified-hitter target is not apples to apples.
+  gate_min_trials: 300
 
   # Pooling strength for league -> handedness -> experience cells.
   hierarchy_pooling_k: 400

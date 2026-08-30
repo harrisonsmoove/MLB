@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 242 tests, no network required
+uv run pytest                      # 260 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -122,6 +122,17 @@ No simulator code exists yet, and none may be written until, in this order:
 mlb-edge gate          # runs both, writes reports/gate.json, exits non-zero if blocked
 ```
 
+The record **expires**. It carries a fingerprint of the warehouse it was
+computed from — row count and latest as-of per table, hashed — and the test
+refuses a record whose fingerprint no longer matches, naming what moved. Row
+counts alone would miss a Statcast restatement that revises values without
+adding rows; as-of alone would miss a deletion. One clean run does not unlock
+`model/` forever.
+
+The gate compares the **≥300 PA** fit, not the shrinkage fit: the target was
+derived from qualified-hitter spread, so the comparison has to use a comparable
+population.
+
 The order is enforced: a constant fitted on a warehouse that fails its own
 integrity checks is a number derived from corrupted input, so it is not
 evaluated at all until integrity passes.
@@ -139,15 +150,31 @@ failure, not a note in a README.
 k = mu(1-mu)/sd^2 - 1  =  0.22 x 0.78 / 0.055^2 - 1  =  55.7
 ```
 
-from a hitter K% mean of ~22% and true-talent SD of ~5.5pp. For a
-beta-binomial, reliability is `n/(n+k)`, so k *is* the stabilisation point —
-and published work puts K% stabilisation at ~60 PA. Two unrelated routes
-agreeing to within 10% is the reason to trust the target.
+from a hitter K% mean of ~22% and true-talent SD of ~5.5pp.
+
+This is **one estimate, not a triangulation.** The published "K% stabilises at
+~60 PA" figure is the same identity evaluated from a different published input
+— for a beta-binomial, reliability is `n/(n+k)`, so the stabilisation point *is*
+k. Agreement means the inputs are mutually consistent, not that either is
+right. Read 55.7 as "somewhere in the tens"; the width of the ratio band is
+what actually protects against a mis-specified estimator.
 
 Fail condition, fixed in advance: **fitted/expected outside [0.5, 2.0]**.
-`build-projections` prints the comparison automatically. Hitters only —
-pitcher K% talent is spread differently, so pitcher constants are reported but
-never gated.
+`build-projections` prints the comparison automatically, alongside the ratio at
+each playing-time threshold:
+
+```
+ratio vs population
+  min_pa>=0     n=260   k=    1,352  ratio=  24.27
+  min_pa>=200   n=156   k=      890  ratio=  15.98 *primary
+  min_pa>=300   n=109   k=    1,020  ratio=  18.32
+```
+
+Published spreads are measured on qualified hitters, so fitting across everyone
+catches call-ups, widens observed spread and pulls k *down*. If the ratio moves
+with the threshold, a low-side miss is sample composition; if it holds steady,
+the estimator is the suspect. Hitters only — pitcher K% talent is spread
+differently, so pitcher constants are reported but never gated.
 
 ## Park orientations
 
@@ -236,5 +263,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          242 tests, all offline, fixtures + a synthetic generator
+tests/          260 tests, all offline, fixtures + a synthetic generator
 ```

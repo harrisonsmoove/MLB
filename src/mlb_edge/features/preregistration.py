@@ -25,16 +25,24 @@ observed season lines, which is wider because it also carries binomial noise).
     sd = 0.055  ->  k = 0.22 * 0.78 / 0.055^2 - 1 = 55.7      <- point estimate
     sd = 0.060  ->  k = 0.22 * 0.78 / 0.060^2 - 1 = 46.7
 
-INDEPENDENT CORROBORATION. For a beta-binomial, reliability is n / (n + k), so
-k *is* the "stabilisation point" -- the sample size at which a player's own
-record and the prior carry equal weight. Published work on when rate statistics
-stabilise puts strikeout rate at roughly 60 plate appearances. The derivation
-above gives 56 from a completely different starting point (talent spread rather
-than split-half reliability). Two independent routes agreeing to within 10% is
-the main reason to trust the target.
+NOT AN INDEPENDENT CHECK. An earlier version of this comment claimed the
+published "strikeout rate stabilises around 60 PA" figure corroborated the 56
+above by a separate route. It does not. For a beta-binomial, reliability is
+n / (n + k), so the stabilisation point *is* k, and the published figure is
+itself obtained from a variance decomposition -- the same identity, evaluated
+from a different published input. Two numbers agreeing here means the inputs
+are mutually consistent, which is worth knowing and is not evidence that either
+is right.
 
-The same check on walk rate: mean 8.5%, true-talent sd about 2.5pp gives k =
-123, against a published stabilisation of roughly 120 PA. Also agrees.
+So the target is one estimate with one set of assumptions, not a triangulation.
+What actually protects against a mis-specified estimator is the width of
+RATIO_BOUNDS below: a factor of two is generous precisely because the target is
+softer than a single point estimate suggests. Read 55.7 as "somewhere in the
+tens", not as a measurement.
+
+The walk-rate figure below has the same status: mean 8.5%, true-talent sd about
+2.5pp gives k = 123, and the published walk stabilisation of roughly 120 PA is
+the same identity again rather than a second opinion.
 
 ---------------------------------------------------------------------------
 WHY ONLY THE DISCRETE BUCKETS ARE GATED

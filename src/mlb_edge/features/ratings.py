@@ -66,19 +66,60 @@ class ProjectorReport:
     batted_balls: int = 0
     unmeasured_batted_balls: int = 0
     constants: dict[str, RegressionConstant] = field(default_factory=dict)
+    #: Every fit, keyed by playing-time threshold. Only the primary shrinks
+    #: anything; the rest exist so a missed ratio can be diagnosed as sample
+    #: composition rather than mis-specification.
+    constant_fits: dict[float, dict[str, RegressionConstant]] = field(default_factory=dict)
+    primary_min_trials: float = 0.0
     proxy: ProxyModel | None = None
 
-    @property
-    def preregistration(self) -> list[PreregistrationCheck]:
-        """Fitted constants against targets fixed before any data was seen."""
-        return check_constants({name: c.k for name, c in self.constants.items()})
+    def population(self, min_trials: float) -> int:
+        """Players that informed the fit at a given threshold."""
+        fit = self.constant_fits.get(min_trials, {})
+        return max((c.n_players for c in fit.values()), default=0)
 
-    @property
-    def preregistration_passed(self) -> bool:
-        return gating_result(self.preregistration)[0]
+    def preregistration(
+        self, min_trials: float | None = None
+    ) -> list[PreregistrationCheck]:
+        """Fitted constants against targets fixed before any data was seen.
 
-    def preregistration_lines(self) -> list[str]:
-        return [check.line() for check in self.preregistration]
+        Defaults to the primary fit. Pass a threshold to check a diagnostic one
+        -- the gate uses the qualified-hitter fit, because that is the
+        population the published spread was measured on.
+        """
+        fit = (
+            self.constants
+            if min_trials is None
+            else self.constant_fits.get(min_trials, self.constants)
+        )
+        return check_constants({name: c.k for name, c in fit.items()})
+
+    def preregistration_passed(self, min_trials: float | None = None) -> bool:
+        return gating_result(self.preregistration(min_trials))[0]
+
+    def preregistration_lines(self, min_trials: float | None = None) -> list[str]:
+        return [check.line() for check in self.preregistration(min_trials)]
+
+    def population_lines(self) -> list[str]:
+        """Ratio and hitter count at every threshold, side by side.
+
+        If the ratio moves with the population, the miss is composition: a wider
+        net catches call-ups, which widens observed spread and pulls k down.
+        If it holds steady across thresholds, composition is not the story and
+        the estimator itself is the suspect.
+        """
+        lines: list[str] = []
+        for min_trials in sorted(self.constant_fits):
+            checks = [c for c in self.preregistration(min_trials) if c.gating]
+            if not checks:
+                continue
+            check = checks[0]
+            marker = " *primary" if min_trials == self.primary_min_trials else ""
+            lines.append(
+                f"min_pa>={min_trials:<5.0f} n={self.population(min_trials):<5d} "
+                f"k={check.fitted_k:>9,.0f}  ratio={check.ratio:>7.2f}{marker}"
+            )
+        return lines
 
     def summary(self) -> str:
         constants = ", ".join(
@@ -131,7 +172,16 @@ class Projector:
             return pl.DataFrame(), report
         report.players = len(players)
 
-        constants = self._fit_constants(players)
+        primary_min_trials = float(self.config.get("min_trials_for_constant_fit", 200))
+        thresholds = {primary_min_trials} | {
+            float(t) for t in self.config.get("diagnostic_fit_thresholds", []) or []
+        }
+        report.constant_fits = {
+            threshold: self._fit_constants(players, threshold)
+            for threshold in sorted(thresholds)
+        }
+        report.primary_min_trials = primary_min_trials
+        constants = report.constant_fits[primary_min_trials]
         report.constants = constants
         priors = self._fit_priors(players)
         league_platoon = self._league_platoon_deltas(players)
@@ -241,7 +291,7 @@ class Projector:
 
     # -- fitting --------------------------------------------------------------
     def _fit_constants(
-        self, players: dict[int, PlayerTally]
+        self, players: dict[int, PlayerTally], min_trials: float
     ) -> dict[str, RegressionConstant]:
         """One regression constant per outcome bucket, fit across all players.
 
@@ -250,7 +300,6 @@ class Projector:
         entire benefit of using contact quality, arriving here automatically
         rather than being asserted.
         """
-        min_trials = float(self.config.get("min_trials_for_constant_fit", 200))
         constants: dict[str, RegressionConstant] = {}
         for bucket in BUCKETS:
             successes: list[float] = []
@@ -493,7 +542,7 @@ class Projector:
 def constants_frame(
     report: ProjectorReport, *, system: str, player_type: str
 ) -> pl.DataFrame:
-    """Serialise a snapshot's fitted constants for storage."""
+    """Serialise every fitted constant, at every threshold, for storage."""
     as_of = datetime.combine(report.through_date, time.min, tzinfo=UTC)
     return pl.DataFrame(
         [
@@ -502,6 +551,8 @@ def constants_frame(
                 "player_type": player_type,
                 "through_date": report.through_date,
                 "bucket": name,
+                "min_trials": min_trials,
+                "is_primary": min_trials == report.primary_min_trials,
                 "k": constant.k,
                 "prior_mean": constant.prior_mean,
                 "var_observed": constant.var_observed,
@@ -514,7 +565,8 @@ def constants_frame(
                 "source_partition": report.through_date.isoformat(),
                 "ingested_at": as_of,
             }
-            for name, constant in sorted(report.constants.items())
+            for min_trials, fit in sorted(report.constant_fits.items())
+            for name, constant in sorted(fit.items())
         ]
     )
 

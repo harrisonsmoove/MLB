@@ -11,7 +11,7 @@ running against an empty warehouse.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 import pytest
@@ -29,7 +29,16 @@ def test_no_model_code_without_a_passing_gate_record(request):
 
     If someone -- me, later, with momentum -- starts writing the simulator
     before the warehouse is verified and the constant checked, this fails.
+
+    Freshness is checked too, when a warehouse is present. A verdict from
+    before the warehouse was rebuilt is a statement about data that no longer
+    exists. Where no warehouse is reachable (a clean clone, CI), staleness
+    cannot be established and the test says so rather than pretending either
+    way -- the passing-record requirement still binds.
     """
+    from mlb_edge.config import load_settings
+    from mlb_edge.storage.warehouse import Warehouse
+
     root = request.config.rootpath
     modules = gate.model_modules(root / "src" / "mlb_edge")
     if not modules:
@@ -46,30 +55,60 @@ def test_no_model_code_without_a_passing_gate_record(request):
         f"{record.get('blocked_reason')}"
     )
 
+    warehouse_path = load_settings(root).warehouse_path
+    if not warehouse_path.is_file():
+        pytest.skip(
+            f"model/ contains {names} with a passing record, but no warehouse at "
+            f"{warehouse_path} to check it against -- freshness unverified here"
+        )
 
-def _seed(warehouse, *, fitted_k: float, through: date = date(2025, 7, 1)):
-    """A warehouse carrying one batter constant and nothing that breaks integrity."""
-    warehouse.load(
-        "projector_constants",
-        pl.DataFrame(
-            [
+    warehouse = Warehouse.open(warehouse_path, read_only=True)
+    try:
+        current, changes = gate.record_is_current(record, warehouse)
+    finally:
+        warehouse.close()
+    assert current, (
+        f"model/ contains {names} but the gate record is stale. The warehouse "
+        "has changed since it was written:\n  " + "\n  ".join(changes) +
+        "\nRe-run `mlb-edge gate`."
+    )
+
+
+def _seed(
+    warehouse,
+    *,
+    fitted_k: float,
+    through: date = date(2025, 7, 1),
+    all_hitters_k: float | None = None,
+    player_type: str = "batter",
+):
+    """Batter constants at two thresholds, as the projector now writes them.
+
+    ``fitted_k`` is the qualified-hitter fit -- the one the gate compares, since
+    that is the population the published spread was measured on.
+    """
+    rows = []
+    for min_trials, k_scale in ((0.0, all_hitters_k), (300.0, fitted_k)):
+        for bucket, base in (("K", fitted_k), ("BB", 120.0)):
+            value = k_scale if (bucket == "K" and k_scale is not None) else base
+            rows.append(
                 {
                     "system": "inhouse_statcast",
-                    "player_type": "batter",
+                    "player_type": player_type,
                     "through_date": through,
                     "bucket": bucket,
-                    "k": k,
+                    "min_trials": min_trials,
+                    "is_primary": min_trials == 300.0,
+                    "k": value,
                     "prior_mean": 0.22,
                     "saturated": False,
-                    "n_players": 400,
+                    "n_players": 400 if min_trials else 900,
                     "as_of_ts": NOW,
                     "source": "test",
                     "ingested_at": NOW,
                 }
-                for bucket, k in (("K", fitted_k), ("BB", 120.0))
-            ]
-        ),
-    )
+            )
+    warehouse.load("projector_constants", pl.DataFrame(rows))
 
 
 def test_gate_passes_on_a_clean_warehouse_and_a_plausible_constant(warehouse):
@@ -151,27 +190,37 @@ def test_only_the_latest_snapshot_is_gated_on(warehouse):
 
 def test_pitcher_constants_do_not_satisfy_the_gate(warehouse):
     """The target is derived from hitter talent spread and does not transfer."""
-    warehouse.load(
-        "projector_constants",
-        pl.DataFrame(
-            [
-                {
-                    "system": "inhouse_statcast",
-                    "player_type": "pitcher",
-                    "through_date": date(2025, 7, 1),
-                    "bucket": "K",
-                    "k": EXPECTED_K_CONCENTRATION,
-                    "saturated": False,
-                    "as_of_ts": NOW,
-                    "source": "test",
-                    "ingested_at": NOW,
-                }
-            ]
-        ),
-    )
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION, player_type="pitcher")
     result = gate.evaluate(warehouse, now=NOW)
     assert not result.passed
     assert "no batter constants" in result.blocked_reason
+
+
+def test_gate_uses_the_qualified_hitter_fit_not_the_all_hitters_one(warehouse):
+    """Population must match the one the target was measured on.
+
+    Fitting across everyone catches call-ups, widens observed spread and pulls k
+    down. Gating on that against a qualified-hitter target would fail for a
+    reason that is not an error.
+    """
+    _seed(
+        warehouse,
+        fitted_k=EXPECTED_K_CONCENTRATION,   # qualified fit: passes
+        all_hitters_k=EXPECTED_K_CONCENTRATION * 0.2,  # all-hitters: would fail
+    )
+    result = gate.evaluate(warehouse, now=NOW)
+    assert result.passed, "the gate must read the qualified-hitter fit"
+    assert result.gate_min_trials == 300.0
+
+
+def test_record_carries_the_population_evidence(warehouse):
+    """The record should let you diagnose a miss, not just report one."""
+    _seed(warehouse, fitted_k=917.0, all_hitters_k=300.0)
+    result = gate.evaluate(warehouse, now=NOW)
+    assert not result.passed
+    thresholds = {row["min_trials"] for row in result.population_by_threshold}
+    assert thresholds == {0.0, 300.0}
+    assert all("n_players" in row for row in result.population_by_threshold)
 
 
 def test_record_round_trips(warehouse, tmp_path):
@@ -211,13 +260,103 @@ def test_expected_k_matches_its_own_derivation():
     assert pytest.approx(mu * (1 - mu) / sd**2 - 1, abs=0.1) == EXPECTED_K_CONCENTRATION
 
 
-def test_derivation_agrees_with_published_stabilisation():
-    """Independent corroboration, kept as a test.
+def test_derivation_is_consistent_with_published_stabilisation():
+    """An input-consistency check, and labelled as one.
 
-    For a beta-binomial, reliability is n/(n+k), so k is the stabilisation
-    point. Published work puts strikeout rate at roughly 60 PA. The derivation
-    starts from talent spread instead and lands at 56. Two unrelated routes
-    agreeing is the main reason to trust the target.
+    For a beta-binomial, reliability is n/(n+k), so the stabilisation point IS
+    k -- and the published "~60 PA" figure is itself derived from a variance
+    decomposition. This is the same identity evaluated from a different
+    published input, not a second method. Agreement means the inputs are
+    mutually consistent; it is not evidence that either is right.
+
+    Kept because inconsistency here would be informative, but it must not be
+    read as corroboration. The ratio band is what does the protecting.
     """
     published_stabilisation_pa = 60.0
     assert abs(EXPECTED_K_CONCENTRATION - published_stabilisation_pa) < 10.0
+
+
+
+# ---------------------------------------------------------------------------
+# Expiry
+# ---------------------------------------------------------------------------
+def test_record_is_current_against_an_unchanged_warehouse(warehouse, tmp_path):
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION)
+    result = gate.evaluate(warehouse, now=NOW)
+    gate.write_record(result, tmp_path)
+
+    current, changes = gate.record_is_current(gate.read_record(tmp_path), warehouse)
+    assert current and changes == []
+
+
+def test_record_expires_when_rows_are_added(warehouse, tmp_path):
+    """A verdict does not survive the data it was computed from."""
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION)
+    gate.write_record(gate.evaluate(warehouse, now=NOW), tmp_path)
+
+    warehouse.load(
+        "games",
+        pl.DataFrame(
+            [
+                {
+                    "game_pk": 776001,
+                    "season": 2025,
+                    "game_type": "R",
+                    "game_date_local": date(2025, 4, 1),
+                    "scheduled_start_ts": NOW,
+                    "home_team_id": 147,
+                    "away_team_id": 111,
+                    "as_of_ts": NOW,
+                    "source": "test",
+                    "ingested_at": NOW,
+                }
+            ]
+        ),
+    )
+    current, changes = gate.record_is_current(gate.read_record(tmp_path), warehouse)
+    assert not current
+    assert any("games" in c and "rows" in c for c in changes), changes
+
+
+def test_record_expires_on_a_revision_that_adds_no_rows(warehouse, tmp_path):
+    """Statcast restates values without adding rows.
+
+    A row-count-only fingerprint would call that unchanged, and the gate would
+    keep vouching for numbers that moved underneath it.
+    """
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION)
+    gate.write_record(gate.evaluate(warehouse, now=NOW), tmp_path)
+
+    warehouse.con.execute(
+        "UPDATE projector_constants SET as_of_ts = ?", [NOW + timedelta(days=30)]
+    )
+    current, changes = gate.record_is_current(gate.read_record(tmp_path), warehouse)
+    assert not current
+    assert any("as_of" in c for c in changes), changes
+
+
+def test_stale_record_names_what_changed(warehouse, tmp_path):
+    """A staleness failure should be diagnosable, not just a refusal."""
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION)
+    gate.write_record(gate.evaluate(warehouse, now=NOW), tmp_path)
+    _seed(warehouse, fitted_k=EXPECTED_K_CONCENTRATION, through=date(2025, 8, 1))
+
+    _, changes = gate.record_is_current(gate.read_record(tmp_path), warehouse)
+    assert changes
+    assert any("projector_constants" in c for c in changes), changes
+
+
+def test_a_record_without_a_fingerprint_is_treated_as_stale(warehouse, tmp_path):
+    """Records written before expiry existed must not grandfather themselves in."""
+    (tmp_path / "gate.json").write_text(json.dumps({"passed": True}))
+    current, changes = gate.record_is_current(gate.read_record(tmp_path), warehouse)
+    assert not current
+    assert "no fingerprint" in changes[0]
+
+
+def test_failing_runs_also_record_a_fingerprint(warehouse, tmp_path):
+    """So a stale FAIL is distinguishable from a stale PASS."""
+    _seed(warehouse, fitted_k=917.0)
+    result = gate.evaluate(warehouse, now=NOW)
+    assert not result.passed
+    assert result.fingerprint.get("digest")

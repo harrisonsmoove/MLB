@@ -297,7 +297,25 @@ def gate_command(
         for note in result.diagnosis:
             console.print(f"  [dim]{note}[/dim]")
 
+    # Whether the record being replaced still described this warehouse. A
+    # verdict written before a rebuild is a statement about data that is gone.
+    previous = gate_module.read_record(settings.reports_dir)
+    if previous is not None:
+        was_current, changes = gate_module.record_is_current(previous, warehouse)
+        if was_current:
+            console.print("\n[dim]previous record was still current[/dim]")
+        else:
+            console.print("\n[yellow]previous record was stale[/yellow]")
+            for change in changes[:6]:
+                console.print(f"  [dim]{change}[/dim]")
+
     path = gate_module.write_record(result, settings.reports_dir)
+    tables = result.fingerprint.get("tables", {})
+    populated = sum(1 for t in tables.values() if t.get("rows"))
+    console.print(
+        f"\n[dim]fingerprint {result.fingerprint.get('digest', '')[:16]} "
+        f"over {populated} populated tables[/dim]"
+    )
     verdict = "[green]GATE PASSED[/green]" if result.passed else "[red]GATE BLOCKED[/red]"
     console.print(f"\n{verdict}")
     if not result.passed:
@@ -562,20 +580,40 @@ def build_projections(
     # The pre-registered check, printed without being asked for. The target was
     # fixed before any real data was seen; see features/preregistration.py.
     if gating_report is not None and gating_report.constants:
+        gate_min_trials = float(settings.section("projector").get("gate_min_trials", 300))
         console.print(
-            f"\n[bold]pre-registered constant check[/bold] ({GATING_PLAYER_TYPE})"
+            f"\n[bold]pre-registered constant check[/bold] ({GATING_PLAYER_TYPE}, "
+            f"gated at min_pa>={gate_min_trials:.0f})"
         )
-        for line in gating_report.preregistration_lines():
+        for line in gating_report.preregistration_lines(gate_min_trials):
             style = "green" if line.startswith("PASS") else "red"
             console.print(f"  [{style}]{line}[/{style}]")
-        passed, reason = gating_result(gating_report.preregistration)
+
+        # Ratio against population. If it moves with the threshold, the miss is
+        # sample composition; if it holds, the estimator is the suspect.
+        console.print("\n  [bold]ratio vs population[/bold]")
+        for line in gating_report.population_lines():
+            console.print(f"    {line}")
+
+        passed, reason = gating_result(gating_report.preregistration(gate_min_trials))
         if passed:
-            console.print(f"  [green]gate: PASS[/green] ({reason})")
+            console.print(f"\n  [green]gate: PASS[/green] ({reason})")
         else:
-            console.print(f"  [red]gate: FAIL[/red] ({reason})")
-            for check in gating_report.preregistration:
+            console.print(f"\n  [red]gate: FAIL[/red] ({reason})")
+            for check in gating_report.preregistration(gate_min_trials):
                 if check.gating and not check.passed:
                     console.print(f"  {interpret(check)}")
+            ratios = [
+                gating_report.preregistration(t)[0].ratio
+                for t in sorted(gating_report.constant_fits)
+                if gating_report.preregistration(t)
+            ]
+            if len(ratios) > 1 and max(ratios) > 1.5 * min(ratios):
+                console.print(
+                    "  [yellow]the ratio moves substantially with the playing-time "
+                    "threshold, so sample composition is a live explanation before "
+                    "the estimator is.[/yellow]"
+                )
     elif gating_report is None:
         console.print(
             f"\n[yellow]no {GATING_PLAYER_TYPE} fit ran, so the gate did not "

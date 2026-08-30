@@ -354,38 +354,74 @@ class KalshiPoller:
         tickers: list[str] = []
 
         markets_path = (self.config.get("endpoints") or {})["markets"]
+        page_size = int(self.poll_config.get("kalshi_markets_page_size", 200))
+        max_pages = int(self.poll_config.get("kalshi_max_pages", 25))
+
         for series in self.config.get("series_tickers", []) or []:
-            params = {"series_ticker": series, "status": "open", "limit": 200}
             url = f"{self.config.base_url}{markets_path}"
-            try:
-                response = self._client.get(url, params=params, headers=self._headers(markets_path))
-            except UpstreamError as exc:
+            cursor: str | None = None
+
+            # Follow the cursor. A single request capped at the page size takes
+            # whatever the first page happens to hold and silently discards the
+            # rest -- and on a busy slate that is most of the board. max_pages
+            # bounds the loop so a cursor that never clears cannot spin forever.
+            for page in range(max_pages):
+                params: dict[str, Any] = {
+                    "series_ticker": series,
+                    "status": "open",
+                    "limit": page_size,
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                try:
+                    response = self._client.get(
+                        url, params=params, headers=self._headers(markets_path)
+                    )
+                except UpstreamError as exc:
+                    records.append(
+                        PollRecord.failure(
+                            venue=self.venue,
+                            endpoint="markets",
+                            url=url,
+                            params=params,
+                            error=str(exc),
+                            status=exc.status,
+                            key=series,
+                        )
+                    )
+                    break
+
+                body = response.text()
+                records.append(
+                    PollRecord.ok(
+                        venue=self.venue,
+                        endpoint="markets",
+                        url=url,
+                        params=params,
+                        body=body,
+                        status=response.status,
+                        key=series if page == 0 else f"{series}#p{page}",
+                    )
+                )
+                tickers.extend(_tickers_from(body))
+
+                cursor = _cursor_from(body)
+                if not cursor:
+                    break
+            else:
                 records.append(
                     PollRecord.failure(
                         venue=self.venue,
                         endpoint="markets",
                         url=url,
-                        params=params,
-                        error=str(exc),
-                        status=exc.status,
+                        params={"series_ticker": series},
+                        error=(
+                            f"cursor did not clear after {max_pages} pages; the market "
+                            "list may be truncated"
+                        ),
                         key=series,
                     )
                 )
-                continue
-
-            body = response.text()
-            records.append(
-                PollRecord.ok(
-                    venue=self.venue,
-                    endpoint="markets",
-                    url=url,
-                    params=params,
-                    body=body,
-                    status=response.status,
-                    key=series,
-                )
-            )
-            tickers.extend(_tickers_from(body))
 
         cap = int(self.poll_config.get("kalshi_max_orderbooks_per_tick", 120))
         depth = int(self.config.get("orderbook_depth", 10))
@@ -423,6 +459,23 @@ class KalshiPoller:
 
     def next_interval_seconds(self, *, now: datetime | None = None) -> float:
         return float(self.poll_config.get("kalshi_interval_seconds", 900))
+
+
+def _cursor_from(body: str) -> str | None:
+    """Next-page cursor, if the response carries one.
+
+    Kalshi signals "no more pages" with an empty or absent cursor. Anything
+    unparseable is treated as the end rather than raising: losing the tail of
+    one tick is recoverable, a crashed poller is not.
+    """
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    cursor = data.get("cursor")
+    return str(cursor) if cursor else None
 
 
 def _tickers_from(body: str) -> list[str]:

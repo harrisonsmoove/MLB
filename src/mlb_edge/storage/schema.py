@@ -472,14 +472,20 @@ TABLES: tuple[TableSpec, ...] = (
     TableSpec(
         name="projector_constants",
         kind=TableKind.FACT,
-        key=("system", "player_type", "through_date", "bucket"),
+        key=("system", "player_type", "through_date", "bucket", "min_trials"),
         notes=(
             "The regression constants the projector fit at each snapshot.\n\n"
             "Persisted rather than left in a log line for two reasons: the "
             "pre-registered gate needs a machine-readable fitted k, and how k "
             "moves across snapshots is itself diagnostic -- a constant that "
             "lurches between weeks means the fit is unstable, whatever the "
-            "projections look like."
+            "projections look like.\n\n"
+            "min_trials is part of the key because the same snapshot is fit at "
+            "several playing-time thresholds. Only is_primary is used for "
+            "shrinkage; the others exist so that a missed ratio can be "
+            "diagnosed as sample composition rather than mis-specification -- "
+            "published talent spreads are measured on qualified hitters, and "
+            "fitting across everyone pulls k down."
         ),
         ddl="""
         CREATE TABLE IF NOT EXISTS projector_constants (
@@ -487,6 +493,8 @@ TABLES: tuple[TableSpec, ...] = (
             player_type       TEXT NOT NULL,
             through_date      DATE NOT NULL,
             bucket            TEXT NOT NULL,
+            min_trials        DOUBLE NOT NULL,
+            is_primary        BOOLEAN NOT NULL DEFAULT FALSE,
             k                 DOUBLE NOT NULL,
             prior_mean        DOUBLE,
             var_observed      DOUBLE,
