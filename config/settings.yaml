@@ -38,6 +38,11 @@ paths:
 # ---------------------------------------------------------------------------
 poller:
   archive_dir: data/poll
+
+  # The budget horizon. The odds poller spreads its remaining credits evenly
+  # over the days to this date, so a free-tier key throttles itself to survive
+  # the season instead of burning out in 2.6 days. Update it each year.
+  season_end_date: "2026-09-28"
   odds_interval_seconds: 900        # 15 min -- the FLOOR, not the guarantee
   kalshi_interval_seconds: 900      # Kalshi is not credit-metered
   kalshi_max_orderbooks_per_tick: 120
@@ -46,10 +51,49 @@ poller:
   # past the first page; an unbounded loop on a cursor that never clears spins
   # forever. Hitting this limit is archived as a failure row, not ignored.
   kalshi_max_pages: 25
-  # The budget horizon. The odds poller spreads its remaining credits evenly
-  # over the days to this date, so a free-tier key throttles itself to survive
-  # the season instead of burning out in 2.6 days. Update it each year.
-  season_end_date: "2026-09-28"
+
+  # --- health and completeness -------------------------------------------
+  # State files live beside the archive so a restart -- expected, since the
+  # unit restarts forever -- does not reset the clock and hide a running outage.
+  health_state_file: poll_health.json
+  alert_throttle_file: poll_alert_throttle.json
+
+  # A venue silent this long WHILE GAMES ARE ON gets an alert. Off-slate silence
+  # is correct behaviour; alerting on it would train you to ignore the alert
+  # that matters.
+  staleness_alert_minutes: 30
+  alert_repeat_hours: 1
+
+  # Compare each cycle's payloads against the MLB schedule and report
+  # "captured X/Y games" per venue. This is the check that catches a silently
+  # truncated board -- the failure that returns 200 on every request.
+  completeness_enabled: true
+  completeness_slate_lead_hours: 12
+  completeness_slate_trail_hours: 5
+  schedule_cache_seconds: 1800
+  # The schedule only feeds the completeness check, so it fails fast rather
+  # than delaying the archive write behind a retry ladder.
+  schedule_timeout_seconds: 10
+  schedule_max_attempts: 2
+
+# ---------------------------------------------------------------------------
+# Off-box backup.
+#
+# The poll archive cannot be rebuilt from anything -- Tier 0 has no historical
+# endpoint -- so if the droplet dies, whatever is not off-box is gone. The
+# warehouse is derived and merely expensive to lose.
+# ---------------------------------------------------------------------------
+backup:
+  directory: data/backups
+  include: [data/poll, data/raw]
+  keep_local: 3
+  # Upload command; {src} is the backup directory. Shelling out to whatever
+  # already works on the box keeps credentials in that tool's own config
+  # rather than in this process. Leave empty to snapshot locally only.
+  # Examples:
+  #   aws s3 sync {src} s3://your-bucket/mlb-edge/$(basename {src}) --delete
+  #   rclone copy {src} spaces:your-bucket/mlb-edge/
+  push_command: ""
 
 http:
   timeout_seconds: 30

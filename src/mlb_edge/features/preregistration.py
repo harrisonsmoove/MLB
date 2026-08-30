@@ -27,12 +27,19 @@ observed season lines, which is wider because it also carries binomial noise).
 
 NOT AN INDEPENDENT CHECK. An earlier version of this comment claimed the
 published "strikeout rate stabilises around 60 PA" figure corroborated the 56
-above by a separate route. It does not. For a beta-binomial, reliability is
-n / (n + k), so the stabilisation point *is* k, and the published figure is
-itself obtained from a variance decomposition -- the same identity, evaluated
-from a different published input. Two numbers agreeing here means the inputs
-are mutually consistent, which is worth knowing and is not evidence that either
-is right.
+above by a separate route. It does not.
+
+Two identities are in play and it is worth keeping them straight:
+
+    reliability(n) = n / (n + k)          -> equals 0.5 exactly at n = k
+    sigma^2_true   = mu(1-mu) / (k + 1)   -> the +1 lives here, and only here
+
+So the stabilisation point *is* k, and the published stabilisation figure is
+itself obtained by decomposing observed variance into true and binomial parts --
+which is the second identity above, rearranged. It is the same relationship
+evaluated from a different published input, not a second method. Two numbers
+agreeing here means the inputs are mutually consistent, which is worth knowing
+and is not evidence that either is right.
 
 So the target is one estimate with one set of assumptions, not a triangulation.
 What actually protects against a mis-specified estimator is the width of

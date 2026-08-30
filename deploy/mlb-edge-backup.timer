@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up the mlb-edge archive daily
+
+[Timer]
+# 08:00 UTC -- after the overnight slate has finished and before the next one.
+OnCalendar=*-*-* 08:00:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

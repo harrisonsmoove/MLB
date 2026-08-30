@@ -263,10 +263,11 @@ def test_expected_k_matches_its_own_derivation():
 def test_derivation_is_consistent_with_published_stabilisation():
     """An input-consistency check, and labelled as one.
 
-    For a beta-binomial, reliability is n/(n+k), so the stabilisation point IS
-    k -- and the published "~60 PA" figure is itself derived from a variance
-    decomposition. This is the same identity evaluated from a different
-    published input, not a second method. Agreement means the inputs are
+    reliability(n) = n/(n+k), which is 0.5 exactly at n = k, so the
+    stabilisation point IS k. (The +1 belongs to the other identity,
+    sigma^2 = mu(1-mu)/(k+1), and nowhere else.) The published "~60 PA" figure
+    is itself a variance decomposition -- the same relationship evaluated from a
+    different published input, not a second method. Agreement means the inputs are
     mutually consistent; it is not evidence that either is right.
 
     Kept because inconsistency here would be informative, but it must not be

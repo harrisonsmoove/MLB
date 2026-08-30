@@ -51,6 +51,17 @@ class StubClient:
         pass
 
 
+class OfflineSlate:
+    """A SlateCache stand-in. Tests must never reach for the schedule."""
+
+    def __init__(self, games=None):
+        self.games = games or []
+        self.last_error = None
+
+    def games_for(self, day, *, now=None):
+        return self.games
+
+
 @pytest.fixture
 def settings_with_keys(monkeypatch):
     monkeypatch.setenv("ODDS_API_KEY", "test-key-do-not-log")
@@ -277,7 +288,7 @@ def test_ticker_extraction_tolerates_shape_drift(body, expected):
 # ---------------------------------------------------------------------------
 def test_daemon_runs_a_tick_and_archives(tmp_path, settings_with_keys):
     archive = PollArchive(tmp_path)
-    daemon = PollDaemon(settings_with_keys, archive=archive)
+    daemon = PollDaemon(settings_with_keys, archive=archive, slate=OfflineSlate())
     daemon.states.clear()
     from mlb_edge.poll import SourceState
 
@@ -307,7 +318,7 @@ def test_daemon_survives_a_source_that_raises(tmp_path, settings_with_keys):
     from mlb_edge.poll import SourceState
 
     archive = PollArchive(tmp_path)
-    daemon = PollDaemon(settings_with_keys, archive=archive)
+    daemon = PollDaemon(settings_with_keys, archive=archive, slate=OfflineSlate())
     daemon.states.clear()
     daemon.states["odds"] = SourceState(poller=Exploding())
 
@@ -318,7 +329,7 @@ def test_daemon_survives_a_source_that_raises(tmp_path, settings_with_keys):
 
 
 def test_daemon_with_no_enabled_sources_exits_cleanly(tmp_path, settings_with_keys):
-    daemon = PollDaemon(settings_with_keys, archive=PollArchive(tmp_path))
+    daemon = PollDaemon(settings_with_keys, archive=PollArchive(tmp_path), slate=OfflineSlate())
     daemon.states.clear()
     assert daemon.run(once=True) == 0
 
@@ -326,10 +337,48 @@ def test_daemon_with_no_enabled_sources_exits_cleanly(tmp_path, settings_with_ke
 def test_stop_request_ends_the_loop(tmp_path, settings_with_keys):
     from mlb_edge.poll import SourceState
 
-    daemon = PollDaemon(settings_with_keys, archive=PollArchive(tmp_path))
+    daemon = PollDaemon(settings_with_keys, archive=PollArchive(tmp_path), slate=OfflineSlate())
     daemon.states.clear()
     daemon.states["odds"] = SourceState(
         poller=OddsPoller(settings_with_keys, client=StubClient({"/odds": []}))
     )
     daemon._request_stop()
     assert daemon.run() == 0, "a stop requested before the loop starts runs nothing"
+
+
+def test_missing_season_end_is_announced_not_silently_defaulted(
+    settings_with_keys, capsys
+):
+    """A misplaced config key once changed the budget pacing with no warning.
+
+    season_end_date sets how the entire odds credit budget is paced. It ended up
+    nested under the wrong block, the poller carried on against a guessed
+    horizon, and only an unrelated test noticed. A wrong horizon is not a crash
+    -- it is an archive that runs out three days early in September.
+    """
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.poll_config = {
+        k: v for k, v in poller.poll_config.items() if k != "season_end_date"
+    }
+    poller.quota_remaining = 500
+
+    poller.next_interval_seconds(now=NOW)
+    assert "season_end_date is not set" in capsys.readouterr().out
+
+
+def test_the_season_end_warning_is_not_repeated_every_tick(settings_with_keys, capsys):
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.poll_config = {
+        k: v for k, v in poller.poll_config.items() if k != "season_end_date"
+    }
+    poller.quota_remaining = 500
+
+    for _ in range(5):
+        poller.next_interval_seconds(now=NOW)
+    assert capsys.readouterr().out.count("season_end_date is not set") == 1
+
+
+def test_config_places_season_end_under_the_poller(settings_with_keys):
+    """Pins the key's location so the same misfiling is caught immediately."""
+    assert settings_with_keys.section("poller").get("season_end_date")
+    assert "season_end_date" not in settings_with_keys.section("backup")

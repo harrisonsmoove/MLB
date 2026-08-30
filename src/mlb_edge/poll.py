@@ -31,15 +31,18 @@ import json
 import signal
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from mlb_edge.alerting import AlertThrottle, build_alerter, send_throttled
+from mlb_edge.completeness import SlateCache, coverage_for_venue, games_in_window
 from mlb_edge.config import Settings
 from mlb_edge.http import HttpClient, UpstreamError, client_for
+from mlb_edge.pollhealth import HealthState, coverage_alerts, staleness_alerts
 from mlb_edge.timeutil import ensure_utc, utcnow
 
 # Deliberately flat and deliberately boring. Anything clever here is a schema
@@ -218,6 +221,7 @@ class OddsPoller:
         self._client = client or client_for(settings, "odds")
         self.quota_remaining: int | None = None
         self.quota_used: int | None = None
+        self._warned_missing_season_end = False
 
     @property
     def credits_per_call(self) -> int:
@@ -289,10 +293,26 @@ class OddsPoller:
         return max(configured, (days_left * 86400.0) / calls_left)
 
     def _season_end(self) -> date:
+        """The horizon the remaining credit budget is spread over.
+
+        A missing value is announced rather than silently defaulted. This key
+        sets the pacing of the entire odds archive, and it once ended up nested
+        under the wrong config block -- the poller carried on against a guessed
+        horizon and nothing said so. A wrong budget horizon is not a crash; it
+        is an archive that runs out three days early in September.
+        """
         raw = self.poll_config.get("season_end_date")
         if raw:
             return date.fromisoformat(str(raw))
-        return date(utcnow().year, 10, 1)
+        fallback = date(utcnow().year, 10, 1)
+        if not self._warned_missing_season_end:
+            self._warned_missing_season_end = True
+            print(
+                f"[poll] poller.season_end_date is not set; pacing the odds budget "
+                f"to a guessed {fallback.isoformat()}. Set it in settings.yaml.",
+                flush=True,
+            )
+        return fallback
 
 
 class KalshiPoller:
@@ -518,7 +538,12 @@ class SourceState:
 class PollDaemon:
     """Long-running loop. One tick per source per its own interval."""
 
-    def __init__(self, settings: Settings, archive: PollArchive | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        archive: PollArchive | None = None,
+        slate: SlateCache | None = None,
+    ) -> None:
         self.settings = settings
         poll_config = settings.section("poller")
         root = Path(poll_config.get("archive_dir", "data/poll"))
@@ -527,6 +552,43 @@ class PollDaemon:
         )
         self.states: dict[str, SourceState] = {}
         self._stopping = False
+
+        # Health, alerting and completeness. All of it runs AFTER the archive
+        # write, never before -- see tick().
+        self.health = HealthState.load(self.archive.root / poll_config.get(
+            "health_state_file", "poll_health.json"
+        ))
+        self.health.started_at = self.health.started_at or utcnow().isoformat()
+        self.alerter = build_alerter()
+        self.throttle = AlertThrottle(
+            self.archive.root / poll_config.get(
+                "alert_throttle_file", "poll_alert_throttle.json"
+            ),
+            repeat_after=timedelta(hours=float(poll_config.get("alert_repeat_hours", 1))),
+        )
+        self.slate = slate
+        if self.slate is None and poll_config.get("completeness_enabled", True):
+            try:
+                # Deliberately low-retry and short-timeout. The schedule only
+                # feeds the completeness check, and the default five-attempt
+                # exponential ladder would add minutes to every poll cycle
+                # whenever StatsAPI is unreachable -- delaying the thing that
+                # matters for the sake of the thing that describes it.
+                schedule_client = HttpClient(
+                    user_agent=settings.section("http").get("user_agent", "mlb-edge/0.1"),
+                    timeout_seconds=float(poll_config.get("schedule_timeout_seconds", 10)),
+                    max_attempts=int(poll_config.get("schedule_max_attempts", 2)),
+                    backoff_initial_seconds=1.0,
+                    backoff_max_seconds=4.0,
+                    rate_limit_per_minute=60,
+                )
+                self.slate = SlateCache(
+                    settings,
+                    schedule_client,
+                    ttl_seconds=float(poll_config.get("schedule_cache_seconds", 1800)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[poll] completeness disabled: {exc}", flush=True)
 
         if settings.source("odds").enabled and settings.source("odds").has_secret("api_key"):
             self.states["odds"] = SourceState(poller=OddsPoller(settings))
@@ -564,7 +626,11 @@ class PollDaemon:
                 )
             ]
 
+        # Bytes first. Everything below is analysis, and analysis must never be
+        # able to cost an archive write -- that ordering is the whole reason the
+        # poller is allowed to do any parsing at all.
         path = self.archive.write(records, venue=name, tick=started)
+
         state.ticks += 1
         state.records += len(records)
         errors = sum(1 for r in records if r.error)
@@ -575,7 +641,63 @@ class PollDaemon:
             f"{quota_note} -> {path.name if path else 'nothing'}",
             flush=True,
         )
+
+        try:
+            self._assess(name, records, errors, started)
+        except Exception as exc:  # noqa: BLE001 - the archive is already safe
+            print(f"[poll] health check failed (archive unaffected): {exc}", flush=True)
         return len(records)
+
+    def _assess(
+        self, name: str, records: list[PollRecord], errors: int, started: datetime
+    ) -> None:
+        """Completeness, heartbeat and alerts. Runs only after bytes are on disk."""
+        coverage = None
+        if self.slate is not None:
+            slate = self.slate.games_for(started.date(), now=started)
+            relevant = games_in_window(
+                slate,
+                now=started,
+                lead=timedelta(
+                    hours=float(self.settings.section("poller").get(
+                        "completeness_slate_lead_hours", 12
+                    ))
+                ),
+                trail=timedelta(
+                    hours=float(self.settings.section("poller").get(
+                        "completeness_slate_trail_hours", 5
+                    ))
+                ),
+            )
+            payloads = [r.payload for r in records if r.payload]
+            coverage = coverage_for_venue(name, payloads, relevant)
+            print(f"[poll] {name} {coverage.line()}", flush=True)
+            for alert in coverage_alerts([coverage]):
+                send_throttled(self.alerter, self.throttle, alert, now=started)
+            if coverage.complete:
+                self.throttle.clear(f"coverage:{name}")
+
+        self.health.record_attempt(
+            name, records=len(records), errors=errors, coverage=coverage, now=started
+        )
+        self.health.save()
+
+        if self.slate is not None:
+            threshold = timedelta(
+                minutes=float(self.settings.section("poller").get(
+                    "staleness_alert_minutes", 30
+                ))
+            )
+            alerts = staleness_alerts(
+                self.health,
+                slate=self.slate.games_for(started.date(), now=started),
+                now=started,
+                threshold=threshold,
+            )
+            for alert in alerts:
+                send_throttled(self.alerter, self.throttle, alert, now=started)
+            if not any(a.key == f"stale:{name}" for a in alerts):
+                self.throttle.clear(f"stale:{name}")
 
     def run(self, *, once: bool = False, max_ticks: int | None = None) -> int:
         """Main loop. Returns the number of ticks executed."""
@@ -632,6 +754,7 @@ def budget_forecast(settings: Settings, quota_remaining: int, now: datetime | No
     poller.poll_config = settings.section("poller")
     poller.quota_remaining = quota_remaining
     poller.quota_used = None
+    poller._warned_missing_season_end = False
 
     days = season_days_remaining(settings, now)
     per_call = poller.credits_per_call

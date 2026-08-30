@@ -327,6 +327,110 @@ def gate_command(
         raise typer.Exit(code=1)
 
 
+backup_app = typer.Typer(help="Off-box backup and restore.", no_args_is_help=True)
+app.add_typer(backup_app, name="backup")
+
+
+@backup_app.command("create")
+def backup_create(
+    push: Annotated[bool, typer.Option(help="Run the configured upload command after.")] = True,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Snapshot the archive and warehouse, verify it, and push it off-box."""
+    from mlb_edge import backup as backup_module
+
+    settings = load_settings(root)
+    config = settings.section("backup")
+    backup_root = settings.root / config.get("directory", "data/backups")
+    destination = backup_root / utcnow().strftime("%Y-%m-%dT%H%M%SZ")
+
+    manifest = backup_module.create(
+        root=settings.root,
+        destination=destination,
+        warehouse_path=settings.warehouse_path,
+        include=tuple(config.get("include", ["data/poll", "data/raw"])),
+    )
+    console.print(f"created {destination.name}: {manifest.summary()}")
+
+    ok, problems = backup_module.verify(destination)
+    if not ok:
+        console.print(f"[red]verification failed[/red] ({len(problems)} problems)")
+        for line in problems[:10]:
+            console.print(f"  {line}")
+        raise typer.Exit(code=1)
+    console.print("[green]verified[/green] every checksum matches")
+
+    command = str(config.get("push_command") or "").strip()
+    if push and command:
+        pushed, output = backup_module.push(backup_dir=destination, command=command)
+        if pushed:
+            console.print("[green]pushed off-box[/green]")
+        else:
+            # Loud: a local-only backup does not survive the failure it exists for.
+            console.print(f"[red]push FAILED[/red] -- this backup is local only\n{output}")
+            raise typer.Exit(code=1)
+    elif push:
+        console.print(
+            "[yellow]no push_command configured[/yellow] -- backup is local only, "
+            "which does not survive the droplet dying"
+        )
+
+    removed = backup_module.prune(backup_root, keep=int(config.get("keep_local", 3)))
+    if removed:
+        console.print(f"pruned {len(removed)} older local backups")
+
+
+@backup_app.command("verify")
+def backup_verify(
+    backup_dir: Annotated[Path, typer.Argument(help="Backup directory to check.")],
+) -> None:
+    """Recompute every checksum in a backup."""
+    from mlb_edge import backup as backup_module
+
+    ok, problems = backup_module.verify(backup_dir)
+    manifest = backup_module.read_manifest(backup_dir)
+    console.print(f"{manifest.summary()} taken {manifest.created_at}")
+    if ok:
+        console.print("[green]OK[/green] every checksum matches")
+        return
+    console.print(f"[red]{len(problems)} problems[/red]")
+    for line in problems[:20]:
+        console.print(f"  {line}")
+    raise typer.Exit(code=1)
+
+
+@backup_app.command("restore")
+def backup_restore(
+    backup_dir: Annotated[Path, typer.Argument(help="Backup directory to restore from.")],
+    into: Annotated[Path, typer.Option(help="Root to restore into.")],
+    skip_verify: Annotated[bool, typer.Option(help="Restore without checking checksums.")] = False,
+) -> None:
+    """Restore a backup into a root directory.
+
+    Restores into a directory you name rather than over the live one. Recovery
+    is not the moment to discover the backup was corrupt after overwriting the
+    only other copy -- check the result, then move it into place.
+    """
+    from mlb_edge import backup as backup_module
+
+    warehouse_path = Path(into) / "data" / "warehouse" / "mlb_edge.duckdb"
+    manifest, problems = backup_module.restore(
+        backup_dir=backup_dir,
+        into_root=into,
+        warehouse_path=warehouse_path,
+        verify_first=not skip_verify,
+    )
+    console.print(f"restored {manifest.summary()} from {manifest.created_at}")
+    if problems:
+        console.print(f"[red]{len(problems)} problems[/red]")
+        for line in problems[:20]:
+            console.print(f"  {line}")
+        raise typer.Exit(code=1)
+    console.print(f"[green]OK[/green] restored into {into}")
+    console.print(f"  warehouse: {warehouse_path}")
+    console.print(f"  check it, then swap it in:  mv {into}/data <live>/data")
+
+
 @app.command()
 def status(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Row counts and as-of coverage per table."""

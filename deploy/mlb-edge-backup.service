@@ -1,0 +1,31 @@
+# Daily off-box backup.
+#
+# The poll archive cannot be rebuilt from anything: Tier 0 has no historical
+# endpoint, so a lost day is lost permanently. If the droplet dies, whatever is
+# not off-box is gone.
+#
+# The unit exits non-zero when the push fails, so a local-only backup shows as a
+# failed unit rather than a green one -- a backup that never left the machine
+# does not survive the failure it exists for.
+
+[Unit]
+Description=mlb-edge off-box backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mlbedge
+Group=mlbedge
+WorkingDirectory=/opt/mlb-edge
+EnvironmentFile=/etc/mlb-edge/mlb-edge.env
+ExecStart=/opt/mlb-edge/.venv/bin/mlb-edge backup create --root /opt/mlb-edge
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mlb-edge-backup
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/mlb-edge/data
+TimeoutStartSec=3600

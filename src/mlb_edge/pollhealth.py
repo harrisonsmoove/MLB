@@ -1,0 +1,212 @@
+"""Per-venue heartbeat, persisted across restarts.
+
+The question this answers is not "did the last request work" but "when did this
+venue last give us anything, and is that recent enough to be believable given
+what is on the schedule right now".
+
+Staleness is only alarming during a slate. A venue quiet at 6am with first pitch
+eight hours away is behaving correctly; the same silence at 7pm is data being
+lost permanently. Alerting on the first case trains you to ignore the second,
+which is the failure mode that actually costs a season.
+
+State lives in a small JSON file next to the archive so a restart -- expected,
+since the unit restarts forever -- does not reset the clock and hide an outage
+that has been running for hours.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from mlb_edge.alerting import Alert, Severity
+from mlb_edge.completeness import CoverageReport, ExpectedGame
+from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
+
+
+@dataclass
+class VenueHealth:
+    last_attempt_at: str | None = None
+    last_success_at: str | None = None
+    consecutive_failures: int = 0
+    last_records: int = 0
+    total_records: int = 0
+    last_coverage: str | None = None
+
+    def success_ts(self) -> datetime | None:
+        return parse_iso_utc(self.last_success_at) if self.last_success_at else None
+
+    def staleness(self, now: datetime) -> timedelta | None:
+        """How long since this venue last produced anything. None if never."""
+        success = self.success_ts()
+        return None if success is None else ensure_utc(now) - success
+
+
+@dataclass
+class HealthState:
+    path: Path
+    venues: dict[str, VenueHealth] = field(default_factory=dict)
+    started_at: str | None = None
+
+    @classmethod
+    def load(cls, path: Path) -> HealthState:
+        path = Path(path)
+        state = cls(path=path)
+        if not path.is_file():
+            return state
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            state.started_at = raw.get("started_at")
+            state.venues = {
+                name: VenueHealth(**payload)
+                for name, payload in (raw.get("venues") or {}).items()
+            }
+        except Exception:  # noqa: BLE001 - corrupt state must not stop polling
+            print(f"[health] could not read {path}; starting fresh", flush=True)
+        return state
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "started_at": self.started_at,
+            "venues": {name: asdict(health) for name, health in self.venues.items()},
+        }
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
+        temporary.replace(self.path)
+
+    def for_venue(self, venue: str) -> VenueHealth:
+        return self.venues.setdefault(venue, VenueHealth())
+
+    def record_attempt(
+        self,
+        venue: str,
+        *,
+        records: int,
+        errors: int,
+        coverage: CoverageReport | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Log one cycle's outcome for a venue.
+
+        A cycle counts as a success only if it produced at least one record that
+        was not an error. A tick that returns nothing but failure rows is an
+        attempt, not a heartbeat -- treating it as one is how a venue that has
+        been 500-ing for hours looks healthy.
+        """
+        reference = ensure_utc(now or utcnow())
+        health = self.for_venue(venue)
+        health.last_attempt_at = reference.isoformat()
+        health.last_records = records
+        health.total_records += records
+        if coverage is not None:
+            health.last_coverage = coverage.line()
+
+        if records > errors:
+            health.last_success_at = reference.isoformat()
+            health.consecutive_failures = 0
+        else:
+            health.consecutive_failures += 1
+
+
+def staleness_alerts(
+    state: HealthState,
+    *,
+    slate: list[ExpectedGame],
+    now: datetime | None = None,
+    threshold: timedelta = timedelta(minutes=30),
+    slate_lead: timedelta = timedelta(hours=6),
+    slate_trail: timedelta = timedelta(hours=5),
+) -> list[Alert]:
+    """Alerts for venues that have gone quiet while games are in play or imminent."""
+    reference = ensure_utc(now or utcnow())
+    if not _slate_active(slate, reference, slate_lead, slate_trail):
+        return []
+
+    alerts: list[Alert] = []
+    for venue, health in sorted(state.venues.items()):
+        staleness = health.staleness(reference)
+        if staleness is None:
+            alerts.append(
+                Alert(
+                    key=f"never-succeeded:{venue}",
+                    severity=Severity.CRITICAL,
+                    subject=f"{venue}: no successful poll ever recorded",
+                    body=(
+                        "Games are on the board and this venue has never returned "
+                        "usable data. Check credentials and the journal."
+                    ),
+                )
+            )
+            continue
+        if staleness >= threshold:
+            minutes = staleness.total_seconds() / 60
+            alerts.append(
+                Alert(
+                    key=f"stale:{venue}",
+                    severity=Severity.CRITICAL,
+                    subject=f"{venue}: no successful poll for {minutes:.0f} min",
+                    body=(
+                        f"Last success {health.last_success_at}. "
+                        f"{health.consecutive_failures} consecutive failed cycles. "
+                        "Tier 0 has no historical endpoint, so anything missed now "
+                        "is missed permanently."
+                    ),
+                )
+            )
+    return alerts
+
+
+def coverage_alerts(
+    reports: list[CoverageReport], *, min_expected: int = 1
+) -> list[Alert]:
+    """Alerts for venues covering fewer games than the schedule says exist.
+
+    This is the check that catches a silently truncated board -- the failure
+    that returns HTTP 200 on every request and logs a clean cycle.
+    """
+    alerts: list[Alert] = []
+    for report in reports:
+        if report.expected < min_expected or report.complete:
+            continue
+        alerts.append(
+            Alert(
+                key=f"coverage:{report.venue}",
+                severity=Severity.CRITICAL if report.covered == 0 else Severity.WARN,
+                subject=(
+                    f"{report.venue}: captured {report.covered}/{report.expected} games"
+                ),
+                body=(
+                    "Missing: " + ", ".join(report.missing[:8])
+                    + ("" if len(report.missing) <= 8 else f" (+{len(report.missing) - 8} more)")
+                    + "\nA shortfall here usually means pagination stopped early or a "
+                    "series ticker changed. The requests will still have returned 200."
+                ),
+            )
+        )
+    return alerts
+
+
+def _slate_active(
+    slate: list[ExpectedGame],
+    now: datetime,
+    lead: timedelta,
+    trail: timedelta,
+) -> bool:
+    return any(game.start_ts - lead <= now <= game.start_ts + trail for game in slate)
+
+
+def health_summary(state: HealthState, *, now: datetime | None = None) -> list[str]:
+    reference = ensure_utc(now or utcnow())
+    lines: list[str] = []
+    for venue, health in sorted(state.venues.items()):
+        staleness = health.staleness(reference)
+        age = "never" if staleness is None else f"{staleness.total_seconds() / 60:.0f} min ago"
+        lines.append(
+            f"{venue:<12} last success {age:<14} "
+            f"records {health.total_records:,}  failures {health.consecutive_failures}"
+            + (f"  [{health.last_coverage}]" if health.last_coverage else "")
+        )
+    return lines

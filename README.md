@@ -11,7 +11,7 @@ not, and why.
 
 ```bash
 uv sync --extra dev
-uv run pytest                      # 260 tests, no network required
+uv run pytest                      # 303 tests, no network required
 uv run mlb-edge init
 ```
 
@@ -74,6 +74,21 @@ It writes raw payloads to timestamped parquet and does no parsing at all, so a
 schema change, a parser bug, or a held DuckDB lock cannot stop the archive from
 growing. Failures are archived as rows, so a gap in the files means the daemon
 was down rather than the upstream being unhappy.
+
+**Every cycle reports completeness, not just success.** It pulls the day's
+schedule and logs `captured 13/15 games (kalshi)` per venue, alerting on any
+shortfall. This is the check that catches a silently truncated board — the
+failure that returns HTTP 200 on every request and logs a clean cycle. It runs
+*after* the archive write, so it can never cost bytes.
+
+A per-venue heartbeat survives restarts and alerts via Telegram when a venue
+goes quiet for 30 minutes **during a slate** (off-slate silence is correct and
+does not alert). Daily backups go off-box with checksums and a restore path
+that has been run end to end, not assumed.
+
+Before trusting a single row, work through
+[`reports/poller-first-24h.md`](reports/poller-first-24h.md) — exact commands,
+expected numbers, and healthy vs. truncated side by side.
 
 The Odds API free tier is 500 credits/month and bills per region per market per
 call, which is **2.6 days** of 15-minute polling. The poller reads the remaining
@@ -154,9 +169,9 @@ from a hitter K% mean of ~22% and true-talent SD of ~5.5pp.
 
 This is **one estimate, not a triangulation.** The published "K% stabilises at
 ~60 PA" figure is the same identity evaluated from a different published input
-— for a beta-binomial, reliability is `n/(n+k)`, so the stabilisation point *is*
-k. Agreement means the inputs are mutually consistent, not that either is
-right. Read 55.7 as "somewhere in the tens"; the width of the ratio band is
+— reliability is `n/(n+k)`, which is 0.5 exactly at `n = k`, so the
+stabilisation point *is* k. (The `+1` belongs only to `σ² = μ(1-μ)/(k+1)`.)
+Agreement means the inputs are mutually consistent, not that either is right. Read 55.7 as "somewhere in the tens"; the width of the ratio band is
 what actually protects against a mis-specified estimator.
 
 Fail condition, fixed in advance: **fitted/expected outside [0.5, 2.0]**.
@@ -263,5 +278,5 @@ src/mlb_edge/
   ingest/       one module per source, the game_pk matcher, the poll importer
   market/       price conversions (devig lives here from Milestone 3)
 deploy/         systemd units and the deploy script
-tests/          260 tests, all offline, fixtures + a synthetic generator
+tests/          303 tests, all offline, fixtures + a synthetic generator
 ```

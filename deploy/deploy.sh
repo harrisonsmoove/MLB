@@ -92,6 +92,9 @@ else
   set +u; source "$ENV_FILE"; set -u
   [[ -n "${ODDS_API_KEY:-}"     ]] || warn "ODDS_API_KEY is empty; the odds poller will not start"
   [[ -n "${KALSHI_API_KEY_ID:-}" ]] || warn "KALSHI_API_KEY_ID is empty; Kalshi polling may be limited"
+  [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || warn "TELEGRAM_BOT_TOKEN is empty; alerts go to the journal only"
+  grep -q '^\s*push_command:\s*""' "$APP_DIR/config/settings.yaml" 2>/dev/null && \
+    warn "backup.push_command is empty; backups stay on this box and will not survive it"
 fi
 
 # --- 6. data directories ---------------------------------------------------
@@ -105,7 +108,8 @@ log "warehouse initialised"
 log "installing systemd units"
 for unit in mlb-edge-poller.service \
             mlb-edge-refresh.service mlb-edge-refresh.timer \
-            mlb-edge-import.service mlb-edge-import.timer; do
+            mlb-edge-import.service mlb-edge-import.timer \
+            mlb-edge-backup.service mlb-edge-backup.timer; do
   install -m 644 "$SCRIPT_DIR/$unit" "$UNIT_DIR/$unit"
 done
 systemctl daemon-reload
@@ -120,6 +124,7 @@ log "enabling and starting services"
 systemctl enable --now mlb-edge-poller.service
 systemctl enable --now mlb-edge-refresh.timer
 systemctl enable --now mlb-edge-import.timer
+systemctl enable --now mlb-edge-backup.timer
 # The poller is restarted last and explicitly, so a deploy that got this far is
 # the version now running.
 systemctl restart mlb-edge-poller.service
