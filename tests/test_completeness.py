@@ -57,8 +57,8 @@ def test_truncated_board_is_detected_even_though_every_request_succeeded():
     full = " ".join(f"Will the {g.home_team} win?" for g in slate)
     truncated = f"Will the {slate[0].home_team} win?"
 
-    healthy = coverage_for_venue("kalshi", [full], slate)
-    broken = coverage_for_venue("kalshi", [truncated], slate)
+    healthy = coverage_for_venue("polymarket", [full], slate)
+    broken = coverage_for_venue("polymarket", [truncated], slate)
 
     assert healthy.complete and healthy.covered == 5
     assert not broken.complete
@@ -68,7 +68,7 @@ def test_truncated_board_is_detected_even_though_every_request_succeeded():
 
 def test_a_truncated_board_raises_an_alert():
     slate = _slate(5)
-    report = coverage_for_venue("kalshi", ["Will the New York Yankees win?"], slate)
+    report = coverage_for_venue("polymarket", ["Will the New York Yankees win?"], slate)
     alerts = coverage_alerts([report])
 
     assert len(alerts) == 1
@@ -78,14 +78,14 @@ def test_a_truncated_board_raises_an_alert():
 
 
 def test_total_blackout_is_critical_not_a_warning():
-    alerts = coverage_alerts([coverage_for_venue("kalshi", ["nothing useful"], _slate(5))])
+    alerts = coverage_alerts([coverage_for_venue("polymarket", ["nothing useful"], _slate(5))])
     assert alerts[0].severity == Severity.CRITICAL
 
 
 def test_full_coverage_raises_nothing():
     slate = _slate(3)
     payload = " ".join(f"{g.away_team} at {g.home_team}" for g in slate)
-    assert coverage_alerts([coverage_for_venue("kalshi", [payload], slate)]) == []
+    assert coverage_alerts([coverage_for_venue("polymarket", [payload], slate)]) == []
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ def test_ambiguous_nicknames_are_dropped_automatically():
 
 def test_a_bare_nickname_still_matches_when_unambiguous():
     slate = [ExpectedGame(1, "New York Yankees", "Boston Red Sox", NOW)]
-    assert coverage_for_venue("kalshi", ["Yankees to win"], slate).covered == 1
+    assert coverage_for_venue("polymarket", ["Yankees to win"], slate).covered == 1
 
 
 def test_short_tokens_do_not_match_by_accident():

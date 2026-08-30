@@ -328,10 +328,13 @@ sources:
     orderbook_depth: 10
     markets_page_size: 200
     max_pages: 25
-    # UNVERIFIED against live: this session had no egress to Kalshi. Ticker and
-    # title formats are matched by these patterns; run `mlb-edge probe kalshi`
-    # after the first live fetch and correct them. A market that matches none of
-    # them is counted as unmapped and skipped, never guessed into a game.
+    # VERIFIED against live payloads on 2026-08-30. These patterns read TITLES,
+    # which is fine for classifying a market's type but is NOT how a market is
+    # joined to a game: Kalshi titles name teams by city only ("Seattle",
+    # "A's"), so substring matching counted 1 of 14 games while the archive held
+    # 13. Games are joined on the TICKER instead -- see
+    # src/mlb_edge/kalshi_tickers.py. A market matching none of these patterns
+    # is counted as unmapped and skipped, never guessed into a game.
     market_parsers:
       - market_type: h2h
         title_pattern: "(?i)will the (?P<team>.+?) (?:win|beat)"

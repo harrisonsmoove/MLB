@@ -38,12 +38,21 @@ from enum import StrEnum
 from typing import Any
 
 from mlb_edge.hydrate import hydrate_string
+from mlb_edge.kalshi_tickers import match_to_games, tickers_from_payloads
 from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]")
 
 #: Venues whose payloads identify both sides of a game explicitly.
-EXACT_VENUES = frozenset({"odds"})
+#:
+#: ``odds`` names ``home_team`` and ``away_team`` on every event. ``kalshi``
+#: earns its place through the ticker rather than the title: titles carry city
+#: names only ("Seattle", "A's"), which is why substring matching counted 1 of
+#: 14 while the archive held 13. See :mod:`mlb_edge.kalshi_tickers`.
+EXACT_VENUES = frozenset({"odds", "kalshi"})
+
+#: Venues matched by parsing tickers rather than reading team-name fields.
+TICKER_VENUES = frozenset({"kalshi"})
 
 
 def normalise(text: str) -> str:
@@ -103,6 +112,9 @@ class CoverageReport:
     #: without an ssh session. "MISSING 13" cannot distinguish a matcher gap
     #: from a truncated board; the titles can.
     sample_labels: list[str] = field(default_factory=list)
+    #: Ticker team codes seen on the board that the alias table does not know.
+    #: Each one is a game that cannot be counted, and a one-line fix.
+    unmapped_codes: list[str] = field(default_factory=list)
     #: Games whose teams appear in the payload but were not counted.
     present_but_uncounted: list[str] = field(default_factory=list)
 
@@ -139,7 +151,9 @@ class CoverageReport:
         return max(self.expected - self.covered, 0)
 
     def line(self) -> str:
-        precision = "exact" if self.exact else "team-mention"
+        precision = "ticker" if self.venue in TICKER_VENUES else (
+            "exact" if self.exact else "team-mention"
+        )
         if self.status is SlateStatus.UNAVAILABLE:
             return (
                 f"WARN: schedule UNAVAILABLE ({self.slate_error or 'no reason recorded'})"
@@ -407,7 +421,21 @@ def coverage_for_venue(
         )
         return report
 
-    if venue in EXACT_VENUES:
+    if venue in TICKER_VENUES:
+        covered, unmapped, _ = match_to_games(tickers_from_payloads(payloads), games)
+        if unmapped:
+            # An unknown code is a one-line fix, but only if it is said out loud.
+            # Silently leaving the game uncounted is how a matcher gap becomes a
+            # standing CRITICAL that everyone learns to ignore.
+            print(
+                f"[slate] WARN: {venue} ticker codes not in the alias table: "
+                + ", ".join(unmapped)
+                + ". Those games cannot be counted. Add them to "
+                "mlb_edge.kalshi_tickers.TEAM_ALIASES.",
+                flush=True,
+            )
+            report.unmapped_codes = unmapped
+    elif venue in EXACT_VENUES:
         seen = _exact_pairs(payloads)
         covered = {
             game.game_pk

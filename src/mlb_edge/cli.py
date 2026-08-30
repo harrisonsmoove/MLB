@@ -1012,6 +1012,28 @@ def explain_coverage(
             "That is real loss on a source with no historical endpoint."
         )
 
+    # Which slate dates the tick actually covers. Asked in review: every string
+    # in a sample was three days out, which could equally be sample truncation
+    # or a board holding only forward-dated markets. Counting the tickers
+    # settles it, and "today: 0" is a different problem from "today: 14".
+    from collections import Counter
+
+    from mlb_edge.kalshi_tickers import parse_ticker, tickers_from_payloads
+
+    parsed = [parse_ticker(tk) for tk in tickers_from_payloads(payloads)]
+    dates = Counter(p.game_date.isoformat() for p in parsed if p is not None)
+    if dates:
+        console.print("\ngame dates in this tick:")
+        for day_str, count in sorted(dates.items()):
+            marker = "  <- the slate being checked" if day_str == when.isoformat() else ""
+            console.print(f"  {day_str}  {count:>4} tickers{marker}")
+        if when.isoformat() not in dates:
+            console.print(
+                f"\n[red]no tickers for {when.isoformat()} at all.[/red] "
+                "The board in this tick is entirely forward-dated -- that is a "
+                "fetch problem, not a matching one."
+            )
+
     strings = extract_labels(payloads)
     console.print(f"\npayload strings ({len(strings)} distinct, showing {min(labels, len(strings))}):")
     for value in strings[:labels]:

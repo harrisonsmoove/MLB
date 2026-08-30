@@ -441,7 +441,7 @@ def test_present_but_not_counted_is_distinguished_from_absent() -> None:
         ["Will the New York Yankees win?", "TOR vs SEA winner"]
     )
 
-    evidence = {e.game.game_pk: e for e in diagnose_coverage("kalshi", [payload], games)}
+    evidence = {e.game.game_pk: e for e in diagnose_coverage("polymarket", [payload], games)}
 
     assert evidence[1].matched
     assert not evidence[2].matched and evidence[2].loose_hits
@@ -456,7 +456,7 @@ def test_the_alert_carries_the_payload_strings() -> None:
     payload = _kalshi_markets(["Will the New York Yankees win?", "TOR vs SEA winner"])
     slate = Slate(day=date(2026, 8, 30), games=tuple(games), in_progress=3)
 
-    report = coverage_for_venue("kalshi", [payload], games, slate=slate)
+    report = coverage_for_venue("polymarket", [payload], games, slate=slate)
     alerts = coverage_alerts([report])
 
     assert len(alerts) == 1
@@ -473,7 +473,7 @@ def test_a_payload_with_no_recognisable_strings_says_so() -> None:
     payload = json.dumps({"orderbook": {"yes": [[50, 10]], "no": [[49, 8]]}})
     slate = Slate(day=date(2026, 8, 30), games=tuple(games), in_progress=3)
 
-    body = coverage_alerts([coverage_for_venue("kalshi", [payload], games, slate=slate)])[0].body
+    body = coverage_alerts([coverage_for_venue("polymarket", [payload], games, slate=slate)])[0].body
     assert "No recognisable title or ticker strings" in body
 
 
@@ -481,7 +481,7 @@ def test_a_complete_board_pays_nothing_for_diagnosis() -> None:
     """The evidence gathering only runs when something is actually wrong."""
     games = [_game(1, "New York Yankees", "Boston Red Sox")]
     payload = _kalshi_markets(["Will the New York Yankees beat the Boston Red Sox?"])
-    report = coverage_for_venue("kalshi", [payload], games)
+    report = coverage_for_venue("polymarket", [payload], games)
 
     assert report.complete
     assert report.sample_labels == []
