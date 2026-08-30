@@ -147,6 +147,7 @@ class PaOutcomeExtractor:
             return pl.DataFrame(), report
 
         counts = self._pitch_counts(wh, as_of=as_of, through=through, seasons=seasons)
+        report.pitches_read = sum(c.get("pitches") or 0 for c in counts.values())
 
         rows: list[dict[str, Any]] = []
         for record in frame.iter_rows(named=True):
