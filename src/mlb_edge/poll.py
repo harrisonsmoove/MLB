@@ -814,16 +814,24 @@ class PollDaemon:
             # shortfall. Split it out rather than demanding a quote that does
             # not exist -- two venues "missing" the same late game is the
             # schedule side talking, not either matcher.
-            expected_now, not_yet = split_by_quote_horizon(
+            expected_now, not_yet, finished = split_by_quote_horizon(
                 relevant,
                 now=started,
                 horizon=timedelta(
                     hours=float(poller_config.get("completeness_quote_horizon_hours", 6))
                 ),
+                closes_after=timedelta(
+                    hours=float(poller_config.get("completeness_quote_close_hours", 4))
+                ),
             )
             payloads = [r.payload for r in records if r.payload]
             coverage = coverage_for_venue(
-                name, payloads, expected_now, slate=slate, not_yet_expected=not_yet
+                name,
+                payloads,
+                expected_now,
+                slate=slate,
+                not_yet_expected=not_yet,
+                no_longer_expected=finished,
             )
             print(f"[poll] {name} {coverage.line()}", flush=True)
             for alert in coverage_alerts([coverage]):

@@ -127,6 +127,9 @@ class CoverageReport:
     #: quote yet. Reported, never counted as a shortfall -- see
     #: :func:`split_by_quote_horizon`.
     not_yet_expected: list[str] = field(default_factory=list)
+    #: Games whose markets have settled and left the board. Reported, never
+    #: counted as a shortfall.
+    no_longer_expected: list[str] = field(default_factory=list)
     #: Games whose teams appear in the payload but were not counted.
     present_but_uncounted: list[str] = field(default_factory=list)
 
@@ -184,11 +187,12 @@ class CoverageReport:
                 "schedule, none near first pitch"
             )
         marker = "" if self.complete else f"  MISSING {self.shortfall}"
-        pending = (
-            f"  [+{len(self.not_yet_expected)} not yet expected]"
-            if self.not_yet_expected
-            else ""
-        )
+        extra: list[str] = []
+        if self.not_yet_expected:
+            extra.append(f"+{len(self.not_yet_expected)} not yet expected")
+        if self.no_longer_expected:
+            extra.append(f"+{len(self.no_longer_expected)} finished")
+        pending = f"  [{', '.join(extra)}]" if extra else ""
         return (
             f"captured {self.covered}/{self.expected} games ({self.venue}, "
             f"{precision}){marker}{pending}"
@@ -412,26 +416,44 @@ def split_by_quote_horizon(
     *,
     now: datetime | None = None,
     horizon: timedelta = timedelta(hours=6),
-) -> tuple[list[ExpectedGame], list[ExpectedGame]]:
-    """Split games into "expect a quote now" and "not yet".
+    closes_after: timedelta = timedelta(hours=4),
+) -> tuple[list[ExpectedGame], list[ExpectedGame], list[ExpectedGame]]:
+    """Split games into "expect a quote now", "not yet", and "no longer".
 
-    The window used to be a single cliff: inside twelve hours a game counted
-    fully, outside it vanished. Books do not work that way. A market for a late
-    game opens closer to first pitch, so a game eleven hours out was demanded of
-    every venue and reported as MISSING when nobody had posted it yet.
+    Venues quote a game over a finite interval, and the window used to be a
+    single cliff at each end: inside twelve hours a game counted fully, outside
+    it vanished. Both ends were wrong.
 
-    That is not a shortfall, and calling it one is how a check earns its way
-    into the ignored pile. Two venues independently "missing" the same late game
-    is the signature -- it points at the schedule side, not at either matcher.
+    **The front end.** Books post a late game's market closer to first pitch, so
+    a game eleven hours out was demanded of every venue and its absence reported
+    as MISSING. Two venues independently "missing" the same late game is that
+    signature -- it points at the schedule side, not at either matcher.
 
-    Returns ``(expected_now, not_yet)``. Only the first is a denominator.
+    **The back end.** A finished game's markets settle and drop off the board.
+    Kalshi is polled with ``status=open``, so the tickers for a game that ended
+    simply stop appearing -- observed live as a date's ticker count going 7 to 0
+    between two ticks three minutes apart. With a five-hour trail and a
+    three-hour game, that left roughly two hours in which a correctly archived,
+    fully complete board was reported as a shortfall.
+
+    Neither is a shortfall, and calling them one is how a check earns its way
+    into the ignored pile. Only ``expected_now`` is a denominator.
+
+    Returns ``(expected_now, not_yet, no_longer)``.
     """
     reference = ensure_utc(now or utcnow())
     expected_now: list[ExpectedGame] = []
     not_yet: list[ExpectedGame] = []
+    no_longer: list[ExpectedGame] = []
     for game in games:
-        (not_yet if game.start_ts - reference > horizon else expected_now).append(game)
-    return expected_now, not_yet
+        until_start = game.start_ts - reference
+        if until_start > horizon:
+            not_yet.append(game)
+        elif reference - game.start_ts > closes_after:
+            no_longer.append(game)
+        else:
+            expected_now.append(game)
+    return expected_now, not_yet, no_longer
 
 
 def coverage_for_venue(
@@ -441,6 +463,7 @@ def coverage_for_venue(
     *,
     slate: Slate | None = None,
     not_yet_expected: list[ExpectedGame] | None = None,
+    no_longer_expected: list[ExpectedGame] | None = None,
 ) -> CoverageReport:
     """How many of today's games this venue's payloads account for.
 
@@ -457,6 +480,7 @@ def coverage_for_venue(
         in_progress=slate.in_progress if slate is not None else None,
         slate_error=slate.error if slate is not None else None,
         not_yet_expected=[g.label for g in (not_yet_expected or [])],
+        no_longer_expected=[g.label for g in (no_longer_expected or [])],
     )
     if slate is not None and not slate.available:
         report.status = SlateStatus.UNAVAILABLE
@@ -634,6 +658,8 @@ class GameEvidence:
     hours_to_first_pitch: float = 0.0
     #: Inside the slate window but too early to expect a quote.
     not_yet_expected: bool = False
+    #: Game is over; its markets have settled and left the board.
+    no_longer_expected: bool = False
     #: A ticker on the board carries one of this game's codes but could not be
     #: parsed, because the OTHER code is not in the alias table. The game is
     #: present, not lost -- and the fix is one line.
@@ -657,6 +683,11 @@ class GameEvidence:
             return "counted"
         if self.not_yet_expected:
             return f"not yet expected ({self.hours_to_first_pitch:+.1f}h to first pitch)"
+        if self.no_longer_expected:
+            return (
+                f"finished ({-self.hours_to_first_pitch:.1f}h after first pitch) "
+                "-- markets settled and left the board"
+            )
         if self.blocked_by_unmapped_code:
             return (
                 "on the board but blocked by unmapped code "
@@ -711,6 +742,7 @@ def diagnose_coverage(
     *,
     now: datetime | None = None,
     quote_horizon: timedelta = timedelta(hours=6),
+    closes_after: timedelta = timedelta(hours=4),
 ) -> list[GameEvidence]:
     """Explain, per game, what the venue's own matcher tried and what it found.
 
@@ -725,7 +757,7 @@ def diagnose_coverage(
     haystack = normalise(" ".join(payloads))
     strict = team_tokens(games)
 
-    ticker_index: dict[frozenset[str], list[str]] = {}
+    ticker_index: dict[tuple[frozenset[str], date], list[str]] = {}
     raw_tickers: list[str] = []
     unparsed_tickers: list[str] = []
     if venue in TICKER_VENUES:
@@ -738,7 +770,11 @@ def diagnose_coverage(
         for ticker in raw_tickers:
             parsed = parse_ticker(ticker)
             if parsed is not None:
-                ticker_index.setdefault(parsed.team_set, []).append(
+                # Keyed on the pair AND the date, exactly as the join keys it.
+                # Keying on the pair alone listed a Cubs-Brewers ticker under
+                # Reds-at-Cubs, which is the loose matching the ticker join
+                # replaced -- reintroduced inside the tool built to diagnose it.
+                ticker_index.setdefault((parsed.team_set, parsed.game_date), []).append(
                     f"{ticker}  ->  {' / '.join(parsed.codes)}  "
                     f"{parsed.game_date.isoformat()} {parsed.start_hhmm or '(no time)'}"
                 )
@@ -749,21 +785,13 @@ def diagnose_coverage(
         candidates: list[str] = []
         if venue in TICKER_VENUES:
             pair = frozenset({canonical_name(game.home_team), canonical_name(game.away_team)})
-            candidates = list(ticker_index.get(pair, []))
-            exact_hit = bool(candidates)
-            if not candidates and not (game.start_ts - reference) > quote_horizon:
-                # Fall back to naming either team, so a ticker that parsed to
-                # the wrong opponent still shows up in the trace.
-                for ticker in raw_tickers:
-                    parsed = parse_ticker(ticker)
-                    if parsed is None:
-                        continue
-                    if pair & parsed.team_set:
-                        candidates.append(
-                            f"{ticker}  ->  parsed as {' vs '.join(sorted(parsed.teams))}"
-                            f" on {parsed.game_date.isoformat()}"
-                        )
-            del exact_hit
+            # Same +/-1 day tolerance the join uses: a ticker's calendar date and
+            # a late game's UTC date can straddle midnight.
+            game_day = game.start_ts.date()
+            for offset in (-1, 0, 1):
+                candidates.extend(
+                    ticker_index.get((pair, game_day + timedelta(days=offset)), [])
+                )
         blocked: list[str] = []
         if venue in TICKER_VENUES and not candidates:
             mine = codes_for(game)
@@ -783,6 +811,7 @@ def diagnose_coverage(
                 ticker_candidates=candidates[:4],
                 hours_to_first_pitch=hours,
                 not_yet_expected=timedelta(hours=hours) > quote_horizon,
+                no_longer_expected=timedelta(hours=-hours) > closes_after,
                 blocked_by_unmapped_code=sorted(set(blocked))[:2],
             )
         )

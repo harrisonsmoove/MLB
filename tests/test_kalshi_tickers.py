@@ -279,11 +279,12 @@ def test_a_late_game_is_not_yet_expected_rather_than_missing() -> None:
     soon = _game(1, "Boston Red Sox", "Seattle Mariners", now + timedelta(hours=2))
     late = _game(2, "Toronto Blue Jays", "Seattle Mariners", now + timedelta(hours=11))
 
-    expected_now, not_yet = split_by_quote_horizon(
+    expected_now, not_yet, finished = split_by_quote_horizon(
         [soon, late], now=now, horizon=timedelta(hours=6)
     )
     assert [g.game_pk for g in expected_now] == [1]
     assert [g.game_pk for g in not_yet] == [2]
+    assert finished == []
 
 
 def test_a_game_already_under_way_is_still_expected() -> None:
@@ -293,8 +294,8 @@ def test_a_game_already_under_way_is_still_expected() -> None:
 
     now = datetime(2026, 8, 30, 18, 0, tzinfo=UTC)
     started = _game(1, "Boston Red Sox", "Seattle Mariners", now - timedelta(hours=1))
-    expected_now, not_yet = split_by_quote_horizon([started], now=now)
-    assert expected_now and not not_yet
+    expected_now, not_yet, finished = split_by_quote_horizon([started], now=now)
+    assert expected_now and not not_yet and not finished
 
 
 def test_pending_games_are_reported_but_not_counted_against_the_venue() -> None:
@@ -371,18 +372,91 @@ def test_a_game_whose_ticker_is_absent_says_not_on_the_board() -> None:
     assert "not on the board" in entry.diagnosis
 
 
-def test_a_ticker_that_names_the_team_but_did_not_join_is_traced() -> None:
-    """Wrong date or wrong opponent -- the trace has to show which."""
+def test_a_ticker_naming_one_team_is_not_listed_under_this_game() -> None:
+    """The diagnostic must key on the PAIR, not on either team.
+
+    Listing a Braves-Mets ticker under Rockies-at-Braves is the same loose
+    matching the ticker join replaced, reintroduced inside the tool built to
+    diagnose it. A ticker that joins elsewhere belongs in the orphan list, which
+    says so, not in this game's row, which implies it is a candidate.
+    """
     from mlb_edge.completeness import diagnose_coverage
 
     games = [_game(1, "Atlanta Braves", "Colorado Rockies", SEP2)]
-    # Same Braves, different opponent: the ticker exists but joins elsewhere.
     payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610ATLNYM"}]}'
 
     entry = diagnose_coverage("kalshi", [payload], games, now=SEP2)[0]
     assert not entry.matched
+    assert entry.ticker_candidates == []
+    assert "not on the board" in entry.diagnosis
+
+
+def test_a_ticker_for_the_wrong_date_is_not_listed_either() -> None:
+    """Observed live: a Sep 2 Cubs-Brewers ticker shown under a Reds-at-Cubs
+    game. Different opponent AND different date."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = [_game(1, "Chicago Cubs", "Cincinnati Reds", datetime(2026, 8, 30, 23, 0, tzinfo=UTC))]
+    payload = (
+        '{"markets":[{"ticker":"KXMLBGAME-26SEP021940MILCHC"},'
+        '{"ticker":"KXMLBGAME-26SEP021240SDCIN"}]}'
+    )
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=datetime(2026, 8, 30, 22, 0, tzinfo=UTC))[0]
+    assert entry.ticker_candidates == []
+    assert "not on the board" in entry.diagnosis
+
+
+def test_a_ticker_a_day_either_side_still_counts_as_a_candidate() -> None:
+    """The join allows +/-1 day for midnight straddle; the trace must match it,
+    or the diagnostic disagrees with the thing it describes."""
+    from mlb_edge.completeness import diagnose_coverage
+
+    late = datetime(2026, 9, 3, 2, 10, tzinfo=UTC)
+    games = [_game(1, "Boston Red Sox", "Seattle Mariners", late)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP022210SEABOS"}]}'
+
+    entry = diagnose_coverage("kalshi", [payload], games, now=late)[0]
+    assert entry.matched
     assert entry.ticker_candidates
-    assert "did NOT join" in entry.diagnosis
+
+
+def test_a_finished_game_is_not_a_shortfall() -> None:
+    """Observed live: a date's ticker count went 7 to 0 between two ticks three
+    minutes apart, while the check still demanded a game at first pitch -3.5h.
+
+    Kalshi is polled with status=open, so a settled game's markets leave the
+    board. With a five-hour trail and a three-hour game that left ~2h in which
+    a complete, correctly archived board read as a shortfall -- and it looked
+    like non-determinism, because the board really did change between ticks.
+    """
+    from datetime import timedelta
+
+    from mlb_edge.completeness import split_by_quote_horizon
+
+    now = datetime(2026, 8, 31, 6, 50, tzinfo=UTC)
+    over = _game(1, "Chicago Cubs", "Cincinnati Reds", now - timedelta(hours=4.5))
+    live = _game(2, "Boston Red Sox", "Seattle Mariners", now - timedelta(hours=1))
+
+    expected_now, _, finished = split_by_quote_horizon(
+        [over, live], now=now, closes_after=timedelta(hours=4)
+    )
+    assert [g.game_pk for g in expected_now] == [2]
+    assert [g.game_pk for g in finished] == [1]
+
+
+def test_a_finished_game_is_reported_but_not_counted() -> None:
+    from mlb_edge.completeness import coverage_for_venue
+
+    games = [_game(1, "Boston Red Sox", "Seattle Mariners", SEP2)]
+    over = [_game(2, "Chicago Cubs", "Cincinnati Reds", SEP2)]
+    payload = '{"markets":[{"ticker":"KXMLBGAME-26SEP021610SEABOS"}]}'
+
+    report = coverage_for_venue("kalshi", [payload], games, no_longer_expected=over)
+
+    assert report.complete and report.expected == 1
+    assert report.no_longer_expected == ["Cincinnati Reds @ Chicago Cubs"]
+    assert "finished" in report.line()
 
 
 def test_orphan_tickers_are_listed() -> None:

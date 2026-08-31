@@ -80,6 +80,13 @@ poller:
   # ignored pile. Games between this and completeness_slate_lead_hours are
   # shown but not counted against any venue.
   completeness_quote_horizon_hours: 6
+  # And the other end. A finished game's markets settle and leave the board --
+  # Kalshi is polled with status=open, so its tickers simply stop appearing.
+  # Observed live: a date's ticker count went 7 to 0 between two ticks three
+  # minutes apart while the check still demanded that game. With a five-hour
+  # trail and a three-hour game that left ~2h in which a complete, correctly
+  # archived board was reported as a shortfall.
+  completeness_quote_close_hours: 4
   schedule_cache_seconds: 1800
   # The schedule only feeds the completeness check, so it fails fast rather
   # than delaying the archive write behind a retry ladder.

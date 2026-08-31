@@ -1002,6 +1002,9 @@ def explain_coverage(
         quote_horizon=timedelta(
             hours=float(poller_config.get("completeness_quote_horizon_hours", 6))
         ),
+        closes_after=timedelta(
+            hours=float(poller_config.get("completeness_quote_close_hours", 4))
+        ),
     )
 
     method = evidence[0].method if evidence else "team-mention"
@@ -1016,11 +1019,12 @@ def explain_coverage(
     table.add_column("tickers on the board" if method == "ticker" else "tokens searched")
     table.add_column("diagnosis")
     for entry in sorted(
-        evidence, key=lambda e: (e.matched, e.not_yet_expected, e.game.label)
+        evidence,
+        key=lambda e: (e.matched, e.not_yet_expected or e.no_longer_expected, e.game.label),
     ):
         if entry.matched:
             colour = "green"
-        elif entry.not_yet_expected:
+        elif entry.not_yet_expected or entry.no_longer_expected:
             colour = "cyan"
         elif entry.ticker_candidates or entry.loose_hits:
             colour = "yellow"
@@ -1045,6 +1049,13 @@ def explain_coverage(
             "the quote horizon from first pitch. Not a shortfall; books post a "
             "late game's market closer to the start."
         )
+    over = [e for e in evidence if e.no_longer_expected and not e.matched]
+    if over:
+        console.print(
+            f"\n[cyan]{len(over)} game(s) have finished[/cyan] -- their markets settled "
+            "and left the board. Not a shortfall; Kalshi is polled with status=open, "
+            "so a settled game's tickers stop appearing."
+        )
 
     codes = coverage_for_venue(venue, payloads, games).unmapped_codes
     if codes:
@@ -1067,7 +1078,10 @@ def explain_coverage(
                 "the same fact seen from two sides.[/dim]"
             )
 
-    unresolved = [e for e in evidence if not e.matched and not e.not_yet_expected]
+    unresolved = [
+        e for e in evidence
+        if not e.matched and not e.not_yet_expected and not e.no_longer_expected
+    ]
     absent = [e for e in unresolved if not e.present]
     gaps = [e for e in unresolved if e.present]
     if gaps:
