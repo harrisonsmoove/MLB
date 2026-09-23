@@ -153,7 +153,7 @@ retroactively to everything ever polled:
 
 ```bash
 mlb-edge probe kalshi --root /opt/mlb-edge     # dump observed keys
-sudo $EDITOR /opt/mlb-edge/config/settings.yaml
+sudo $EDITOR /opt/mlb-edge/config/local.yaml   # NOT settings.yaml: deploy resets it
 mlb-edge import-polls --reimport --root /opt/mlb-edge
 ```
 
@@ -237,7 +237,7 @@ through this process.
 ### Check it
 
 ```bash
-sudo -u mlbedge /opt/mlb-edge/.venv/bin/mlb-edge backup --root /opt/mlb-edge
+sudo -u mlbedge /opt/mlb-edge/.venv/bin/mlb-edge backup create --root /opt/mlb-edge
 sudo -u mlbedge /opt/mlb-edge/.venv/bin/mlb-edge backup status --root /opt/mlb-edge
 ```
 
@@ -251,7 +251,7 @@ last off-box push: 2026-09-23T20:01:12+00:00  (0.4h ago)
 OK a copy exists off this box
 ```
 
-Exit codes: `backup` exits **2** if a push was wanted and no command is
+Exit codes: `backup create` exits **2** if a push was wanted and no command is
 configured, so the systemd timer goes red instead of green. Pass `--no-push` if
 local-only is genuinely what you want; there is no longer a way to mean it by
 accident.

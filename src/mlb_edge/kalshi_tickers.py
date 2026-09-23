@@ -33,7 +33,8 @@ plausible. Expect more; the WARN is how they surface.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
@@ -225,23 +226,99 @@ def tickers_from_payloads(payloads: list[str]) -> list[str]:
 MLB_SERIES_PREFIX = "KXMLB"
 
 
-def match_to_games(
+#: Offsets the ticker clock might be in: UTC, US Eastern in summer, US Eastern
+#: in winter. Which one is not documented, so it is measured rather than
+#: assumed -- see :func:`infer_clock_offset`.
+CLOCK_OFFSET_CANDIDATES = (0, 240, 300)
+
+#: Mean residual above which an inferred offset is not believable. Roughly a
+#: rain delay; beyond it the tickers are not describing these games.
+MAX_MEAN_RESIDUAL_MINUTES = 60.0
+
+
+def _circular_delta(a: int, b: int) -> int:
+    """Minutes between two clock times, the short way round midnight."""
+    raw = abs(a - b) % 1440
+    return min(raw, 1440 - raw)
+
+
+def infer_clock_offset(
+    samples: Sequence[tuple[int, int]],
+    candidates: Sequence[int] = CLOCK_OFFSET_CANDIDATES,
+) -> int | None:
+    """Work out what timezone the ticker clock is in, from games we already know.
+
+    The previous code scored each doubleheader candidate against all three
+    offsets and kept the best, which sounds conservative and is the opposite. A
+    doubleheader's two games are about five hours apart, and UTC-to-Eastern is
+    four or five hours, so the nightcap read in Eastern lands on the same clock
+    time as the opener read in UTC. Both scored a perfect zero, the join
+    correctly refused to guess between them, and a real Toronto-at-Baltimore
+    doubleheader lost both games.
+
+    Guessing three ways is not safer than guessing once. A slate has fifteen
+    games and at most one doubleheader, so the offset is measurable from the
+    unambiguous ones and then simply known.
+
+    ``samples`` is ``(game UTC minutes, ticker clock minutes)`` for tickers that
+    matched exactly one game. Returns ``None`` when there is nothing to learn
+    from, or when the best candidate still does not fit -- an offset inferred
+    from noise is worse than admitting we do not have one.
+    """
+    if not samples:
+        return None
+    best: int | None = None
+    best_cost: float | None = None
+    for offset in candidates:
+        cost = sum(
+            _circular_delta((game - offset) % 1440, ticker) for game, ticker in samples
+        )
+        if best_cost is None or cost < best_cost:
+            best, best_cost = offset, cost
+    if best_cost is None or best_cost / len(samples) > MAX_MEAN_RESIDUAL_MINUTES:
+        return None
+    return best
+
+
+@dataclass
+class TickerJoin:
+    """The result of joining a board's tickers onto a slate."""
+
+    matched: dict[int, str] = field(default_factory=dict)
+    unmapped: list[str] = field(default_factory=list)
+    unparsed: list[str] = field(default_factory=list)
+    #: Games in a matchup the venue lists FEWER tickers for than there are
+    #: games -- the second game of a doubleheader it does not publish. A
+    #: distinct state from a parse failure: nothing is broken, the market does
+    #: not exist, and no code change will conjure it.
+    unlisted: set[int] = field(default_factory=set)
+    #: Games that could not be told apart even with a known clock offset.
+    ambiguous: set[int] = field(default_factory=set)
+    clock_offset_minutes: int | None = None
+
+    @property
+    def matched_pks(self) -> set[int]:
+        return set(self.matched)
+
+
+def join_tickers(
     tickers: list[str],
     games: list[Any],
     *,
-    tolerance_minutes: int = 240,
     series_prefix: str = MLB_SERIES_PREFIX,
-) -> tuple[set[int], list[str], list[str]]:
-    """Join parsed tickers onto schedule games.
+) -> TickerJoin:
+    """Join parsed tickers onto schedule games, in two passes.
 
-    Returns ``(matched game_pks, unmapped codes, unparsed tickers)``.
+    Pass one takes every matchup with a single game on the date, which is all
+    but a handful, and learns the ticker clock's offset from them. Pass two
+    uses that one offset to separate doubleheaders.
 
-    The join is on the unordered team pair plus the date, with the ticker's
-    start time used only to separate a doubleheader -- the one case where a pair
-    and a date are not unique, and the one case where guessing would corrupt the
-    archive rather than merely miscount it. An ambiguous doubleheader is refused,
-    matching ``GameMatcher``: a wrong game_pk is worse than a missing one.
+    An ambiguous doubleheader is still refused rather than guessed, matching
+    ``GameMatcher``: a wrong ``game_pk`` corrupts the archive, a missing one
+    only under-counts it.
     """
+    result = TickerJoin()
+
     by_pair: dict[frozenset[str], list[Any]] = {}
     for game in games:
         key = frozenset(
@@ -249,68 +326,134 @@ def match_to_games(
         )
         by_pair.setdefault(key, []).append(game)
 
-    matched: set[int] = set()
-    unmapped: list[str] = []
-    unparsed: list[str] = []
-
+    parsed_ok: list[ParsedTicker] = []
     for ticker in tickers:
         if series_prefix and not ticker.strip().upper().startswith(series_prefix):
             continue
         parsed = parse_ticker(ticker)
         if parsed is None:
             codes = unmapped_codes(ticker)
-            (unmapped if codes else unparsed).extend(codes or [ticker])
+            (result.unmapped if codes else result.unparsed).extend(codes or [ticker])
             continue
+        parsed_ok.append(parsed)
 
-        candidates = by_pair.get(parsed.team_set, [])
-        # A ticker date and a UTC start can straddle midnight either way.
+    # --- pass one: unambiguous matchups, and what they teach ---------------
+    contested: list[tuple[ParsedTicker, list[Any]]] = []
+    samples: list[tuple[int, int]] = []
+    for parsed in parsed_ok:
         candidates = [
-            g for g in candidates if abs((g.start_ts.date() - parsed.game_date).days) <= 1
+            g
+            for g in by_pair.get(parsed.team_set, [])
+            if abs((g.start_ts.date() - parsed.game_date).days) <= 1
         ]
         if not candidates:
             continue
         if len(candidates) == 1:
-            matched.add(candidates[0].game_pk)
+            game = candidates[0]
+            result.matched[game.game_pk] = parsed.ticker
+            if parsed.start_hhmm:
+                samples.append(
+                    (
+                        game.start_ts.hour * 60 + game.start_ts.minute,
+                        int(parsed.start_hhmm[:2]) * 60 + int(parsed.start_hhmm[2:]),
+                    )
+                )
             continue
+        contested.append((parsed, candidates))
 
-        best = _closest_by_start(candidates, parsed, tolerance_minutes)
-        if best is not None:
-            matched.add(best.game_pk)
+    result.clock_offset_minutes = infer_clock_offset(samples)
 
-    return matched, sorted(set(unmapped)), unparsed
+    # --- pass two: doubleheaders, with the clock now known ------------------
+    for parsed, candidates in contested:
+        game = _pick_by_start(candidates, parsed, result.clock_offset_minutes, result)
+        if game is not None:
+            result.matched[game.game_pk] = parsed.ticker
+
+    # --- what the venue simply does not list --------------------------------
+    for group in by_pair.values():
+        if len(group) < 2:
+            continue
+        listed = sum(1 for g in group if g.game_pk in result.matched)
+        if listed < len(group):
+            for game in group:
+                if game.game_pk not in result.matched and game.game_pk not in result.ambiguous:
+                    result.unlisted.add(game.game_pk)
+    return result
 
 
-def _closest_by_start(candidates: list[Any], parsed: ParsedTicker, tolerance: int) -> Any | None:
-    """Pick the doubleheader game whose start time the ticker names.
+def _pick_by_start(
+    candidates: list[Any],
+    parsed: ParsedTicker,
+    offset: int | None,
+    result: TickerJoin,
+    *,
+    tolerance_minutes: int = 180,
+) -> Any | None:
+    """Choose which game of a doubleheader a ticker names.
 
-    Returns ``None`` when the ticker carries no time, or when two games are
-    equally close. Refusing beats guessing: the whole reason this project keys
-    on ``game_pk`` is that doubleheaders are where a plausible-looking match is
-    silently the wrong game.
+    Refuses, and records why, when the ticker carries no time, when the clock
+    offset could not be established, or when two games are equally close.
     """
     if not parsed.start_hhmm:
+        result.ambiguous.update(g.game_pk for g in candidates)
         return None
-    hh, mm = int(parsed.start_hhmm[:2]), int(parsed.start_hhmm[2:])
-    ticker_minutes = hh * 60 + mm
 
-    scored: list[tuple[int, Any]] = []
-    for game in candidates:
-        start = game.start_ts
-        game_minutes = start.hour * 60 + start.minute
-        # The ticker's clock is not documented as UTC or Eastern. Score against
-        # both and keep the better, rather than encoding an assumption that
-        # would silently pick the wrong game of a doubleheader.
-        deltas = [
-            abs(game_minutes - ticker_minutes),
-            abs(((game_minutes - 240) % 1440) - ticker_minutes),
-            abs(((game_minutes - 300) % 1440) - ticker_minutes),
-        ]
-        scored.append((min(deltas), game))
+    ticker_minutes = int(parsed.start_hhmm[:2]) * 60 + int(parsed.start_hhmm[2:])
 
-    scored.sort(key=lambda pair: pair[0])
+    if offset is not None:
+        picked = _best_under_offset(candidates, ticker_minutes, offset, tolerance_minutes)
+        if picked is None:
+            result.ambiguous.update(g.game_pk for g in candidates)
+        return picked
+
+    # No unambiguous game on this board to learn the clock from -- a late-night
+    # board where everything else has already settled, for instance.
+    #
+    # There is no safe fallback here and it is worth saying why rather than
+    # leaving a future reader to re-derive it: the candidate offsets are four
+    # and five hours apart, and a doubleheader's two games are about five hours
+    # apart, so the offsets disagree by construction. Requiring them to agree
+    # would never fire; picking one would be the guess this refusal exists to
+    # prevent. Mid-slate boards always carry reference games, so this is rare.
+    print(
+        "[slate] WARN: cannot separate the doubleheader "
+        f"{parsed.ticker}: no single-game matchup on this board to establish "
+        "the ticker clock. Both games left uncounted rather than guessed.",
+        flush=True,
+    )
+    result.ambiguous.update(g.game_pk for g in candidates)
+    return None
+
+
+def _best_under_offset(
+    candidates: list[Any], ticker_minutes: int, offset: int, tolerance: int
+) -> Any | None:
+    """The single closest game under one clock offset, or ``None`` if tied."""
+    scored = sorted(
+        (
+            _circular_delta(
+                (g.start_ts.hour * 60 + g.start_ts.minute - offset) % 1440,
+                ticker_minutes,
+            ),
+            g.game_pk,
+            g,
+        )
+        for g in candidates
+    )
     if scored[0][0] > tolerance:
         return None
     if len(scored) > 1 and scored[0][0] == scored[1][0]:
         return None
-    return scored[0][1]
+    return scored[0][2]
 
+
+def match_to_games(
+    tickers: list[str],
+    games: list[Any],
+    *,
+    series_prefix: str = MLB_SERIES_PREFIX,
+    **_ignored: Any,
+) -> tuple[set[int], list[str], list[str]]:
+    """Backwards-compatible view of :func:`join_tickers`."""
+    join = join_tickers(tickers, games, series_prefix=series_prefix)
+    return join.matched_pks, sorted(set(join.unmapped)), join.unparsed

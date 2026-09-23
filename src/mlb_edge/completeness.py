@@ -42,6 +42,7 @@ from mlb_edge.kalshi_tickers import (
     MLB_SERIES_PREFIX,
     canonical_name,
     codes_for,
+    join_tickers,
     match_to_games,
     parse_ticker,
     tickers_from_payloads,
@@ -130,6 +131,10 @@ class CoverageReport:
     #: Games whose markets have settled and left the board. Reported, never
     #: counted as a shortfall.
     no_longer_expected: list[str] = field(default_factory=list)
+    #: Games this venue does not publish a market for at all -- typically the
+    #: second game of a doubleheader. Reported, never alerted: there is no
+    #: market to collect and no code change that would conjure one.
+    not_listed: list[str] = field(default_factory=list)
     #: Games whose teams appear in the payload but were not counted.
     present_but_uncounted: list[str] = field(default_factory=list)
 
@@ -192,6 +197,8 @@ class CoverageReport:
             extra.append(f"+{len(self.not_yet_expected)} not yet expected")
         if self.no_longer_expected:
             extra.append(f"+{len(self.no_longer_expected)} finished")
+        if self.not_listed:
+            extra.append(f"+{len(self.not_listed)} not listed by venue")
         pending = f"  [{', '.join(extra)}]" if extra else ""
         return (
             f"captured {self.covered}/{self.expected} games ({self.venue}, "
@@ -492,7 +499,13 @@ def coverage_for_venue(
         return report
 
     if venue in TICKER_VENUES:
-        covered, unmapped, _ = match_to_games(tickers_from_payloads(payloads), games)
+        join = join_tickers(tickers_from_payloads(payloads), games)
+        covered = join.matched_pks
+        unmapped = sorted(set(join.unmapped))
+        by_pk = {g.game_pk: g for g in games}
+        report.not_listed = [
+            by_pk[pk].label for pk in sorted(join.unlisted) if pk in by_pk
+        ]
         if unmapped:
             # An unknown code is a one-line fix, but only if it is said out loud.
             # Silently leaving the game uncounted is how a matcher gap becomes a
@@ -506,12 +519,7 @@ def coverage_for_venue(
             )
             report.unmapped_codes = unmapped
     elif venue in EXACT_VENUES:
-        seen = _exact_pairs(payloads)
-        covered = {
-            game.game_pk
-            for game in games
-            if (normalise(game.home_team), normalise(game.away_team)) in seen
-        }
+        covered = set(match_events(payloads, games))
     else:
         haystack = normalise(" ".join(payloads))
         tokens = team_tokens(games)
@@ -522,7 +530,13 @@ def coverage_for_venue(
         }
 
     report.covered = len(covered)
-    report.missing = [g.label for g in games if g.game_pk not in covered]
+    unlisted = set(report.not_listed)
+    report.missing = [
+        g.label for g in games if g.game_pk not in covered and g.label not in unlisted
+    ]
+    # Games the venue does not publish leave the denominator too, or a
+    # doubleheader day reads as a shortfall every time and stops being read.
+    report.expected = len(games) - len(unlisted)
     if report.missing:
         # Only pay for this when something is wrong.
         report.sample_labels = extract_labels(payloads, limit=12)
@@ -536,23 +550,103 @@ def coverage_for_venue(
     return report
 
 
-def _exact_pairs(payloads: list[str]) -> set[tuple[str, str]]:
-    """``(home, away)`` pairs named explicitly in Odds API event payloads."""
-    pairs: set[tuple[str, str]] = set()
+@dataclass(frozen=True)
+class OddsEvent:
+    home: str
+    away: str
+    commence_ts: datetime | None
+    event_id: str
+
+    def describe(self) -> str:
+        when = self.commence_ts.isoformat() if self.commence_ts else "(no commence_time)"
+        return f"{self.event_id or '(no id)'}  {when}"
+
+
+def _exact_events(payloads: list[str]) -> list[OddsEvent]:
+    """Every event in an Odds API payload, keeping the fields that identify it.
+
+    The previous version returned a SET OF PAIRS, which discarded
+    ``commence_time`` and ``id``. Both games of a doubleheader share a pair, so
+    a single event covered both and the venue reported 15/16 where the honest
+    answer was 14/16. A false pass on a completeness check is worse than a
+    shortfall: a shortfall gets investigated.
+    """
+    events: list[OddsEvent] = []
     for payload in payloads:
         try:
-            events = json.loads(payload)
-        except json.JSONDecodeError:
+            parsed = json.loads(payload)
+        except (json.JSONDecodeError, TypeError):
             continue
-        if not isinstance(events, list):
+        if not isinstance(parsed, list):
             continue
-        for event in events:
+        for event in parsed:
             if not isinstance(event, dict):
                 continue
             home, away = event.get("home_team"), event.get("away_team")
-            if home and away:
-                pairs.add((normalise(str(home)), normalise(str(away))))
-    return pairs
+            if not (home and away):
+                continue
+            raw = event.get("commence_time")
+            try:
+                commence = parse_iso_utc(str(raw)) if raw else None
+            except (ValueError, TypeError):
+                commence = None
+            events.append(
+                OddsEvent(
+                    home=normalise(str(home)),
+                    away=normalise(str(away)),
+                    commence_ts=commence,
+                    event_id=str(event.get("id") or ""),
+                )
+            )
+    return events
+
+
+def match_events(payloads: list[str], games: list[ExpectedGame]) -> dict[int, str]:
+    """Join Odds API events onto games, one event per game.
+
+    Each event is CONSUMED when it matches, so two games sharing a matchup --
+    a doubleheader -- need two events to both count. Where several events could
+    serve, the nearest ``commence_time`` wins, which is what separates the
+    opener from the nightcap.
+    """
+    # Deduplicate by event id first. The same event can appear in two payloads
+    # of one tick, and two copies of one event would cover both games of a
+    # doubleheader -- the exact false pass this function exists to prevent,
+    # arriving by a different door.
+    available: list[OddsEvent] = []
+    seen_ids: set[str] = set()
+    for event in _exact_events(payloads):
+        if event.event_id and event.event_id in seen_ids:
+            continue
+        if event.event_id:
+            seen_ids.add(event.event_id)
+        available.append(event)
+
+    used: set[int] = set()
+    matched: dict[int, str] = {}
+
+    # Nearest-first across all games, so the opener does not consume the
+    # nightcap's event just by being earlier in the list.
+    pairs: list[tuple[float, int, int]] = []
+    for game in games:
+        for index, event in enumerate(available):
+            if (normalise(game.home_team), normalise(game.away_team)) != (
+                event.home,
+                event.away,
+            ):
+                continue
+            if event.commence_ts is None:
+                distance = float("inf")
+            else:
+                distance = abs((event.commence_ts - game.start_ts).total_seconds())
+            pairs.append((distance, game.game_pk, index))
+
+    for _distance, game_pk, index in sorted(pairs, key=lambda x: (x[0], x[1], x[2])):
+        if game_pk in matched or index in used:
+            continue
+        matched[game_pk] = available[index].describe()
+        used.add(index)
+    return matched
 
 
 def games_in_window(
@@ -660,6 +754,12 @@ class GameEvidence:
     not_yet_expected: bool = False
     #: Game is over; its markets have settled and left the board.
     no_longer_expected: bool = False
+    #: The venue publishes no market for this game at all -- typically the
+    #: second game of a doubleheader. Not a bug, and not fixable in code.
+    not_listed: bool = False
+    #: Exact venues only: the event this game joined to, or the reason it did
+    #: not. Shown instead of token searches, which exact venues never run.
+    event_match: str = ""
     #: A ticker on the board carries one of this game's codes but could not be
     #: parsed, because the OTHER code is not in the alias table. The game is
     #: present, not lost -- and the fix is one line.
@@ -675,6 +775,8 @@ class GameEvidence:
         """
         if self.method == "ticker":
             return bool(self.ticker_candidates or self.blocked_by_unmapped_code)
+        if self.method == "exact":
+            return bool(self.event_match)
         return bool(self.loose_hits)
 
     @property
@@ -688,6 +790,8 @@ class GameEvidence:
                 f"finished ({-self.hours_to_first_pitch:.1f}h after first pitch) "
                 "-- markets settled and left the board"
             )
+        if self.not_listed:
+            return "venue does not list this game (no market published)"
         if self.blocked_by_unmapped_code:
             return (
                 "on the board but blocked by unmapped code "
@@ -735,6 +839,15 @@ def loose_tokens(game: ExpectedGame) -> set[str]:
     return {tok for tok in tokens if len(tok) >= 3}
 
 
+def report_unlisted_pks(
+    venue: str, payloads: list[str], games: list[ExpectedGame]
+) -> set[int]:
+    """Game ids this venue publishes no market for. Ticker venues only."""
+    if venue not in TICKER_VENUES:
+        return set()
+    return join_tickers(tickers_from_payloads(payloads), games).unlisted
+
+
 def diagnose_coverage(
     venue: str,
     payloads: list[str],
@@ -757,6 +870,8 @@ def diagnose_coverage(
     haystack = normalise(" ".join(payloads))
     strict = team_tokens(games)
 
+    events = match_events(payloads, games) if venue in EXACT_VENUES else {}
+    unlisted = set(report_unlisted_pks(venue, payloads, games))
     ticker_index: dict[tuple[frozenset[str], date], list[str]] = {}
     raw_tickers: list[str] = []
     unparsed_tickers: list[str] = []
@@ -812,6 +927,8 @@ def diagnose_coverage(
                 hours_to_first_pitch=hours,
                 not_yet_expected=timedelta(hours=hours) > quote_horizon,
                 no_longer_expected=timedelta(hours=-hours) > closes_after,
+                not_listed=game.game_pk in unlisted,
+                event_match=events.get(game.game_pk, ""),
                 blocked_by_unmapped_code=sorted(set(blocked))[:2],
             )
         )

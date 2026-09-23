@@ -27,6 +27,7 @@ import pytest
 from mlb_edge.completeness import ExpectedGame, coverage_for_venue
 from mlb_edge.kalshi_tickers import (
     TEAM_ALIASES,
+    join_tickers,
     match_to_games,
     parse_ticker,
     split_codes,
@@ -184,12 +185,96 @@ def test_a_ticker_date_may_straddle_midnight() -> None:
 
 
 def test_a_doubleheader_is_separated_by_the_start_time() -> None:
+    """Needs one ordinary game on the board to establish the ticker clock.
+
+    Observed live: Toronto at Baltimore, 18:35 and 23:35 UTC, one ticker at
+    1835. The old code scored each game against UTC, UTC-4 and UTC-5 and kept
+    the best of the three -- so the nightcap read in Eastern landed on exactly
+    18:35 too. Both scored zero, the join refused the tie, and a real
+    doubleheader lost both games.
+    """
     games = [
-        _game(1, "Boston Red Sox", "Seattle Mariners", datetime(2026, 9, 2, 17, 10, tzinfo=UTC)),
-        _game(2, "Boston Red Sox", "Seattle Mariners", datetime(2026, 9, 2, 23, 10, tzinfo=UTC)),
+        _game(1, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 18, 35, tzinfo=UTC)),
+        _game(2, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 23, 35, tzinfo=UTC)),
+        # An ordinary game: this is what teaches the clock.
+        _game(3, "Boston Red Sox", "Seattle Mariners", datetime(2026, 9, 23, 23, 10, tzinfo=UTC)),
     ]
-    matched, _, _ = match_to_games(["KXMLBGAME-26SEP021710SEABOS"], games)
-    assert matched == {1}
+    matched, _, _ = match_to_games(
+        ["KXMLBGAME-26SEP231835TORBAL", "KXMLBGAME-26SEP232310SEABOS"], games
+    )
+    assert matched == {1, 3}
+
+
+def test_the_unlisted_second_game_is_a_distinct_state() -> None:
+    """Kalshi publishes one ticker for the pair. "The venue does not list this
+    game" is not "the join failed" -- nothing is broken and no code change will
+    conjure a market that does not exist."""
+    games = [
+        _game(1, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 18, 35, tzinfo=UTC)),
+        _game(2, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 23, 35, tzinfo=UTC)),
+        _game(3, "Boston Red Sox", "Seattle Mariners", datetime(2026, 9, 23, 23, 10, tzinfo=UTC)),
+    ]
+    join = join_tickers(
+        ["KXMLBGAME-26SEP231835TORBAL", "KXMLBGAME-26SEP232310SEABOS"], games
+    )
+    assert join.matched_pks == {1, 3}
+    assert join.unlisted == {2}
+    assert join.ambiguous == set()
+
+
+def test_an_unlisted_game_leaves_the_denominator() -> None:
+    """Or a doubleheader day reads as a shortfall every time and stops being read."""
+    from mlb_edge.completeness import coverage_for_venue
+
+    games = [
+        _game(1, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 18, 35, tzinfo=UTC)),
+        _game(2, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 23, 35, tzinfo=UTC)),
+        _game(3, "Boston Red Sox", "Seattle Mariners", datetime(2026, 9, 23, 23, 10, tzinfo=UTC)),
+    ]
+    payload = (
+        '{"markets":[{"ticker":"KXMLBGAME-26SEP231835TORBAL"},'
+        '{"ticker":"KXMLBGAME-26SEP232310SEABOS"}]}'
+    )
+    report = coverage_for_venue("kalshi", [payload], games)
+
+    assert report.expected == 2 and report.covered == 2
+    assert report.healthy
+    assert report.missing == []
+    assert report.not_listed == ["Toronto Blue Jays @ Baltimore Orioles"]
+    assert "not listed by venue" in report.line()
+
+
+def test_the_clock_offset_is_measured_not_assumed() -> None:
+    from mlb_edge.kalshi_tickers import infer_clock_offset
+
+    # Game at 23:10 UTC, ticker says 1910 -> the clock is UTC-4.
+    assert infer_clock_offset([(23 * 60 + 10, 19 * 60 + 10)]) == 240
+    assert infer_clock_offset([(23 * 60 + 10, 23 * 60 + 10)]) == 0
+    assert infer_clock_offset([]) is None
+
+
+def test_an_offset_inferred_from_noise_is_rejected() -> None:
+    """An offset fitted to garbage is worse than admitting we have none."""
+    from mlb_edge.kalshi_tickers import infer_clock_offset
+
+    assert infer_clock_offset([(100, 800), (200, 30), (700, 1300)]) is None
+
+
+def test_a_doubleheader_alone_on_the_board_is_refused_loudly(capsys) -> None:
+    """The candidate offsets are 4-5h apart and a doubleheader's games are ~5h
+    apart, so with no reference game the offsets disagree by construction.
+    Refusing is right; doing it silently is not."""
+    games = [
+        _game(1, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 18, 35, tzinfo=UTC)),
+        _game(2, "Baltimore Orioles", "Toronto Blue Jays", datetime(2026, 9, 23, 23, 35, tzinfo=UTC)),
+    ]
+    join = join_tickers(["KXMLBGAME-26SEP231835TORBAL"], games)
+
+    assert join.matched_pks == set()
+    assert join.ambiguous == {1, 2}
+    out = capsys.readouterr().out
+    assert "WARN" in out
+    assert "doubleheader" in out
 
 
 def test_an_undecidable_doubleheader_is_refused_not_guessed() -> None:

@@ -364,3 +364,95 @@ def test_a_broken_completeness_check_does_not_stop_the_archive(monkeypatch, tmp_
     assert daemon.run(once=True) == 1
     files = archive.files("odds")
     assert len(files) == 1, "bytes must be on disk even though the check failed"
+
+
+# ---------------------------------------------------------------------------
+# One event covers one game
+# ---------------------------------------------------------------------------
+def _dh_games():
+    from datetime import UTC, datetime
+
+    return [
+        ExpectedGame(1, "Baltimore Orioles", "Toronto Blue Jays",
+                     datetime(2026, 9, 23, 18, 35, tzinfo=UTC)),
+        ExpectedGame(2, "Baltimore Orioles", "Toronto Blue Jays",
+                     datetime(2026, 9, 23, 23, 35, tzinfo=UTC)),
+    ]
+
+
+def _odds_event(event_id: str, commence: str):
+    return {
+        "id": event_id,
+        "commence_time": commence,
+        "home_team": "Baltimore Orioles",
+        "away_team": "Toronto Blue Jays",
+    }
+
+
+def test_one_odds_event_does_not_cover_a_whole_doubleheader():
+    """The matcher returned a SET OF PAIRS, which discarded commence_time.
+
+    Both games of a doubleheader share a pair, so one event covered both and
+    the venue reported 15/16 where the honest answer was 14/16. A false pass on
+    a completeness check is worse than a shortfall -- a shortfall gets
+    investigated.
+    """
+    import json
+
+    payload = json.dumps([_odds_event("e1", "2026-09-23T18:35:00Z")])
+    report = coverage_for_venue("odds", [payload], _dh_games())
+
+    assert report.covered == 1
+    assert report.expected == 2
+    assert not report.complete
+
+
+def test_two_odds_events_cover_both_games():
+    import json
+
+    payload = json.dumps([
+        _odds_event("e1", "2026-09-23T18:35:00Z"),
+        _odds_event("e2", "2026-09-23T23:35:00Z"),
+    ])
+    report = coverage_for_venue("odds", [payload], _dh_games())
+
+    assert report.covered == 2
+    assert report.complete
+
+
+def test_each_odds_event_joins_to_its_nearest_game():
+    """The opener must not consume the nightcap's event just by being first."""
+    import json
+
+    from mlb_edge.completeness import match_events
+
+    payload = json.dumps([
+        _odds_event("nightcap", "2026-09-23T23:35:00Z"),
+        _odds_event("opener", "2026-09-23T18:35:00Z"),
+    ])
+    matched = match_events([payload], _dh_games())
+
+    assert "opener" in matched[1]
+    assert "nightcap" in matched[2]
+
+
+def test_an_event_without_a_commence_time_still_covers_one_game():
+    """Degrade, but never to covering two."""
+    import json
+
+    payload = json.dumps([
+        {"id": "e1", "home_team": "Baltimore Orioles", "away_team": "Toronto Blue Jays"}
+    ])
+    report = coverage_for_venue("odds", [payload], _dh_games())
+    assert report.covered == 1
+
+
+def test_a_duplicate_event_id_does_not_count_twice():
+    """Two payloads in one tick can carry the same event; it is still one game."""
+    import json
+
+    one = json.dumps([_odds_event("e1", "2026-09-23T18:35:00Z")])
+    report = coverage_for_venue("odds", [one, one], _dh_games())
+
+    assert report.covered == 1, "two copies of one event is still one game"
+    assert report.expected == 2

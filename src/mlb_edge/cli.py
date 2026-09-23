@@ -1074,15 +1074,23 @@ def explain_coverage(
     table.add_column("first pitch", justify="right")
     # The column must describe the matcher that actually ran. Showing fuzzy
     # tokens beside a ticker join sends you to debug a dead code path.
-    table.add_column("tickers on the board" if method == "ticker" else "tokens searched")
+    table.add_column(
+        {"ticker": "tickers on the board", "exact": "event joined"}.get(
+            method, "tokens searched"
+        )
+    )
     table.add_column("diagnosis")
     for entry in sorted(
         evidence,
-        key=lambda e: (e.matched, e.not_yet_expected or e.no_longer_expected, e.game.label),
+        key=lambda e: (
+            e.matched,
+            e.not_yet_expected or e.no_longer_expected or e.not_listed,
+            e.game.label,
+        ),
     ):
         if entry.matched:
             colour = "green"
-        elif entry.not_yet_expected or entry.no_longer_expected:
+        elif entry.not_yet_expected or entry.no_longer_expected or entry.not_listed:
             colour = "cyan"
         elif entry.ticker_candidates or entry.loose_hits:
             colour = "yellow"
@@ -1090,6 +1098,10 @@ def explain_coverage(
             colour = "red"
         if method == "ticker":
             attempted = "\n".join(entry.ticker_candidates) or "[dim]none[/dim]"
+        elif method == "exact":
+            # Exact venues join on the event, never on tokens. Showing an empty
+            # token list here described a matcher that does not run.
+            attempted = entry.event_match or "[dim]no event[/dim]"
         else:
             attempted = ", ".join(sorted(entry.strict_tokens)) or "[dim]none[/dim]"
         table.add_row(
@@ -1138,7 +1150,10 @@ def explain_coverage(
 
     unresolved = [
         e for e in evidence
-        if not e.matched and not e.not_yet_expected and not e.no_longer_expected
+        if not e.matched
+        and not e.not_yet_expected
+        and not e.no_longer_expected
+        and not e.not_listed
     ]
     absent = [e for e in unresolved if not e.present]
     gaps = [e for e in unresolved if e.present]

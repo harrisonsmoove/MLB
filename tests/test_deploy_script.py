@@ -197,3 +197,53 @@ def test_dirty_config_is_backed_up_before_the_reset() -> None:
 )
 def test_required_deploy_behaviour_is_present(phrase: str) -> None:
     assert phrase in DEPLOY.read_text(encoding="utf-8")
+
+
+# --- the README has to actually work ---------------------------------------
+
+
+README = REPO_ROOT / "deploy" / "README.md"
+
+
+def _documented_commands() -> list[str]:
+    """Every `mlb-edge ...` invocation the README tells someone to run."""
+    text = README.read_text(encoding="utf-8")
+    found: list[str] = []
+    for match in re.finditer(r"mlb-edge ([a-z][a-z-]*(?: [a-z][a-z-]*)?)", text):
+        found.append(match.group(1))
+    return sorted(set(found))
+
+
+def test_every_command_in_the_readme_exists() -> None:
+    """`mlb-edge backup --root X` was in here and would have failed on first
+    use -- `backup` is a command group, so it needs `backup create`.
+
+    A runbook is only useful if the commands in it run. This checks them
+    against the CLI's own help rather than against memory.
+    """
+    binary = str(REPO_ROOT / ".venv" / "bin" / "mlb-edge")
+    top = subprocess.run([binary, "--help"], capture_output=True, text=True).stdout
+
+    for command in _documented_commands():
+        head, _, sub = command.partition(" ")
+        assert head in top, f"README documents `mlb-edge {command}`, no such command"
+        if not sub:
+            continue
+        group = subprocess.run(
+            [binary, head, "--help"], capture_output=True, text=True
+        ).stdout
+        if "Commands" not in group:
+            # Not a group -- the second token is an argument (`probe kalshi`),
+            # and the CLI is the authority on whether it is valid, not this test.
+            continue
+        assert sub in group, f"README documents `mlb-edge {command}`, no such subcommand"
+
+
+def test_the_readme_does_not_send_edits_to_settings_yaml() -> None:
+    """Every deploy runs `git reset --hard`. Telling someone to edit the
+    tracked config is telling them to lose the edit."""
+    for line in README.read_text(encoding="utf-8").splitlines():
+        if "EDITOR" not in line:
+            continue
+        command, _, _comment = line.partition("#")
+        assert "settings.yaml" not in command, line
