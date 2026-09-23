@@ -199,3 +199,85 @@ right behaviour and an unhelpful thing to arrive at by default.
 If `config/` has uncommitted edits when you deploy, they are copied to
 `data/config-backups/<timestamp>/` (with a diff) before the reset, and the log
 says so.
+
+
+## Off-box backups
+
+The poll archive cannot be rebuilt. Tier 0 has no historical odds endpoint, so
+an hour not backed up and then lost is gone at any price. A backup that has
+never left this box does not survive the failure backups exist for.
+
+**`push_command` is empty by default and the poller alerts CRITICAL until it is
+set.** That is deliberate: it was a yellow line at deploy time for 23 days while
+the archive sat in exactly one place, and a warning nobody is obliged to act on
+is indistinguishable from no warning.
+
+### Setting it up (DigitalOcean Spaces)
+
+```bash
+# On the box, once.
+curl https://rclone.org/install.sh | sudo bash
+sudo -u mlbedge rclone config    # new remote, type "s3", provider "DigitalOcean"
+```
+
+Then in `/opt/mlb-edge/config/local.yaml` — **not** `settings.yaml`, which every
+deploy resets:
+
+```yaml
+backup:
+  push_command: "rclone copy {src} spaces:your-bucket/mlb-edge/ --checksum"
+  max_age_hours: 48
+```
+
+`{src}` is substituted with the dated backup directory. Any tool works — `aws
+s3 sync`, `rsync -a`, `restic` — because the command is shelled out rather than
+reimplemented here, so credentials stay in that tool's own config and never pass
+through this process.
+
+### Check it
+
+```bash
+sudo -u mlbedge /opt/mlb-edge/.venv/bin/mlb-edge backup --root /opt/mlb-edge
+sudo -u mlbedge /opt/mlb-edge/.venv/bin/mlb-edge backup status --root /opt/mlb-edge
+```
+
+`backup status` answers the only question that matters — when a copy last left
+the box:
+
+```
+last local backup: 2026-09-23T20:00:00+00:00
+last off-box push: 2026-09-23T20:01:12+00:00  (0.4h ago)
+
+OK a copy exists off this box
+```
+
+Exit codes: `backup` exits **2** if a push was wanted and no command is
+configured, so the systemd timer goes red instead of green. Pass `--no-push` if
+local-only is genuinely what you want; there is no longer a way to mean it by
+accident.
+
+### Verify the restore, once
+
+A backup that has never been restored is a hypothesis.
+
+```bash
+mlb-edge backup verify /opt/mlb-edge/data/backups/<dated-dir>
+mlb-edge backup restore /opt/mlb-edge/data/backups/<dated-dir> --into /tmp/restore-test
+```
+
+The warehouse travels as DuckDB `EXPORT DATABASE` output — parquet plus SQL —
+rather than a copied database file, so it stays readable by a DuckDB build that
+does not exist yet.
+
+### What watches it
+
+The **poller** raises the alert, not the backup timer, and re-reads the state
+file every cycle. A job that is not running cannot report that it is not
+running; the poller is the process that is always up, so it is the one that can
+notice. Three distinct alerts, because they have three different fixes:
+
+| Alert | Means |
+|---|---|
+| `backup:unconfigured` | no `push_command` — the archive has no off-box copy at all |
+| `backup:never` | a command is set and has never succeeded — credentials or bucket |
+| `backup:stale` | it worked once and has not for `max_age_hours` |

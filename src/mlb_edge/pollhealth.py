@@ -320,6 +320,73 @@ def frozen_alerts(fingerprint: Any, identical_ticks: int, *, threshold: int = 2)
     ]
 
 
+def backup_alerts(
+    state: Any,
+    *,
+    now: datetime | None = None,
+    max_age: timedelta = timedelta(hours=48),
+) -> list[Alert]:
+    """Alert when the archive has no recent copy off this box.
+
+    The poller raises this rather than the backup timer, because the failure is
+    the backup *not running* -- or running and never leaving the box -- and a
+    job that is not running cannot report that it is not running. The poller is
+    the process that is always up, so it is the one that can notice.
+
+    Not configuring an upload command is a CRITICAL, not a warning. It was a
+    warning for 23 days, printed only at deploy time, while the only
+    irreplaceable asset in the project existed in exactly one place.
+    """
+    reference = ensure_utc(now or utcnow())
+    if not state.push_configured and state.last_push_at is None:
+        return [
+            Alert(
+                key="backup:unconfigured",
+                severity=Severity.CRITICAL,
+                subject="archive has NO off-box copy",
+                body=(
+                    "backup.push_command is not configured, so every backup is "
+                    "local only and dies with the droplet.\n"
+                    "Tier 0 has no historical endpoint: the poll archive cannot be "
+                    "rebuilt from anything, at any price.\n"
+                    "Set backup.push_command in config/local.yaml -- see "
+                    "deploy/README.md."
+                ),
+            )
+        ]
+
+    age = state.off_box_age(reference)
+    if age is None:
+        return [
+            Alert(
+                key="backup:never",
+                severity=Severity.CRITICAL,
+                subject="no backup has ever reached off-box storage",
+                body=(
+                    f"An upload command is configured but has never succeeded. "
+                    f"Last error: {state.last_push_error or 'none recorded'}\n"
+                    "Run `mlb-edge backup` by hand and read the output."
+                ),
+            )
+        ]
+
+    if age > max_age:
+        hours = age.total_seconds() / 3600
+        return [
+            Alert(
+                key="backup:stale",
+                severity=Severity.CRITICAL,
+                subject=f"no off-box backup for {hours:.0f}h",
+                body=(
+                    f"Last successful push {state.last_push_at}.\n"
+                    f"Last error: {state.last_push_error or 'none recorded'}\n"
+                    "Everything polled since then exists only on this box."
+                ),
+            )
+        ]
+    return []
+
+
 def _slate_active(
     slate: list[ExpectedGame],
     now: datetime,

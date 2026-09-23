@@ -42,7 +42,12 @@ poller:
   # The budget horizon. The odds poller spreads its remaining credits evenly
   # over the days to this date, so a free-tier key throttles itself to survive
   # the season instead of burning out in 2.6 days. Update it each year.
-  season_end_date: "2026-09-28"
+  # Through the POSTSEASON, not the regular season. This read 2026-09-28 for
+  # three weeks, which is a budget-pacing bug wearing a date's clothes: as the
+  # horizon closes the pacing term collapses below the configured interval, the
+  # poller reverts to a flat 15 minutes, and 500 credits/month is gone in 2.6
+  # days -- arriving exactly as October, the only live-fire window left, began.
+  season_end_date: "2026-11-08"
   odds_interval_seconds: 900        # 15 min -- the FLOOR, not the guarantee
   kalshi_interval_seconds: 900      # Kalshi is not credit-metered
   # Sized for a full slate, not a guess: ~15 games x winner/total/game markets
@@ -111,6 +116,13 @@ backup:
   #   aws s3 sync {src} s3://your-bucket/mlb-edge/$(basename {src}) --delete
   #   rclone copy {src} spaces:your-bucket/mlb-edge/
   push_command: ""
+  # State beside the archive: when a backup last ran, and when a copy last
+  # actually LEFT this box. Two facts, and only the second one survives the
+  # droplet. The poller re-reads this every cycle and alerts when it lapses --
+  # `push_command: ""` was a yellow line at deploy time for 23 days while the
+  # one irreplaceable asset in the project sat in a single location.
+  state_file: backup_state.json
+  max_age_hours: 48
 
 http:
   timeout_seconds: 30

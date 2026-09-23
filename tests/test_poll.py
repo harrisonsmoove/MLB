@@ -175,15 +175,45 @@ def test_odds_failure_is_archived_as_a_row_not_a_gap(settings_with_keys):
     assert "401" in records[0].error
 
 
-def test_free_tier_throttles_to_survive_the_season(settings_with_keys):
+def test_free_tier_throttles_to_survive_the_month(settings_with_keys):
     """500 credits is 2.6 days of 15-minute polling, so it must slow down."""
     poller = OddsPoller(settings_with_keys, client=StubClient({}))
     poller.quota_remaining = 500
-    interval = poller.next_interval_seconds(now=NOW)
+    # First of a month, so a full refill period lies ahead.
+    interval = poller.next_interval_seconds(now=datetime(2026, 10, 1, 12, 0, tzinfo=UTC))
     configured = float(settings_with_keys.section("poller")["odds_interval_seconds"])
 
     assert interval > configured
     assert interval / 60 == pytest.approx(179, abs=5), "roughly three-hourly on the free tier"
+
+
+def test_budget_is_paced_to_the_month_not_the_season(settings_with_keys):
+    """The quota refills on the first, so pacing it to a season-end horizon
+    under-spends by the ratio of the two.
+
+    From late September a November horizon gives 4.4-hour intervals where 3
+    hours was affordable, and the difference is snapshots of a live board that
+    cannot be recovered later.
+    """
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.quota_remaining = 500
+
+    first = poller.next_interval_seconds(now=datetime(2026, 10, 1, 12, 0, tzinfo=UTC))
+    late = poller.next_interval_seconds(now=datetime(2026, 10, 28, 12, 0, tzinfo=UTC))
+
+    # Late in the month there are few days left to spend this month's credits
+    # over, so it speeds up rather than hoarding them into a period they do not
+    # carry over into.
+    assert late < first
+
+
+def test_pacing_never_looks_past_the_end_of_the_season(settings_with_keys):
+    """Past the season there is nothing left to pace for."""
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.quota_remaining = 500
+    configured = float(settings_with_keys.section("poller")["odds_interval_seconds"])
+    after = poller.next_interval_seconds(now=datetime(2027, 1, 5, 12, 0, tzinfo=UTC))
+    assert after == configured
 
 
 def test_ample_quota_polls_at_the_configured_interval(settings_with_keys):

@@ -28,10 +28,10 @@ import os
 import shutil
 import subprocess
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from mlb_edge.timeutil import utcnow
+from mlb_edge.timeutil import ensure_utc, parse_iso_utc, utcnow
 
 MANIFEST_NAME = "MANIFEST.json"
 WAREHOUSE_EXPORT_DIR = "warehouse-export"
@@ -303,3 +303,75 @@ def prune(backup_root: Path, *, keep: int) -> list[Path]:
         shutil.rmtree(path)
         removed.append(path)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Is there actually a copy off this box?
+# ---------------------------------------------------------------------------
+@dataclass
+class BackupState:
+    """When a backup last succeeded, and when one last left the box.
+
+    Two timestamps, not one, because they fail independently and only the
+    second one matters. ``push_command`` was empty for 23 days: every backup
+    "succeeded", the systemd timer stayed green, and the only signal was a
+    yellow line at deploy time that scrolled past. The archive was one droplet
+    failure from gone while everything reported healthy.
+
+    That is this project's recurring bug in its purest form -- a degraded path
+    reporting success -- so the off-box copy gets the same treatment as the
+    poller's heartbeat: a timestamp, a threshold, and an alert when it lapses.
+    """
+
+    path: Path
+    last_backup_at: str | None = None
+    last_push_at: str | None = None
+    last_push_error: str | None = None
+    push_configured: bool = False
+
+    @classmethod
+    def load(cls, path: Path) -> BackupState:
+        path = Path(path)
+        state = cls(path=path)
+        if not path.is_file():
+            return state
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+        except Exception:  # noqa: BLE001 - corrupt state must not stop a backup
+            print(f"[backup] WARN: could not read {path}; starting fresh", flush=True)
+            return state
+        state.last_backup_at = raw.get("last_backup_at")
+        state.last_push_at = raw.get("last_push_at")
+        state.last_push_error = raw.get("last_push_error")
+        state.push_configured = bool(raw.get("push_configured", False))
+        return state
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "last_backup_at": self.last_backup_at,
+            "last_push_at": self.last_push_at,
+            "last_push_error": self.last_push_error,
+            "push_configured": self.push_configured,
+        }
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
+        temporary.replace(self.path)
+
+    def record_backup(self, *, now: datetime) -> None:
+        self.last_backup_at = now.isoformat()
+
+    def record_push(self, *, now: datetime, ok: bool, error: str | None = None) -> None:
+        self.push_configured = True
+        if ok:
+            self.last_push_at = now.isoformat()
+            self.last_push_error = None
+        else:
+            self.last_push_error = (error or "")[:500]
+
+    def off_box_age(self, now: datetime) -> timedelta | None:
+        """How long since a copy last left the box. ``None`` means never."""
+        if not self.last_push_at:
+            return None
+        return ensure_utc(now) - parse_iso_utc(self.last_push_at)
+

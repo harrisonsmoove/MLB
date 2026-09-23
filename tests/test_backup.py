@@ -232,3 +232,129 @@ def test_backup_uses_hardlinks_where_it_can(live_root, tmp_path):
     source = next((root / "data" / "poll").rglob("*.parquet"))
     mirrored = destination / source.relative_to(root)
     assert mirrored.stat().st_ino == source.stat().st_ino, "expected a hardlink"
+
+
+# ---------------------------------------------------------------------------
+# A backup nobody is watching is not a backup
+# ---------------------------------------------------------------------------
+def test_unconfigured_push_is_critical_not_a_warning(tmp_path):
+    """It was a warning for 23 days, printed only at deploy time, while the
+    archive existed in exactly one place.
+
+    Tier 0 has no historical endpoint: the poll archive cannot be rebuilt from
+    anything, at any price. "Local only" is not a degraded backup, it is no
+    backup against the failure backups exist for.
+    """
+    from mlb_edge.backup import BackupState
+    from mlb_edge.pollhealth import backup_alerts
+
+    state = BackupState(path=tmp_path / "s.json")
+    alerts = backup_alerts(state)
+
+    assert len(alerts) == 1
+    assert alerts[0].severity.value == "CRITICAL"
+    assert "NO off-box copy" in alerts[0].subject
+    assert "local.yaml" in alerts[0].body
+
+
+def test_configured_but_never_succeeded_is_distinct_from_unconfigured(tmp_path):
+    """Different causes, different fixes. One is a missing setting, the other
+    is a broken credential or bucket."""
+    from mlb_edge.backup import BackupState
+    from mlb_edge.pollhealth import backup_alerts
+
+    state = BackupState(path=tmp_path / "s.json", push_configured=True)
+    state.last_push_error = "AccessDenied"
+    alerts = backup_alerts(state)
+
+    assert alerts[0].key == "backup:never"
+    assert "AccessDenied" in alerts[0].body
+
+
+def test_a_stale_off_box_copy_alerts(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from mlb_edge.backup import BackupState
+    from mlb_edge.pollhealth import backup_alerts
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    state = BackupState(path=tmp_path / "s.json", push_configured=True)
+    state.record_push(now=now - timedelta(hours=72), ok=True)
+
+    alerts = backup_alerts(state, now=now, max_age=timedelta(hours=48))
+    assert alerts[0].key == "backup:stale"
+    assert "72h" in alerts[0].subject
+
+
+def test_a_recent_off_box_copy_is_silent(tmp_path):
+    from datetime import UTC, datetime, timedelta
+
+    from mlb_edge.backup import BackupState
+    from mlb_edge.pollhealth import backup_alerts
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    state = BackupState(path=tmp_path / "s.json", push_configured=True)
+    state.record_push(now=now - timedelta(hours=6), ok=True)
+
+    assert backup_alerts(state, now=now, max_age=timedelta(hours=48)) == []
+
+
+def test_a_failed_push_does_not_refresh_the_clock(tmp_path):
+    """The subtle one: recording an attempt as though it were a success would
+    silence the alert permanently on a box whose uploads always fail."""
+    from datetime import UTC, datetime, timedelta
+
+    from mlb_edge.backup import BackupState
+    from mlb_edge.pollhealth import backup_alerts
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    state = BackupState(path=tmp_path / "s.json")
+    state.record_push(now=now - timedelta(hours=72), ok=True)
+    state.record_push(now=now, ok=False, error="connection refused")
+
+    assert state.last_push_at == (now - timedelta(hours=72)).isoformat()
+    assert backup_alerts(state, now=now, max_age=timedelta(hours=48))[0].key == "backup:stale"
+
+
+def test_state_round_trips_through_disk(tmp_path):
+    from datetime import UTC, datetime
+
+    from mlb_edge.backup import BackupState
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=UTC)
+    path = tmp_path / "state" / "backup_state.json"
+    state = BackupState(path=path)
+    state.record_backup(now=now)
+    state.record_push(now=now, ok=True)
+    state.save()
+
+    reloaded = BackupState.load(path)
+    assert reloaded.last_push_at == now.isoformat()
+    assert reloaded.push_configured is True
+
+
+def test_corrupt_state_warns_and_starts_fresh(tmp_path, capsys):
+    from mlb_edge.backup import BackupState
+
+    path = tmp_path / "backup_state.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    state = BackupState.load(path)
+    assert state.last_push_at is None
+    assert "WARN" in capsys.readouterr().out
+
+
+def test_the_poller_rereads_state_rather_than_caching_it():
+    """The backup timer writes this file while the poller runs for days.
+
+    A snapshot taken at startup would keep alerting after the problem was
+    fixed, and an alert that stays lit once its cause is gone is how alerts get
+    muted.
+    """
+    import inspect
+
+    from mlb_edge.poll import PollDaemon
+
+    source = inspect.getsource(PollDaemon)
+    assert "BackupState.load(self.backup_state_path)" in source
+    assert "self.backup_state =" not in source

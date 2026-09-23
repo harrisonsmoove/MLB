@@ -39,6 +39,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from mlb_edge.alerting import AlertThrottle, build_alerter, send_throttled
+from mlb_edge.backup import BackupState
 from mlb_edge.completeness import (
     SlateCache,
     coverage_for_venue,
@@ -49,6 +50,7 @@ from mlb_edge.config import Settings
 from mlb_edge.http import HttpClient, UpstreamError, client_for
 from mlb_edge.pollhealth import (
     HealthState,
+    backup_alerts,
     coverage_alerts,
     frozen_alerts,
     staleness_alerts,
@@ -296,8 +298,8 @@ class OddsPoller:
         if self.quota_remaining is None:
             return configured
 
-        horizon = self._season_end()
         reference = ensure_utc(now or utcnow()).date()
+        horizon = self._budget_horizon(reference)
         days_left = max((horizon - reference).days, 1)
         calls_left = self.quota_remaining / self.credits_per_call
         if calls_left <= 0:
@@ -305,6 +307,31 @@ class OddsPoller:
             # without a restart, rather than hammering a dead quota.
             return 3600.0
         return max(configured, (days_left * 86400.0) / calls_left)
+
+
+    def _budget_horizon(self, reference: date) -> date:
+        """The date the CURRENT quota has to last until.
+
+        Not the end of the season. ``monthly_request_budget`` refills on the
+        first of each month and ``x-requests-remaining`` reports the current
+        period, so spreading this month's credits to a November horizon
+        under-spends by the ratio of the two: from late September that is a
+        4.4-hour interval where 3 hours was affordable, and the difference is
+        snapshots of a live board that cannot be recovered later.
+
+        So the horizon is whichever comes first, the month boundary or the end
+        of the season. Past the season end there is nothing left to pace for and
+        the configured interval applies.
+        """
+        season_end = self._season_end()
+        if reference >= season_end:
+            return season_end
+        month_end = date(
+            reference.year + (reference.month == 12),
+            (reference.month % 12) + 1,
+            1,
+        )
+        return min(season_end, month_end)
 
     def _season_end(self) -> date:
         """The horizon the remaining credit budget is spread over.
@@ -689,6 +716,14 @@ class PollDaemon:
             ),
             repeat_after=timedelta(hours=float(poll_config.get("alert_repeat_hours", 1))),
         )
+        # The PATH, not a loaded snapshot. The backup timer writes this file
+        # while the poller runs for days, so a state cached at startup would go
+        # on alerting after the problem was fixed -- and an alert that stays lit
+        # once the cause is gone is how alerts get muted.
+        self.backup_state_path = self.archive.root / str(
+            settings.section("backup").get("state_file", "backup_state.json")
+        )
+
         self.slate = slate
         if self.slate is None and poll_config.get("completeness_enabled", True):
             try:
@@ -838,6 +873,18 @@ class PollDaemon:
                 send_throttled(self.alerter, self.throttle, alert, now=started)
             if coverage.healthy:
                 self.throttle.clear(f"coverage:{name}")
+
+        # The archive's off-box copy is checked here rather than by the backup
+        # timer: a job that is not running cannot report that it is not running,
+        # and the poller is the process that is always up.
+        for alert in backup_alerts(
+            BackupState.load(self.backup_state_path),
+            now=started,
+            max_age=timedelta(
+                hours=float(self.settings.section("backup").get("max_age_hours", 48))
+            ),
+        ):
+            send_throttled(self.alerter, self.throttle, alert, now=started)
 
         if fingerprint is not None:
             for alert in frozen_alerts(fingerprint, self.states[name].identical_ticks):

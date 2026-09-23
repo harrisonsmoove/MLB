@@ -441,7 +441,14 @@ def test_present_but_not_counted_is_distinguished_from_absent() -> None:
         ["Will the New York Yankees win?", "TOR vs SEA winner"]
     )
 
-    evidence = {e.game.game_pk: e for e in diagnose_coverage("polymarket", [payload], games)}
+    # now= is not optional here. Omitting it makes the test read the wall clock,
+    # and this one silently rotted the moment the fixture games aged past the
+    # quote-close horizon -- it passed for weeks and then failed on a date, not
+    # on a change.
+    evidence = {
+        e.game.game_pk: e
+        for e in diagnose_coverage("polymarket", [payload], games, now=NOW)
+    }
 
     assert evidence[1].matched
     assert not evidence[2].matched and evidence[2].loose_hits
@@ -513,3 +520,29 @@ def test_loose_tokens_include_abbreviations_and_cities() -> None:
     assert "toronto" in tokens      # city
     assert "jays" in tokens         # nickname
     assert "seattlemariners" in tokens
+
+
+def test_the_diagnosis_does_not_depend_on_the_wall_clock() -> None:
+    """Pinned because one of these tests rotted exactly this way.
+
+    `diagnose_coverage` defaults `now` to utcnow(), so a test that omits it
+    passes until its fixture games age past a horizon, then fails on a date
+    rather than on a change. A test that passes in August and fails in
+    September is worse than no test.
+    """
+    from mlb_edge.completeness import diagnose_coverage
+
+    games = _slate_games()
+    payload = _kalshi_markets(["Will the New York Yankees win?"])
+
+    first = diagnose_coverage("polymarket", [payload], games, now=NOW)
+    later = diagnose_coverage(
+        "polymarket", [payload], games, now=NOW + timedelta(days=365)
+    )
+
+    assert [e.diagnosis for e in first] != [e.diagnosis for e in later], (
+        "a year later every game is long finished -- if this is equal, the "
+        "horizon logic is not reading now= at all"
+    )
+    again = diagnose_coverage("polymarket", [payload], games, now=NOW)
+    assert [e.diagnosis for e in first] == [e.diagnosis for e in again]

@@ -397,9 +397,14 @@ def backup_create(
         raise typer.Exit(code=1)
     console.print("[green]verified[/green] every checksum matches")
 
+    state = backup_module.BackupState.load(_backup_state_path(settings))
+    state.record_backup(now=utcnow())
+
     command = str(config.get("push_command") or "").strip()
     if push and command:
         pushed, output = backup_module.push(backup_dir=destination, command=command)
+        state.record_push(now=utcnow(), ok=pushed, error=None if pushed else output)
+        state.save()
         if pushed:
             console.print("[green]pushed off-box[/green]")
         else:
@@ -407,14 +412,67 @@ def backup_create(
             console.print(f"[red]push FAILED[/red] -- this backup is local only\n{output}")
             raise typer.Exit(code=1)
     elif push:
+        # Exit non-zero. This printed yellow and exited 0 for 23 days, so the
+        # systemd timer stayed green while the only irreplaceable asset in the
+        # project existed in exactly one place. `--no-push` is how you say you
+        # meant it; there is no longer a way to mean it by accident.
+        state.save()
         console.print(
-            "[yellow]no push_command configured[/yellow] -- backup is local only, "
-            "which does not survive the droplet dying"
+            "[red]no push_command configured[/red] -- this backup is LOCAL ONLY and "
+            "does not survive the droplet dying.\n"
+            "Set backup.push_command in config/local.yaml (see deploy/README.md), "
+            "or pass --no-push if local-only is deliberate."
         )
+        raise typer.Exit(code=2)
+    else:
+        state.save()
 
     removed = backup_module.prune(backup_root, keep=int(config.get("keep_local", 3)))
     if removed:
         console.print(f"pruned {len(removed)} older local backups")
+
+
+def _backup_state_path(settings: Settings) -> Path:
+    """Beside the archive, so a restart does not reset the clock on it."""
+    archive_root = Path(settings.section("poller").get("archive_dir", "data/poll"))
+    root = archive_root if archive_root.is_absolute() else settings.root / archive_root
+    return root / str(settings.section("backup").get("state_file", "backup_state.json"))
+
+
+@backup_app.command("status")
+def backup_status(root: Annotated[Path | None, typer.Option()] = None) -> None:
+    """When the archive last left this box.
+
+    The only question that matters about a backup. "A backup ran" and "a copy
+    exists somewhere else" are different facts, and only the second one survives
+    the droplet.
+    """
+    from mlb_edge import backup as backup_module
+    from mlb_edge import pollhealth
+
+    settings = load_settings(root)
+    state = backup_module.BackupState.load(_backup_state_path(settings))
+
+    console.print(f"last local backup: {state.last_backup_at or '[red]never[/red]'}")
+    age = state.off_box_age(utcnow())
+    if age is None:
+        console.print("last off-box push: [red]never[/red]")
+    else:
+        console.print(
+            f"last off-box push: {state.last_push_at}  "
+            f"({age.total_seconds() / 3600:.1f}h ago)"
+        )
+    if state.last_push_error:
+        console.print(f"last push error:   [red]{state.last_push_error}[/red]")
+
+    max_age = timedelta(hours=float(settings.section("backup").get("max_age_hours", 48)))
+    alerts = pollhealth.backup_alerts(state, max_age=max_age)
+    if not alerts:
+        console.print("\n[green]OK[/green] a copy exists off this box")
+        return
+    for alert in alerts:
+        console.print(f"\n[red]{alert.subject}[/red]\n{alert.body}")
+    raise typer.Exit(code=1)
 
 
 @backup_app.command("verify")
