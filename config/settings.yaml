@@ -203,8 +203,14 @@ sources:
     base_url: https://baseballsavant.mlb.com
     endpoints:
       search_csv: "/statcast_search/csv"
-    row_cap: 30000          # Savant truncates silently above this
+    # UNVERIFIED -- stated from memory, never probed, and it fails SILENTLY:
+    # a chunk over the real cap comes back short with no error. chunk_days
+    # below is derived from this number and inherits any error in it.
+    row_cap: 30000          # believed: Savant truncates silently above this
     chunk_days: 3           # conservative; a busy day is ~4.5k pitches
+    # UNVERIFIED -- Savant publishes no limit; 20 is this repo's guess. It is
+    # also the number the "eight-hour backfill" estimate rests on, which is
+    # what justified moving the k gate ahead of the backfill.
     rate_limit_per_minute: 20
     # Base query for the CSV export. Kept in config so a parameter rename
     # upstream is a config edit rather than a code change.
@@ -351,6 +357,11 @@ sources:
       orderbook: "/markets/{ticker}/orderbook"
       fee_schedule: "/exchange/schedule"
     series_tickers: [KXMLBGAME, KXMLBWINNER, KXMLBTOTAL]
+    # UNVERIFIED -- probe with `mlb-edge probe-depth --live`. Nothing has
+    # checked this against what Kalshi actually serves, and the cost of it
+    # being low is not recoverable: a snapshot truncated at collection time
+    # stays truncated, there is no historical orderbook endpoint, and realised
+    # depth at the dislocated price is the measurement stage two exists for.
     orderbook_depth: 10
     markets_page_size: 200
     max_pages: 25
@@ -377,6 +388,10 @@ sources:
       source: fetch
       cache_ttl_hours: 24
       allow_hardcoded_fallback: false
+    # UNVERIFIED -- probe with `mlb-edge probe-ratelimit --venue kalshi`.
+    # This bounds the SLOWER leg of the whole gap measurement: at ~200 tickers
+    # a full sweep takes 200s here, so even the configured rate leaves the
+    # 15-minute cadence a factor of four unused.
     rate_limit_per_minute: 60
 
   polymarket:

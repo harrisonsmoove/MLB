@@ -70,11 +70,10 @@ leaves a factor of four unused even at the configured rate.
 
 ### B4. `sources.statcast.rate_limit_per_minute: 20`
 
-Repo-chosen. Baseball Savant publishes no limit. This is the number the
-"eight-hour backfill" estimate rests on — the estimate that justified moving
-the k gate ahead of the backfill in the first place. If the real limit is 60,
-the backfill is under three hours and that sequencing argument was built on an
-invented constraint.
+Repo-chosen; Baseball Savant publishes no limit. Still an invented constraint
+and still deserves a probe — but **the first draft of this entry was wrong
+about why it mattered, and working the arithmetic rather than asserting it is
+what showed that.** Correction in section F.
 
 ### B5. `sources.odds.rate_limit_per_minute: 10`
 
@@ -165,3 +164,53 @@ Proposed addition, in the same spirit:
 `probe-billing` and `probe-ratelimit` are that mechanism for two of them. The
 rest of section B needs the same treatment, and the comment convention is what
 makes the gap visible without another audit.
+
+
+---
+
+## F. B4 worked out, before the probe rather than after
+
+The first draft said this number was what the "eight-hour backfill" estimate
+rested on, and that raising it would collapse the backfill and undermine the
+sequencing decision that put the k gate ahead of it. Computing it says
+otherwise, and the conclusion is recorded now so it cannot be chosen after the
+probe returns a number.
+
+**Step (a), the k-gate path** — `teams, venues, schedule, statcast`, 11 seasons
+at `chunk_days: 3`, about 682 Statcast requests:
+
+| | rate-bound | transfer-bound | effective |
+|---|---|---|---|
+| 20 req/min, 8 s/request | 0.6 h | 1.5 h | **1.5 h** |
+| 20 req/min, 15 s/request | 0.6 h | 2.8 h | **2.8 h** |
+| 60 req/min, 8 s/request | 0.2 h | 1.5 h | **1.5 h** |
+| 60 req/min, 15 s/request | 0.2 h | 2.8 h | **2.8 h** |
+
+**Statcast is transfer-bound, not rate-bound.** Each request returns a large
+CSV, and at 682 requests the rate limit never binds at either 20 or 60. Raising
+it changes step (a) by nothing at all.
+
+So the plain answer to "if the real limit is 60, was the estimate wrong":
+
+1. **The 8-hour figure was never about step (a).** It described step (d), the
+   full backfill including game feeds — one per game, 11 seasons, **26,730
+   requests**. That comes to 3.7–7.4 hours and the original figure was roughly
+   right.
+2. **Step (a) is 1.5–3 hours, not 8.** If anything was overstated it was this,
+   and not because of the rate limit.
+3. **The sequencing decision holds, for a different reason than either of us
+   gave.** Putting the k gate ahead of the full backfill is right because step
+   (d) is 26,730 game feeds, not because Statcast is slow. The conclusion
+   survives; the stated reason does not.
+4. **The real lever on step (a) is `chunk_days`, not the rate limit.** Moving 3
+   to 7 roughly halves it — 292 requests instead of 682. And `chunk_days` is
+   bounded by `row_cap`, which is B2. **So B2 outranks B4**, and the ranking in
+   section D should be read that way.
+
+What the probe is still worth: the limit is unverified either way, and a
+*lower* real limit than 20 would matter — it would make step (a) rate-bound
+after all, in the direction nobody is watching for.
+
+This entry is the audit finding its own error. The original claim was written
+from the same habit it exists to catch: a number asserted from memory with
+nothing in place that would contradict it.

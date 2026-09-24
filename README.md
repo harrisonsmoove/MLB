@@ -240,6 +240,36 @@ pinned by a test.** Examples currently enforced —
 `poller.season_end_date` missing, Telegram unconfigured, Kalshi auth
 half-configured, a page-limit bound being hit, a backup that never left the box.
 
+### Standing rule: a number about someone else's system carries its provenance
+
+The rule above catches paths that announce themselves *because something went
+wrong*. There is a second class that never goes wrong, and so never announces
+anything: **a config value asserting a fact about an external system, written
+from memory, that the code then obeys as though the venue imposed it.**
+
+Two of these were found by looking, not by failing. `tier: 0` restricted the
+odds request to `h2h` for 25 days on a plan that paid for more.
+`monthly_request_budget: 500` described a 20,000-credit plan, making every
+resolution figure in two reports forty times too pessimistic. Neither was ever
+wrong in a way the code could see — obeying them *is* the code's job.
+
+So: **any config value that asserts a fact about an external system carries how
+it was established — `# measured <date>` or `# UNVERIFIED` — and anything
+UNVERIFIED has a probe command that exists.**
+
+The provenance comment goes in when the number is written, not in a later
+sweep. A sweep only finds what someone thought to look for; `reports/invented-constraints.md`
+is the one that was done, and section B is what it still has open.
+
+Probes currently shipping:
+
+| Command | Settles |
+|---|---|
+| `mlb-edge probe-billing` | credits per call, and the real plan size |
+| `mlb-edge probe-ratelimit` | the request rate a venue actually allows |
+| `mlb-edge probe-depth` | orderbook levels served, and what the cap has already cost |
+| `mlb-edge probe-hydrate` | which StatsAPI hydrate terms are still accepted |
+
 
 ## Rebuilding from cache
 

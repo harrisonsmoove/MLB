@@ -605,3 +605,41 @@ def test_codes_for_covers_every_alias_of_both_teams() -> None:
     codes = codes_for(_game(1, "Athletics", "Arizona Diamondbacks", SEP2))
     assert {"ATH", "OAK", "AS"} <= codes
     assert {"AZ", "ARI"} <= codes
+
+
+# --- orderbook depth: a repo-chosen cap on an irreplaceable archive --------
+
+
+def test_level_counting_reads_both_sides() -> None:
+    from mlb_edge.cli import _orderbook_levels
+
+    payload = '{"orderbook":{"yes":[[50,10],[49,20],[48,5]],"no":[[51,8]]}}'
+    assert _orderbook_levels(payload) == (3, 1)
+
+
+def test_level_counting_survives_junk() -> None:
+    """A malformed payload must not stop the scan; it is one row of many."""
+    from mlb_edge.cli import _orderbook_levels
+
+    assert _orderbook_levels("{not json") is None
+    assert _orderbook_levels('{"no_orderbook_here":1}') is None
+    assert _orderbook_levels('{"orderbook":{"yes":null,"no":null}}') == (0, 0)
+
+
+def test_a_snapshot_at_the_cap_is_distinguishable_from_one_below_it() -> None:
+    """The whole basis of the archive scan.
+
+    A book sitting at exactly the configured depth was cut off there. One
+    sitting below it was not. That difference is what says whether anything has
+    already been permanently lost, and it needs no network to measure.
+    """
+    import json
+
+    from mlb_edge.cli import _orderbook_levels
+
+    levels = json.dumps([[50 - i, 10] for i in range(10)])
+    capped = '{"orderbook":{"yes":' + levels + ',"no":[[1,1]]}}'
+    shallow = '{"orderbook":{"yes":[[50,10],[49,5]],"no":[[51,3]]}}'
+
+    assert max(_orderbook_levels(capped)) == 10
+    assert max(_orderbook_levels(shallow)) == 2

@@ -1446,6 +1446,176 @@ def probe_ratelimit(
     )
 
 
+def _orderbook_levels(payload: str) -> tuple[int, int] | None:
+    """``(yes levels, no levels)`` in a Kalshi orderbook payload."""
+    import json as _json
+
+    try:
+        data = _json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    book = data.get("orderbook") if isinstance(data, dict) else None
+    if not isinstance(book, dict):
+        return None
+
+    def count(side: Any) -> int:
+        return len(side) if isinstance(side, list) else 0
+
+    return count(book.get("yes")), count(book.get("no"))
+
+
+@app.command(name="probe-depth")
+def probe_depth(
+    depth: Annotated[int, typer.Option(help="Depth to request when probing live.")] = 100,
+    live: Annotated[bool, typer.Option(help="Also ask Kalshi what it serves.")] = False,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """How many orderbook levels Kalshi serves, versus the ten we ask for.
+
+    `orderbook_depth: 10` is a number this repo chose. Nothing has ever checked
+    it against what Kalshi returns, and the consequence is not recoverable: the
+    poll archive has no historical endpoint, stage two's binding measurement is
+    realised depth at the dislocated price, and a snapshot truncated at
+    collection time is truncated for good.
+
+    Two halves. The archive scan needs no network and quantifies what has
+    already been taken: a snapshot sitting at exactly the configured depth was
+    cut off there, and one sitting below it was not. The live half asks Kalshi
+    directly.
+    """
+    import polars as pl
+
+    from mlb_edge.poll import PollArchive
+
+    settings = load_settings(root)
+    configured = int(settings.source("kalshi").get("orderbook_depth", 10))
+    console.print(f"configured orderbook_depth: [bold]{configured}[/bold]\n")
+
+    # --- what the archive already holds ------------------------------------
+    poller_config = settings.section("poller")
+    archive_root = Path(poller_config.get("archive_dir", "data/poll"))
+    archive = PollArchive(
+        archive_root if archive_root.is_absolute() else settings.root / archive_root
+    )
+    files = archive.files("kalshi")
+    if not files:
+        console.print("[yellow]no kalshi archive to scan[/yellow]")
+    else:
+        from collections import Counter
+
+        levels: Counter[int] = Counter()
+        books = 0
+        for path in files[-60:]:            # a couple of days is plenty
+            frame = pl.read_parquet(path, columns=["endpoint", "payload"])
+            for endpoint, payload in zip(
+                frame["endpoint"].to_list(), frame["payload"].to_list(), strict=False
+            ):
+                if endpoint != "orderbook" or not payload:
+                    continue
+                counted = _orderbook_levels(payload)
+                if counted is None:
+                    continue
+                books += 1
+                levels[max(counted)] += 1
+
+        saturated = sum(n for lv, n in levels.items() if lv >= configured)
+        console.print(f"archive: {books:,} orderbook snapshots over {len(files[-60:])} ticks")
+        table = Table(title="levels per snapshot (deepest side)")
+        table.add_column("levels", justify="right")
+        table.add_column("snapshots", justify="right")
+        table.add_column("share", justify="right")
+        for lv in sorted(levels):
+            share = levels[lv] / books * 100 if books else 0
+            mark = "  <- at the cap" if lv >= configured else ""
+            table.add_row(f"{lv}{mark}", f"{levels[lv]:,}", f"{share:.1f}%")
+        console.print(table)
+        if books:
+            pct = saturated / books * 100
+            console.print(
+                f"\n[bold]{saturated:,} of {books:,} snapshots ({pct:.1f}%) sit at "
+                f"the configured depth.[/bold]"
+            )
+            if pct > 5:
+                console.print(
+                    "[red]Those were cut off at collection time.[/red] Whatever "
+                    "depth existed beyond level "
+                    f"{configured} is not in the archive and cannot be fetched back."
+                )
+            else:
+                console.print(
+                    "[green]Few snapshots reach the cap[/green], so the books are "
+                    "mostly shallower than the limit and little has been lost -- "
+                    "but the live check below still decides whether the cap binds."
+                )
+
+    if not live:
+        console.print(
+            "\n[yellow]archive scan only.[/yellow] Re-run with --live to ask "
+            "Kalshi what it actually serves."
+        )
+        return
+
+    # --- what Kalshi actually serves ---------------------------------------
+    from mlb_edge.poll import KalshiPoller
+
+    poller = KalshiPoller(settings)
+    records = poller.poll()
+    tickers = [r.key for r in records if r.endpoint == "orderbook" and not r.error][:5]
+    if not tickers:
+        console.print("[red]no orderbooks returned; cannot probe live depth[/red]")
+        raise typer.Exit(1)
+
+    config = settings.source("kalshi")
+    path_template = (config.get("endpoints") or {})["orderbook"]
+    comparison = Table(title=f"levels returned: depth={configured} vs depth={depth}")
+    comparison.add_column("ticker")
+    comparison.add_column(f"at {configured}", justify="right")
+    comparison.add_column(f"at {depth}", justify="right")
+    comparison.add_column("verdict")
+
+    deeper = 0
+    for ticker in tickers:
+        path = path_template.format(ticker=ticker)
+        url = f"{config.base_url}{path}"
+        counts = []
+        for requested in (configured, depth):
+            try:
+                response = poller._client.get(
+                    url, params={"depth": requested}, headers=poller._headers(path)
+                )
+                got = _orderbook_levels(response.text())
+                counts.append(max(got) if got else 0)
+            except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+                counts.append(-1)
+                console.print(f"[dim]{ticker}: {exc}[/dim]")
+        shallow, deep = counts
+        if deep > shallow:
+            deeper += 1
+            verdict = f"[red]TRUNCATING -- {deep - shallow} levels lost per snapshot[/red]"
+        elif deep == shallow and shallow < configured:
+            verdict = "[dim]book shallower than the cap; inconclusive[/dim]"
+        else:
+            verdict = "[green]cap is not binding[/green]"
+        comparison.add_row(ticker or "-", str(shallow), str(deep), verdict)
+    console.print(comparison)
+
+    if deeper:
+        console.print(
+            f"\n[bold red]orderbook_depth: {configured} is truncating "
+            f"{deeper} of {len(tickers)} books.[/bold red]\n"
+            f"Raise it, and understand that every snapshot archived so far is "
+            "capped at the old value permanently. Tier 0 has no historical "
+            "orderbook endpoint; the depth beyond that cap was never recorded "
+            "and cannot be bought."
+        )
+        raise typer.Exit(1)
+    console.print(
+        "\n[green]No book returned more levels than the cap allows.[/green] "
+        "Either the cap is above what these books hold, or Kalshi itself caps "
+        "here. Re-run against a busier slate before treating it as settled."
+    )
+
+
 @app.command(name="poll-sources")
 def poll_sources(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Which venues the poller would actually poll, and why the others are out.
