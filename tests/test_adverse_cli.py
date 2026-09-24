@@ -39,12 +39,12 @@ def _write(root: Path, venue: str, day: str, name: str, rows: list[dict]) -> Non
     pl.DataFrame(rows).write_parquet(folder / f"{venue}-{name}.parquet")
 
 
-def _odds_payload(stamp: datetime) -> str:
+def _odds_payload(start: datetime) -> str:
     return json.dumps([{
-        "id": "abc123",
+        "id": f"abc{start:%m%d}",
         "home_team": "Toronto Blue Jays",
         "away_team": "Baltimore Orioles",
-        "commence_time": FIRST_PITCH.isoformat().replace("+00:00", "Z"),
+        "commence_time": start.isoformat().replace("+00:00", "Z"),
         "bookmakers": [{
             "key": "pinnacle",
             "markets": [{"key": "h2h", "outcomes": [
@@ -63,17 +63,25 @@ def _book(yes: float) -> str:
     }})
 
 
-def _build(base: Path, side: str, yes_mid: float) -> None:
-    """One matchup, six ticks, with the ticker's YES side set to ``side``."""
+def _build(
+    base: Path,
+    side: str,
+    yes_mid: float,
+    *,
+    start: datetime = FIRST_PITCH,
+    ticker_date: str = "26SEP23",
+    tag: str = "a",
+) -> None:
+    """One game, six ticks, with the ticker's YES side set to ``side``."""
     root = base / "poll"
-    ticker = f"KXMLBGAME-26SEP231905TORBAL-{side}"
+    ticker = f"KXMLBGAME-{ticker_date}1905TORBAL-{side}"
     for index in range(6):
-        stamp = FIRST_PITCH - timedelta(minutes=90 - index * 15)
+        stamp = start - timedelta(minutes=90 - index * 15)
         day = stamp.date().isoformat()
-        _write(root, "odds", day, f"{index:02d}", [{
-            "payload": _odds_payload(stamp), "error": None, "fetched_at": stamp,
+        _write(root, "odds", day, f"{tag}{index:02d}", [{
+            "payload": _odds_payload(start), "error": None, "fetched_at": stamp,
         }])
-        _write(root, "kalshi", day, f"{index:02d}", [{
+        _write(root, "kalshi", day, f"{tag}{index:02d}", [{
             "endpoint": "orderbook", "key": ticker, "payload": _book(yes_mid),
             "error": None, "fetched_at": stamp,
         }])
@@ -155,3 +163,45 @@ def test_the_dump_prints_one_record_end_to_end(archive: Path) -> None:
         assert field in output, f"{field!r} missing from the dump"
     assert "KXMLBGAME-26SEP231905TORBAL-BAL" in output
     assert "Baltimore Orioles" in output
+
+
+# --- one matchup is not one game -------------------------------------------
+
+
+def test_a_rematch_is_a_separate_game(archive: Path) -> None:
+    """The third defect: the same two teams meet again a week later.
+
+    Both legs were keyed on the team pair alone, with no date. Every meeting
+    between two teams in the archive collapsed onto one key -- one first
+    pitch, one close, one merged price series standing for three or four games
+    a week. Here the 23rd agrees and the 30th is 12 points off. Merged, the
+    30th's quotes all fall after the 23rd's first pitch and vanish as
+    "in-play"; separated, its gaps are found.
+    """
+    base = archive / "rematch"
+    later = FIRST_PITCH + timedelta(days=7)
+    _build(base, "BAL", 1.0 - TORONTO_FAIR, tag="a")
+    _build(
+        base, "BAL", 1.0 - TORONTO_FAIR - 0.12,
+        start=later, ticker_date="26SEP30", tag="b",
+    )
+
+    output = _run(base, dump=2, dump_min=0.05)
+
+    assert "2 joined on both venues" in output, output
+    assert "qualifying gaps above the floor: 0" not in output
+    # The gaps must come from the second meeting, not the first.
+    assert "KXMLBGAME-26SEP301905TORBAL-BAL" in output
+    assert "KXMLBGAME-26SEP231905TORBAL-BAL" not in output
+
+
+def test_both_meetings_are_counted_as_games(archive: Path) -> None:
+    base = archive / "twogames"
+    _build(base, "TOR", TORONTO_FAIR, tag="a")
+    _build(
+        base, "TOR", TORONTO_FAIR,
+        start=FIRST_PITCH + timedelta(days=7), ticker_date="26SEP30", tag="b",
+    )
+    output = _run(base)
+    assert "2 joined on both venues" in output, output
+    assert "qualifying gaps above the floor: 0" in output

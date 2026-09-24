@@ -270,6 +270,42 @@ Probes currently shipping:
 | `mlb-edge probe-depth` | orderbook levels served, and what the cap has already cost |
 | `mlb-edge probe-hydrate` | which StatsAPI hydrate terms are still accepted |
 
+### Standing rule: any price carries what it is the probability of
+
+The first two rules are about things the code cannot see going wrong. This one
+is about a number that is *correct* and still gets read against the wrong
+thing: **a bare probability has two possible referents on a binary market, and
+sooner or later it is compared against the other one.**
+
+The adverse-selection study reported 303,372 gaps averaging 20 percentage
+points and a verdict that passed. Kalshi tickers name which team the YES side
+pays on (`...TORBAL-BAL`); the study stored each mid under a key built from
+`sorted(teams)`, which by construction discards that, and compared it against
+the devigged **home** probability. Whenever a ticker's YES side was the away
+team the comparison was wrong by exactly `1 − 2p` — twenty points on a 60/40
+game, in the direction that looks like an edge.
+
+`sorted(teams)` was not a mistake. It was correct for what it was written
+for — matching a matchup across two venues, where the order carries no
+information. It got reused for the one thing it throws away.
+
+So: **any price carries what it is the probability of, and any comparison
+between two prices states the team it is stated in terms of.** `Quote.team`
+is not decoration; `orient()` is the only sanctioned way to line two prices
+up, and it **refuses** — counted and printed — rather than guessing when
+either referent is unknown. Half of those guesses would be backwards, and the
+error is largest at the coin flip, which is exactly where the money is.
+
+The same defect has a sibling in keys: **a matchup is not a game.** The same
+two teams meet three or four times a week. `_pair_key` is documented as unfit
+for joining two venues game by game, and the study now joins on the Kalshi
+event ticker and an exact start time, refusing doubleheaders it cannot
+separate. This is the `game_pk` rule again, one level down.
+
+`reports/adverse-selection.md` has the full postmortem. Seven tests in
+`tests/test_adverse.py` and six in `tests/test_adverse_cli.py` fail if either
+defect is reintroduced — verified by reintroducing them.
+
 
 ## Rebuilding from cache
 

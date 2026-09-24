@@ -1840,6 +1840,152 @@ def _available_mb() -> float:
 
 
 @app.command(name="adverse-selection")
+@app.command("probe-inplay")
+def probe_inplay(
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Does the odds feed carry prices after first pitch?
+
+    Settles a structural question with the archive already on disk: whether the
+    market-vs-market trade can ever operate in-play, or is pre-game only by
+    construction. Reads no network and costs nothing.
+
+    Three outcomes, and they mean different things:
+
+    * **The event vanishes from the feed at first pitch.** The trade is
+      pre-game only. Kalshi's in-play board stays recorded but has no
+      reference price, and only a model can supply one.
+    * **The event stays but the sharp book drops out.** Same conclusion for
+      that book; a different book may still quote, at a different price
+      quality.
+    * **In-play quotes exist.** The limit is not structural, and the question
+      becomes what the alignment term costs when a line moves on every pitch.
+    """
+    import json as _json
+    from collections import defaultdict
+
+    import polars as pl
+
+    from mlb_edge.poll import PollArchive
+    from mlb_edge.timeutil import parse_iso_utc
+
+    settings = load_settings(root)
+    poller_config = settings.section("poller")
+    archive_root = Path(poller_config.get("archive_dir", "data/poll"))
+    archive = PollArchive(
+        archive_root if archive_root.is_absolute() else settings.root / archive_root
+    )
+
+    events_seen = 0
+    events_after = 0
+    latest_by_book: dict[str, float] = defaultdict(float)
+    quotes_after: dict[str, int] = defaultdict(int)
+    quotes_before: dict[str, int] = defaultdict(int)
+    max_minutes = 0.0
+
+    files = archive.files("odds")
+    if not files:
+        console.print("[red]no odds files in the archive.[/red]")
+        raise typer.Exit(1)
+
+    for number, path in enumerate(files, 1):
+        frame = pl.read_parquet(path, columns=["payload", "error", "fetched_at"])
+        for payload, error, at in zip(
+            frame["payload"].to_list(), frame["error"].to_list(),
+            frame["fetched_at"].to_list(), strict=False,
+        ):
+            if error or not payload:
+                continue
+            try:
+                events = _json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                raw = event.get("commence_time")
+                if not raw:
+                    continue
+                try:
+                    start = parse_iso_utc(str(raw))
+                except (ValueError, TypeError):
+                    continue
+                events_seen += 1
+                minutes = (at - start).total_seconds() / 60.0
+                after = minutes > 0
+                if after:
+                    events_after += 1
+                    max_minutes = max(max_minutes, minutes)
+                for bookmaker in event.get("bookmakers") or []:
+                    if not isinstance(bookmaker, dict):
+                        continue
+                    key = str(bookmaker.get("key"))
+                    if not any(
+                        isinstance(m, dict) and m.get("key") == "h2h"
+                        for m in bookmaker.get("markets") or []
+                    ):
+                        continue
+                    if after:
+                        quotes_after[key] += 1
+                        latest_by_book[key] = max(latest_by_book[key], minutes)
+                    else:
+                        quotes_before[key] += 1
+        if number % 100 == 0 or number == len(files):
+            console.print(f"  {number:,}/{len(files):,} files", highlight=False)
+
+    console.print(
+        f"\nevent rows: [bold]{events_seen:,}[/bold]   "
+        f"after first pitch: [bold]{events_after:,}[/bold] "
+        f"({events_after / events_seen * 100:.1f}%)" if events_seen else "no events"
+    )
+    if events_after:
+        console.print(
+            f"latest an event was seen: [bold]{max_minutes:.0f} minutes[/bold] "
+            "past its commence_time"
+        )
+
+    table = Table(title="h2h quotes before and after first pitch, by book")
+    for column in ("book", "before", "after", "latest (min)", "reading"):
+        table.add_column(column, justify="right" if column != "book" else "left")
+    for book in sorted(set(quotes_before) | set(quotes_after)):
+        after = quotes_after.get(book, 0)
+        reading = (
+            "[green]quotes in-play[/green]" if after
+            else "[yellow]pre-match only[/yellow]"
+        )
+        table.add_row(
+            book, f"{quotes_before.get(book, 0):,}", f"{after:,}",
+            f"{latest_by_book.get(book, 0.0):.0f}" if after else "-", reading,
+        )
+    console.print(table)
+
+    if not events_after:
+        console.print(
+            "\n[bold]The feed drops an event at first pitch.[/bold] The "
+            "market-vs-market trade is pre-game only, structurally. Kalshi's "
+            "in-play board keeps recording, but nothing in this archive can "
+            "price it -- only a model can."
+        )
+    elif not quotes_after:
+        console.print(
+            "\n[bold]Events survive first pitch but no book quotes h2h "
+            "in-play.[/bold] Same conclusion, different mechanism."
+        )
+    else:
+        console.print(
+            "\n[bold]In-play quotes exist.[/bold] The limit is not structural. "
+            "The open question is the alignment term: a line that moves on "
+            "every pitch is far staler at a given cadence than a pre-game one."
+        )
+    console.print(
+        "\nRecord the answer in reports/odds-feed-pricing.md with today's "
+        "date, per the provenance rule."
+    )
+
+
+@app.command("adverse-selection")
 def adverse_selection(
     reference: Annotated[str, typer.Option(help="Sharp book to price against.")] = "pinnacle",
     half_spread: Annotated[float, typer.Option(help="Half the Kalshi spread, in probability.")] = 0.01,
@@ -1884,7 +2030,7 @@ def adverse_selection(
         sharp_fair,
         summarise,
     )
-    from mlb_edge.kalshi_tickers import canonical_name, parse_ticker
+    from mlb_edge.kalshi_tickers import canonical_name, join_tickers, parse_ticker
     from mlb_edge.market.devig import devig_all
     from mlb_edge.market.prices import american_to_prob
     from mlb_edge.poll import PollArchive
@@ -1928,7 +2074,9 @@ def adverse_selection(
 
     try:
         # --- pass one: parse every row to four columns and spill -----------
-        first_pitch: dict[str, Any] = {}
+        games: dict[str, _OddsGame] = {}
+        undated = 0
+        after_first_pitch = 0
         buffer: list[dict[str, Any]] = []
         files = archive.files("odds")
         for number, path in enumerate(files, 1):
@@ -1960,8 +2108,25 @@ def adverse_selection(
                     if not fair:
                         continue
                     pair = _pair_key(str(home), str(away), canonical_name)
+                    raw = event.get("commence_time")
+                    start = None
+                    if raw:
+                        with contextlib.suppress(ValueError, TypeError):
+                            start = parse_iso_utc(str(raw))
+                    if start is None:
+                        # Without a start time this row cannot be attached to a
+                        # game, and the matchup alone is not a game: these two
+                        # teams meet three or four times in a week.
+                        undated += 1
+                        continue
+                    key = f"{pair}|{start.isoformat()}"
+                    if key not in games:
+                        games[key] = _OddsGame(
+                            game_pk=len(games), home_team=str(home),
+                            away_team=str(away), start_ts=start,
+                        )
                     buffer.append({
-                        "pair": pair, "at": at,
+                        "pair": key, "at": at,
                         "price": fair.get("shin", next(iter(fair.values()))),
                         # The devigged price is the probability of the HOME
                         # team. Recording whose it is turns a comparison that
@@ -1971,10 +2136,8 @@ def adverse_selection(
                         "home": str(home), "away": str(away),
                         "raw_home": prices[0], "raw_away": prices[1],
                     })
-                    raw = event.get("commence_time")
-                    if raw and pair not in first_pitch:
-                        with contextlib.suppress(ValueError, TypeError):
-                            first_pitch[pair] = parse_iso_utc(str(raw))
+                    if at > start:
+                        after_first_pitch += 1
             if len(buffer) >= flush_rows:
                 spill(buffer, "sharp")
             if number % 50 == 0 or number == len(files):
@@ -1994,6 +2157,7 @@ def adverse_selection(
 
         files = archive.files("kalshi")
         unsided: dict[str, int] = {}
+        event_tickers: set[str] = set()
         for number, path in enumerate(files, 1):
             frame = pl.read_parquet(
                 path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
@@ -2023,8 +2187,11 @@ def adverse_selection(
                         unsided.get(parsed.side_code or "(none)", 0) + 1
                     )
                     continue
+                event_tickers.add(parsed.event_ticker)
                 buffer.append({
-                    "pair": _pair_key(*sorted(parsed.teams), canonical_name),
+                    # The event ticker IS the game -- date and start time
+                    # included. The team pair is not: it repeats every series.
+                    "pair": parsed.event_ticker,
                     "at": at, "price": mid, "team": side,
                     "ticker": str(key),
                     "best_yes": max(price for price, _ in pairs[0]),
@@ -2058,24 +2225,67 @@ def adverse_selection(
 
         sharp_scan = pl.scan_parquet(sharp_files)
         kalshi_scan = pl.scan_parquet(kalshi_files)
-        pairs = sorted(
-            set(sharp_scan.select("pair").unique().collect()["pair"].to_list())
-            & set(kalshi_scan.select("pair").unique().collect()["pair"].to_list())
+
+        # Join GAME to GAME. The previous version keyed both sides on the team
+        # pair alone, which merged every meeting between two teams in the
+        # archive into a single series -- three or four games a week, with one
+        # first pitch and one close standing for all of them. join_tickers
+        # already separates games, doubleheaders included, and refuses the ones
+        # it cannot tell apart.
+        join = join_tickers(sorted(event_tickers), list(games.values()))
+        by_pk = {game.game_pk: key for key, game in games.items()}
+        matched = [
+            (by_pk[pk], ticker, games[by_pk[pk]].start_ts)
+            for pk, ticker in join.matched.items()
+            if pk in by_pk
+        ]
+        matched.sort()
+
+        console.print(
+            f"\ngames: [bold]{len(matched):,}[/bold] joined on both venues "
+            f"({len(games):,} priced by {reference}, "
+            f"{len(event_tickers):,} on the Kalshi board)"
         )
-        console.print(f"\nmatchups on both venues: [bold]{len(pairs):,}[/bold]")
+        if join.clock_offset_minutes is not None:
+            console.print(
+                f"  [dim]ticker clock offset inferred: "
+                f"{join.clock_offset_minutes} minutes from UTC[/dim]"
+            )
+        if join.ambiguous:
+            console.print(
+                f"  [yellow]{len(join.ambiguous)} game(s) refused as ambiguous"
+                "[/yellow] -- doubleheaders the clock could not separate. "
+                "Refused rather than guessed."
+            )
+        if join.unlisted:
+            console.print(
+                f"  [dim]{len(join.unlisted)} game(s) the Kalshi board does not "
+                "list[/dim]"
+            )
+        if undated:
+            console.print(
+                f"  [yellow]{undated:,} odds rows had no commence_time[/yellow] "
+                "and could not be attached to a game."
+            )
+        if not matched:
+            console.print(
+                "[red]no games joined on both venues.[/red] The ticker clock "
+                "offset or the team aliases are the place to look."
+            )
+            raise typer.Exit(1)
 
         # --- pass two: one matchup at a time -------------------------------
         gaps: list[Any] = []
         counts = ScanCounts()
         paired = 0
-        for number, pair in enumerate(pairs, 1):
+        for number, (pair, event_ticker, start) in enumerate(matched, 1):
             sharp_rows = (
                 sharp_scan.filter(pl.col("pair") == pair)
                 .select(["at", "price", "team", "home", "away", "raw_home", "raw_away"])
                 .collect()
             )
             kalshi_rows = (
-                kalshi_scan.filter(pl.col("pair") == pair)
+                kalshi_scan.filter(pl.col("pair") == event_ticker)
                 .select(["at", "price", "team", "ticker", "best_yes", "best_no"])
                 .collect()
             )
@@ -2094,11 +2304,6 @@ def adverse_selection(
                 for row in kalshi_rows.iter_rows(named=True)
             ]
             paired += len(kalshi_quotes)
-            start = first_pitch.get(pair) or (
-                max(q.at for q in kalshi_quotes) if kalshi_quotes else None
-            )
-            if start is None:
-                continue
             found = find_gaps(
                 kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
                 half_spread=half_spread, alignment=alignment,
@@ -2108,9 +2313,9 @@ def adverse_selection(
             attach_outcomes(found, kalshi_quotes, first_pitch=start)
             gaps.extend(found)
             del sharp_quotes, kalshi_quotes, sharp_rows, kalshi_rows
-            if number % 20 == 0 or number == len(pairs):
+            if number % 20 == 0 or number == len(matched):
                 console.print(
-                    f"  matchup {number:,}/{len(pairs):,}   "
+                    f"  game {number:,}/{len(matched):,}   "
                     f"{paired:,} quotes paired   {len(gaps):,} gaps   "
                     f"+{grown_mb():.0f} MB", highlight=False
                 )
@@ -2139,6 +2344,17 @@ def adverse_selection(
             "  A quote with no resolvable side has no referent. Comparing it "
             "anyway is wrong by 1-2p on half of them.\n"
         )
+
+    total_sharp = after_first_pitch
+    console.print(
+        f"sharp quotes observed AFTER first pitch: [bold]{total_sharp:,}[/bold]"
+    )
+    console.print(
+        "  [dim]This is the measurement, not an assumption: if the sharp feed "
+        "carried in-play prices there would be many. Near zero means the feed "
+        "is pre-match only, and the market-vs-market trade is pre-game only. "
+        "See reports/odds-feed-pricing.md.[/dim]\n"
+    )
 
     console.print("quotes excluded, by reason:")
     console.print(f"  {counts.line()}")
@@ -2234,8 +2450,27 @@ def _dump_gaps(
         console.print()
 
 
+@dataclass(frozen=True)
+class _OddsGame:
+    """One game as the odds feed describes it, shaped for ``join_tickers``.
+
+    ``game_pk`` here is a local index, not a StatsAPI id -- the joiner only
+    needs something hashable to key its result on. The real identity is
+    ``(teams, start_ts)``.
+    """
+
+    game_pk: int
+    home_team: str
+    away_team: str
+    start_ts: Any
+
+
 def _pair_key(home: str, away: str, canonical: Any) -> str:
-    """A stable string key for an unordered matchup."""
+    """A stable string key for an unordered matchup.
+
+    NOT a game key. The same two teams meet three or four times in a series.
+    Use it to group a matchup; never to join two venues game by game.
+    """
     return "|".join(sorted({canonical(home), canonical(away)}))
 
 

@@ -269,3 +269,99 @@ Proposed as a third standing rule:
 > **Any price carries what it is the probability of.** A bare number with two
 > possible referents will eventually be read against the wrong one, and on a
 > binary market the error is `1 − 2p` — largest exactly where the money is.
+
+---
+
+# Correction, same day: the n-drop explanation above is wrong
+
+The section above attributes the drop from 302,793 to 97,061 to in-play
+contamination. **That explanation does not survive checking, and the premise
+under it was never measured.** Both are corrected here rather than edited
+away, because the reasoning error is the useful part.
+
+## The arithmetic that breaks it
+
+`find_gaps` pairs each Kalshi quote with the most recent sharp quote at or
+before it, and drops the pair when that quote is more than 30 minutes old. If
+the sharp feed really were pre-match only, its last quote for a game would
+stand at first pitch and the staleness filter would cut every Kalshi quote
+more than 30 minutes into the game. A baseball game is about three hours. So
+pre-match-only feed plus 30-minute staleness bounds in-play contamination at
+roughly a sixth of a game — nowhere near two thirds of the sample.
+
+The two claims are inconsistent with each other. I did not notice because each
+one sounded right on its own.
+
+## Defect 3: a matchup is not a game
+
+The real mechanism. Both legs were keyed on `_pair_key`, built from
+`sorted({canonical(home), canonical(away)})` — **no date, no start time**.
+Toronto and Baltimore meet three or four times in a series and a dozen times a
+season. Every one of those meetings collapsed onto one key:
+
+```
+KXMLBGAME-26SEP231905TORBAL-BAL  ->  Baltimore Orioles|Toronto Blue Jays
+KXMLBGAME-26SEP301905TORBAL-BAL  ->  Baltimore Orioles|Toronto Blue Jays
+                                     same key
+```
+
+One merged price series per team pair, with **one** first pitch and **one**
+close standing for every meeting in the archive. And `first_pitch` was
+populated with `if raw and pair not in first_pitch` — the *earliest* game
+seen for that pair.
+
+The n drop falls straight out. The close is the last Kalshi quote at or before
+that earliest first pitch, and is assigned only when `closing_at > gap.at`. So
+**only gaps occurring before the first meeting's first pitch got a close.**
+Everything from the second meeting onward — days or weeks of quotes — got
+none. For a pair with markets opening a day or so ahead and three or four
+meetings inside the archive, the share of quotes falling before that first
+first-pitch lands around a quarter to a third. Observed: 97,061/302,793 = 32%.
+
+This is the `game_pk` rule one level down. The rule was already written for
+doubleheaders — never key on `(date, home, away)` — and this key does not even
+carry the date.
+
+`_pair_key` was not a bug. It was correct for grouping a matchup, which is
+what it was written for. It was reused for a game-by-game join, which needs
+the exact thing it discards. Same shape as the side inversion: the second
+reuse of a correct abstraction, in a place that needed what it threw away.
+
+**Fix.** The study now joins game to game. The sharp leg keys on
+`pair|commence_time`; the Kalshi leg keys on `ParsedTicker.event_ticker`,
+which carries the date and start time. The two are joined by `join_tickers`,
+which was already written to separate doubleheaders by inferring the ticker
+clock offset, and which refuses the ones it cannot tell apart. The run now
+prints games joined, games refused as ambiguous, and games the board does not
+list.
+
+## What is still unverified
+
+Whether the feed carries in-play prices at all is **not established**. I
+asserted it. It is measurable from the archive already on disk:
+
+```bash
+mlb-edge probe-inplay
+```
+
+See `reports/odds-feed-pricing.md` for what each outcome implies. The
+adverse-selection run also prints `sharp quotes observed AFTER first pitch`
+before any verdict, so the fact is visible on every run.
+
+The pre-game filter stays on regardless. It is correct whether or not the feed
+carries in-play, because differencing a Kalshi in-play price against a sharp
+quote of unknown freshness is not a measurement of anything — and with the
+exclusions now printed, its cost is visible rather than silent.
+
+## Three defects, one shape
+
+| | What was reused | What it discarded |
+|---|---|---|
+| Side inversion | `sorted(teams)` as a price key | which team the price is *of* |
+| Matchup collision | `sorted(teams)` as a game key | which *meeting* it is |
+| In-play | — | whether the reference was still live |
+
+The first two are the same line of code, reused twice for jobs that each
+needed one of the two things it drops. The standing rule now in the README
+covers the first. The second is the `game_pk` rule, which already existed and
+which I did not apply here.

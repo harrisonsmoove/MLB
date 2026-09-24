@@ -392,3 +392,90 @@ reseller staying alive, which after July 2025 counts for something.
 
 Confirm every price in section 2 before spending anything. I could not reach a
 single vendor's pricing page from here.
+
+---
+
+# Structural limit: can this trade ever operate in-play?
+
+**Status: UNVERIFIED as of 2026-09-24. Probe: `mlb-edge probe-inplay`.**
+
+This section exists because I asserted the answer before measuring it. On
+2026-09-24 I told you the tier-0 h2h feed is "pre-match only" and built an
+explanation of a sample-size drop on top of it. That was an assertion from
+memory about someone else's system, which is precisely what the provenance
+rule forbids. It is recorded here as unverified until the probe runs.
+
+## The question
+
+If the odds feed stops quoting a game at first pitch, then the
+market-vs-market trade — Kalshi against a sharp consensus — is **pre-game
+only by construction**, for as long as that feed is the reference. It is not a
+tuning parameter or a coverage gap that more polling fixes.
+
+## What the probe distinguishes
+
+`mlb-edge probe-inplay` reads the archive already on disk, costs nothing, and
+separates three outcomes that have different consequences:
+
+| Outcome | Meaning |
+|---|---|
+| The event disappears from the feed at first pitch | Pre-game only, structurally. |
+| The event survives but no book quotes h2h | Pre-game only for those books. Another book might not be. |
+| In-play quotes exist | Not a structural limit. The binding constraint moves to the alignment term. |
+
+The adverse-selection run also now prints `sharp quotes observed AFTER first
+pitch` before any verdict, so the same fact is visible on every run rather
+than only when someone goes looking.
+
+## If it comes back pre-match only
+
+Three things follow, and the first two are worth separating because they are
+usually run together.
+
+**1. The board is not invisible. It is unpriced.** We hold 464,917 Kalshi
+orderbook rows, in-play ones included, and the poller keeps adding them. What
+is missing is a *reference price*, not data. The archive keeps accruing value
+against a reference that does not exist yet, which is a much better position
+than not recording it.
+
+**2. A reference price does not have to be another market.** In-play win
+probability from game state is exactly what a game simulator produces, and
+in-play WP is **far more tractable than pre-game WP**, not less. Pre-game
+requires projecting eighteen hitters and two starters through nine innings —
+the whole projector, the `k` gate, the park factors, every hard problem this
+plan has deferred. In-play at 7-3 in the eighth requires almost none of it:
+the score, the inning, the base-out state and the remaining lineup carry most
+of the information, and the residual projection error is small against a
+distribution that is already mostly determined.
+
+So if the feed is pre-match only, the in-play board is the simulator's
+**strongest** application, not a consolation. That is an argument about
+ordering *within* the simulator work whenever it starts. It is not an argument
+for moving the simulator ahead of revenue, and nothing here changes the agreed
+sequence.
+
+**3. The sizes are not symmetric.** Pre-game MLB moneyline markets are the
+most efficient part of the board and the sharp consensus is close to
+unbeatable; in-play prediction markets are thinner and more reactive. That
+cuts both ways — thin and reactive is also where adverse selection lives — and
+none of it is measured. Kalshi's in-play spread and depth are unknown and
+would need their own probe before any of this is more than a hypothesis.
+
+## If it comes back with in-play quotes
+
+The limit is not structural, and the binding constraint becomes the
+**alignment term** the gate already carries.
+
+A pre-game moneyline barely moves over two minutes. An in-play line moves on
+every pitch: a home run with two on in the eighth can move win probability
+twenty points in one swing, and at roughly one plate appearance per two
+minutes the reference price is stale by a materially different amount than it
+is pre-game. The floor is `fee(P) + s(P)/2 + align(L)`, and `align` is the
+term that would blow up.
+
+So "the feed carries in-play" would **not** mean "we can trade in-play". It
+would mean the question becomes measurable: re-derive `align(L)` from observed
+in-play line movement at the polling cadence, and require the gap to exceed
+it, exactly as the gate already requires pre-game. A gap smaller than the
+timing error is not a gap — that rule does not change in-play, it just binds
+much harder.

@@ -130,6 +130,28 @@ class ParsedTicker:
     side_code: str | None = None
 
     @property
+    def event_ticker(self) -> str:
+        """The ticker with any side suffix removed: one game, both sides.
+
+        This is the game's identity. A key built from the two team names alone
+        is NOT -- the same two teams meet three or four times in a series and a
+        dozen times a season, and every one of those meetings collapses onto
+        the same name pair. Anything joining two venues game-by-game keys on
+        this, or on an exact start time, never on the matchup.
+        """
+        if self.side_code is None:
+            return self.ticker
+        head, _, tail = self.ticker.rpartition("-")
+        return head if head and tail == self.side_code else self.ticker
+
+    @property
+    def start_minutes(self) -> int | None:
+        """Minutes past midnight on the ticker's own clock, if it carries one."""
+        if not self.start_hhmm:
+            return None
+        return int(self.start_hhmm[:2]) * 60 + int(self.start_hhmm[2:])
+
+    @property
     def side_team(self) -> str | None:
         """Canonical name of the team the YES side pays on.
 
