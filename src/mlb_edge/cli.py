@@ -16,7 +16,9 @@ data. That is the half of Milestone 1 this environment could not prove.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import statistics
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -1810,6 +1812,285 @@ def probe_depth(
         "Either the cap is above what these books hold, or Kalshi caps here. "
         "Re-run against a busier slate before treating it as settled."
     )
+
+
+@app.command(name="adverse-selection")
+def adverse_selection(
+    reference: Annotated[str, typer.Option(help="Sharp book to price against.")] = "pinnacle",
+    half_spread: Annotated[float, typer.Option(help="Half the Kalshi spread, in probability.")] = 0.01,
+    alignment: Annotated[float, typer.Option(help="Timing-error term added to the floor.")] = 0.0,
+    min_gaps: Annotated[int, typer.Option(help="Below this, report underpowered and stop.")] = 50,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """When Kalshi disagreed with the sharp price, which way did it then move?
+
+    Pre-registered in reports/adverse-selection.md, before any gap was measured.
+    Reads only the archive already on disk -- no network, no cost -- and answers
+    the question that makes stage one meaningless if it comes back wrong.
+
+    Reports the qualifying-gap COUNT first. Under --min-gaps the honest output
+    is "not enough gaps yet", not a verdict read off thirty observations.
+    """
+    import json as _json
+    from collections import defaultdict
+
+    import polars as pl
+
+    from mlb_edge.eval.adverse import (
+        Quote,
+        attach_outcomes,
+        breakeven_toward_rate,
+        find_gaps,
+        kalshi_mid,
+        sharp_fair,
+        summarise,
+    )
+    from mlb_edge.market.prices import american_to_prob
+    from mlb_edge.poll import PollArchive
+    from mlb_edge.timeutil import parse_iso_utc
+
+    settings = load_settings(root)
+    poller_config = settings.section("poller")
+    archive_root = Path(poller_config.get("archive_dir", "data/poll"))
+    archive = PollArchive(
+        archive_root if archive_root.is_absolute() else settings.root / archive_root
+    )
+
+    # --- the sharp leg ------------------------------------------------------
+    # Pinnacle alone, not a consensus: stripping the recreational books leaves
+    # a consensus of one anyway, and the weighted logit mean is step 7 of the
+    # plan. The sign of convergence does not need it.
+    sharp: dict[tuple[str, str], list[Quote]] = defaultdict(list)
+    first_pitch: dict[tuple[str, str], Any] = {}
+    for path in archive.files("odds"):
+        frame = pl.read_parquet(path, columns=["payload", "error", "fetched_at"])
+        for payload, error, at in zip(
+            frame["payload"].to_list(), frame["error"].to_list(),
+            frame["fetched_at"].to_list(), strict=False,
+        ):
+            if error or not payload:
+                continue
+            try:
+                events = _json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                home, away = event.get("home_team"), event.get("away_team")
+                if not (home and away):
+                    continue
+                prices = _reference_prices(event, reference)
+                if prices is None:
+                    continue
+                fair = sharp_fair(american_to_prob(prices[0]), american_to_prob(prices[1]))
+                if not fair:
+                    continue
+                key = (str(home), str(away))
+                sharp[key].append(Quote(at, fair.get("shin", next(iter(fair.values())))))
+                raw = event.get("commence_time")
+                if raw and key not in first_pitch:
+                    with contextlib.suppress(ValueError, TypeError):
+                        first_pitch[key] = parse_iso_utc(str(raw))
+
+    if not sharp:
+        console.print(
+            f"[red]no {reference} prices in the odds archive.[/red] "
+            "Check the book key against books.yaml."
+        )
+        raise typer.Exit(1)
+
+    # --- the Kalshi leg -----------------------------------------------------
+    from mlb_edge.kalshi_tickers import parse_ticker
+
+    kalshi: dict[frozenset[str], list[Quote]] = defaultdict(list)
+    for path in archive.files("kalshi"):
+        frame = pl.read_parquet(
+            path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
+        )
+        for endpoint, key, payload, error, at in zip(
+            frame["endpoint"].to_list(), frame["key"].to_list(),
+            frame["payload"].to_list(), frame["error"].to_list(),
+            frame["fetched_at"].to_list(), strict=False,
+        ):
+            if endpoint != "orderbook" or error or not payload or not key:
+                continue
+            parsed = parse_ticker(str(key))
+            if parsed is None:
+                continue
+            book = _parse_orderbook(payload)
+            if book is None:
+                continue
+            raw = _orderbook_pairs(payload)
+            if raw is None:
+                continue
+            mid = kalshi_mid(raw[0], raw[1])
+            if mid is None:
+                continue
+            kalshi[parsed.team_set].append(Quote(at, mid))
+
+    console.print(
+        f"sharp series: {len(sharp):,} matchups   "
+        f"kalshi series: {len(kalshi):,} matchups"
+    )
+
+    # --- join and measure ---------------------------------------------------
+    from mlb_edge.kalshi_tickers import canonical_name
+
+    gaps: list[Any] = []
+    matched = 0
+    for (home, away), sharp_quotes in sharp.items():
+        pair = frozenset({canonical_name(home), canonical_name(away)})
+        kalshi_quotes = kalshi.get(pair)
+        if not kalshi_quotes:
+            continue
+        matched += 1
+        start = first_pitch.get((home, away)) or max(q.at for q in kalshi_quotes)
+        found = find_gaps(
+            kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
+            half_spread=half_spread, alignment=alignment,
+        )
+        attach_outcomes(found, kalshi_quotes, first_pitch=start)
+        gaps.extend(found)
+
+    console.print(f"matchups on both venues: [bold]{matched:,}[/bold]")
+    console.print(f"qualifying gaps above the floor: [bold]{len(gaps):,}[/bold]\n")
+
+    if len(gaps) < min_gaps:
+        console.print(
+            f"[yellow]NOT ENOUGH GAPS YET.[/yellow] {len(gaps)} qualifying gaps is "
+            f"below the pre-registered minimum of {min_gaps}.\n"
+            "No convergence figure is reported, because one read off this many "
+            "observations would not survive its own confidence interval. "
+            "Keep collecting and re-run."
+        )
+        return
+
+    table = Table(title="realised convergence toward the sharp price")
+    table.add_column("horizon")
+    table.add_column("n", justify="right")
+    table.add_column("mean", justify="right")
+    table.add_column("median", justify="right")
+    table.add_column("toward", justify="right")
+    table.add_column("floor", justify="right")
+    table.add_column("verdict")
+
+    gating = None
+    for horizon in ("+1 snapshot", "+1 hour", "close"):
+        result = summarise(gaps, horizon)
+        if horizon == "close":
+            gating = result
+        if result.observations == 0:
+            table.add_row(horizon, "0", "-", "-", "-", "-", "[dim]no data[/dim]")
+            continue
+        if result.negative:
+            verdict = "[red]NEGATIVE -- we are the slow side[/red]"
+        elif result.clears_floor:
+            verdict = "[green]clears the floor[/green]"
+        else:
+            verdict = "[yellow]positive but under the floor[/yellow]"
+        table.add_row(
+            horizon, f"{result.observations:,}",
+            f"{result.mean * 100:+.2f}pp", f"{result.median * 100:+.2f}pp",
+            f"{result.toward_rate * 100:.1f}%", f"{result.floor * 100:.2f}pp", verdict,
+        )
+    console.print(table)
+
+    # The win rate is only meaningful beside the threshold it has to clear.
+    buckets = Table(title="toward-rate against its break-even, by gap size")
+    buckets.add_column("gap")
+    buckets.add_column("n", justify="right")
+    buckets.add_column("observed", justify="right")
+    buckets.add_column("break-even", justify="right")
+    for low, high in ((0.0, 0.04), (0.04, 0.06), (0.06, 0.10), (0.10, 1.0)):
+        inside = [g for g in gaps if low <= g.size < high and g.convergence("close") is not None]
+        if not inside:
+            continue
+        toward = sum(1 for g in inside if (g.convergence("close") or 0) > 0)
+        mid_gap = statistics.fmean([g.size for g in inside])
+        friction = statistics.fmean([g.floor for g in inside])
+        need = breakeven_toward_rate(mid_gap, friction)
+        buckets.add_row(
+            f"{low * 100:.0f}-{high * 100:.0f}pp", f"{len(inside):,}",
+            f"{toward / len(inside) * 100:.1f}%", f"{need * 100:.1f}%",
+        )
+    console.print(buckets)
+
+    if gating is None or gating.observations == 0:
+        # A verdict from no observations is the failure this whole study exists
+        # to avoid, arriving in the study itself.
+        console.print(
+            "\n[yellow]No gap had a later Kalshi quote to compare against.[/yellow] "
+            "Gaps were found but none could be followed to a close -- check that "
+            "the archive spans past first pitch for these games. No verdict."
+        )
+        return
+    if gating.negative:
+        console.print(
+            "\n[bold red]HARD STOP.[/bold red] Mean convergence to Kalshi's close "
+            "is negative: the archive says we are the stale side. The "
+            "prediction-market-versus-sharp-book trade is dead and stage one "
+            "does not run."
+        )
+        raise typer.Exit(1)
+    if not gating.clears_floor:
+        console.print(
+            "\n[yellow]Convergence is positive but does not clear the floor.[/yellow] "
+            "The signal points the right way and does not pay for the fee and "
+            "the spread. Not a hard stop; not a business yet either."
+        )
+
+
+def _reference_prices(event: dict[str, Any], book_key: str) -> tuple[float, float] | None:
+    """``(home, away)`` American prices from one book's h2h market."""
+    home, away = event.get("home_team"), event.get("away_team")
+    for bookmaker in event.get("bookmakers") or []:
+        if not isinstance(bookmaker, dict) or bookmaker.get("key") != book_key:
+            continue
+        for market in bookmaker.get("markets") or []:
+            if not isinstance(market, dict) or market.get("key") != "h2h":
+                continue
+            prices: dict[str, float] = {}
+            for outcome in market.get("outcomes") or []:
+                if isinstance(outcome, dict) and outcome.get("name") and outcome.get("price"):
+                    prices[str(outcome["name"])] = float(outcome["price"])
+            if home in prices and away in prices:
+                return prices[str(home)], prices[str(away)]
+    return None
+
+
+def _orderbook_pairs(payload: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    """``(yes, no)`` price/size levels, for the mid calculation."""
+    import json as _json
+
+    try:
+        data = _json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for container in (*ORDERBOOK_CONTAINERS, None):
+        node = data.get(container) if container else data
+        if not isinstance(node, dict):
+            continue
+        sides: dict[str, list[tuple[float, float]]] = {"yes": [], "no": []}
+        seen = False
+        for key, value in node.items():
+            side = _side_of(key)
+            if side is None or not isinstance(value, list):
+                continue
+            seen = True
+            for entry in value:
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    try:
+                        sides[side].append((float(entry[0]), float(entry[1])))
+                    except (TypeError, ValueError):
+                        continue
+        if seen:
+            return sides["yes"], sides["no"]
+    return None
 
 
 @app.command(name="poll-sources")

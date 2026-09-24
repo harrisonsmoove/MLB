@@ -70,8 +70,20 @@ could be entirely an artifact of which devig was chosen.
 Arbitrating between methods would be picking the one whose answer we like.
 Instead the disagreement becomes a **robustness requirement**:
 
-> A gap counts as qualifying only if it exceeds `floor(P)` under **all four**
-> devig methods — multiplicative, additive, Shin and power.
+> A gap counts as qualifying only if it exceeds `floor(P)` under **every
+> distinct** devig method.
+
+**On a two-outcome market that is three methods, not four.** Measured after
+implementing them: additive and Shin are *identical* for two outcomes — they
+agree to 1e-13 across overrounds from 5% to 22% — and separate only on
+three-way markets. MLB moneyline is two-outcome, so the distinct set is
+multiplicative, additive/Shin, and power.
+
+This is the `k` mistake again: four names, three methods, and a robustness
+requirement that would have read stronger than it is. The measured spread on
+one outcome is 0.00 pp at a pick'em, 0.54 pp on a moderate favourite, 1.17 pp
+at −250 and 2.33 pp at −600 — which is the tail tension, now measured rather
+than asserted.
 
 This dissolves the tension rather than adjudicating it. The gate's verdict no
 longer depends on the method choice at all, which is the right property when
