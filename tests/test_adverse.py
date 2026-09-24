@@ -13,13 +13,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from mlb_edge.eval.adverse import (
+    MAX_PLAUSIBLE_GAP,
     Quote,
+    ScanCounts,
     attach_outcomes,
     breakeven_toward_rate,
     fee,
     find_gaps,
     floor_for,
     kalshi_mid,
+    orient,
     sharp_fair,
     summarise,
 )
@@ -27,8 +30,17 @@ from mlb_edge.eval.adverse import (
 FIRST_PITCH = datetime(2026, 9, 20, 23, 10, tzinfo=UTC)
 
 
-def _series(start: datetime, prices: list[float], step: int = 15) -> list[Quote]:
-    return [Quote(start + timedelta(minutes=step * i), p) for i, p in enumerate(prices)]
+HOME = "Toronto Blue Jays"
+AWAY = "Baltimore Orioles"
+
+
+def _series(
+    start: datetime, prices: list[float], step: int = 15, team: str = HOME
+) -> list[Quote]:
+    return [
+        Quote(start + timedelta(minutes=step * i), p, team=team)
+        for i, p in enumerate(prices)
+    ]
 
 
 # --- the floor -------------------------------------------------------------
@@ -86,11 +98,15 @@ def test_a_stale_sharp_quote_is_dropped() -> None:
 
 def test_a_gap_below_the_floor_is_not_a_gap() -> None:
     at = datetime(2026, 9, 20, 22, 0, tzinfo=UTC)
-    kalshi = [Quote(at, 0.50)]
+    kalshi = [Quote(at, 0.50, team=HOME)]
     # 2pp gap against a 2.75pp floor.
-    assert find_gaps([*kalshi], [Quote(at, 0.52)], game_pk=1, first_pitch=FIRST_PITCH) == []
+    assert find_gaps(
+        [*kalshi], [Quote(at, 0.52, team=HOME)], game_pk=1, first_pitch=FIRST_PITCH
+    ) == []
     # 5pp clears it.
-    assert len(find_gaps([*kalshi], [Quote(at, 0.55)], game_pk=1, first_pitch=FIRST_PITCH)) == 1
+    assert len(find_gaps(
+        [*kalshi], [Quote(at, 0.55, team=HOME)], game_pk=1, first_pitch=FIRST_PITCH
+    )) == 1
 
 
 # --- the measurement itself ------------------------------------------------
@@ -291,3 +307,160 @@ def test_attach_outcomes_is_unchanged_by_the_rewrite() -> None:
     assert first.later["+1 snapshot"] == pytest.approx(0.52)
     assert first.later["+1 hour"] == pytest.approx(0.58)
     assert first.later["close"] == pytest.approx(0.58)
+
+
+# --- side matching ---------------------------------------------------------
+#
+# The bug these pin: a Kalshi ticker names which team its YES side pays on
+# (``...TORBAL-BAL``), and the devigged sharp price is the *home* team's. When
+# the ticker's side is the away team, comparing the two directly is wrong by
+# exactly ``1 - 2p`` -- on a 62/38 game, 24 points. That is not a small error
+# that shows up as noise. It is a large error in the direction that looks like
+# a free edge, and it passed a gate because 24pp clears every floor there is.
+
+
+def test_an_away_side_ticker_is_not_a_twenty_point_gap() -> None:
+    """The regression. Sharp home 0.62; Kalshi YES(away) 0.39.
+
+    Oriented, the two venues disagree by one point on the away side and there
+    is no gap. Unoriented, 0.39 against 0.62 is a 23-point gap that clears
+    every floor. This test fails on the inversion.
+    """
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 6, team=HOME)
+    kalshi = _series(start, [0.39] * 6, team=AWAY)
+
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH)
+
+    assert gaps == [], (
+        "an away-side ticker was compared against the home probability: "
+        f"{[round(g.size, 3) for g in gaps]}"
+    )
+
+
+def test_an_away_side_ticker_still_finds_a_real_gap() -> None:
+    """The other half: orientation must not suppress genuine disagreement.
+
+    Kalshi YES(away) at 0.30 is the away side priced 8 points below the sharp
+    0.38. That is a real gap and it must survive.
+    """
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 6, team=HOME)
+    kalshi = _series(start, [0.30] * 6, team=AWAY)
+
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH)
+
+    assert gaps
+    assert all(abs(g.size - 0.08) < 1e-9 for g in gaps)
+    # Stored oriented: the probability of the sharp quote's team.
+    assert all(abs(g.kalshi - 0.70) < 1e-9 for g in gaps)
+
+
+def test_convergence_is_measured_on_the_oriented_price() -> None:
+    """A later quote naming the other side must not read as a sign flip.
+
+    Kalshi's away side drifts 0.30 -> 0.34, toward the sharp 0.38. Oriented to
+    the home team that is 0.70 -> 0.66, toward the sharp 0.62: +4pp. Read
+    unoriented it would be -4pp, and the study would call our own convergence
+    adverse selection.
+    """
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 8, team=HOME)
+    kalshi = _series(start, [0.30, 0.34], team=AWAY)
+
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH)
+    attach_outcomes(gaps, kalshi, first_pitch=FIRST_PITCH)
+    result = summarise(gaps, "+1 snapshot")
+
+    assert result.observations == 1
+    assert result.mean > 0, f"oriented convergence read as {result.mean:+.4f}"
+    assert abs(result.mean - 0.04) < 1e-9
+
+
+def test_a_quote_with_no_resolvable_team_is_dropped_not_guessed() -> None:
+    """An unparseable side is a refusal. Half of these would be backwards."""
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 6, team=HOME)
+    kalshi = [Quote(q.at, q.price, team=None) for q in _series(start, [0.39] * 6)]
+
+    counts = ScanCounts()
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH, counts=counts)
+
+    assert gaps == []
+    assert counts.unoriented == 6
+
+
+def test_orient_flips_only_the_other_side() -> None:
+    assert orient(0.39, AWAY, AWAY) == pytest.approx(0.39)
+    assert orient(0.39, AWAY, HOME) == pytest.approx(0.61)
+    assert orient(0.39, None, HOME) is None
+    assert orient(0.39, AWAY, None) is None
+
+
+# --- the sanity bound ------------------------------------------------------
+
+
+def test_an_implausible_gap_is_excluded_and_counted() -> None:
+    """The bound that would have caught the inversion before I reported it."""
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 6, team=HOME)
+    kalshi = _series(start, [0.25] * 6, team=HOME)  # a 37-point "gap"
+
+    counts = ScanCounts()
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH, counts=counts)
+
+    assert gaps == []
+    assert counts.implausible == 6
+    assert 0.37 > MAX_PLAUSIBLE_GAP
+
+
+def test_the_bound_can_be_lifted_deliberately() -> None:
+    start = FIRST_PITCH - timedelta(hours=3)
+    sharp = _series(start, [0.62] * 6, team=HOME)
+    kalshi = _series(start, [0.25] * 6, team=HOME)
+
+    gaps = find_gaps(
+        kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH, max_gap=None
+    )
+    assert len(gaps) == 6
+
+
+# --- in-play contamination -------------------------------------------------
+
+
+def test_quotes_after_first_pitch_are_not_gaps() -> None:
+    """The second defect, and the reason n collapsed at the close horizon.
+
+    The sharp feed is pre-match: its last quote stands frozen at first pitch
+    while Kalshi keeps trading the game. Every in-play snapshot then reads as a
+    widening disagreement with a stale number. Those are not gaps, and because
+    no close exists after first pitch they were silently absent from the close
+    row rather than being reported as excluded.
+    """
+    start = FIRST_PITCH - timedelta(hours=1)
+    sharp = _series(start, [0.62] * 2, step=30, team=HOME)
+    kalshi = _series(start, [0.50, 0.50, 0.50, 0.50, 0.50], step=30, team=HOME)
+
+    counts = ScanCounts()
+    gaps = find_gaps(
+        kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH,
+        counts=counts, max_staleness=timedelta(hours=6),
+    )
+
+    assert counts.in_play == 3
+    assert len(gaps) == 2
+    assert all(g.minutes_to_first_pitch > 0 for g in gaps)
+    assert not any(g.in_play for g in gaps)
+
+
+def test_in_play_quotes_are_included_when_asked_for() -> None:
+    start = FIRST_PITCH - timedelta(hours=1)
+    sharp = _series(start, [0.62] * 2, step=30, team=HOME)
+    kalshi = _series(start, [0.50] * 5, step=30, team=HOME)
+
+    gaps = find_gaps(
+        kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH,
+        pregame_only=False, max_staleness=timedelta(hours=6),
+    )
+    assert len(gaps) == 5
+    assert sum(1 for g in gaps if g.in_play) == 3

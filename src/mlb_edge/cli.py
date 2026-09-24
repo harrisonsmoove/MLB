@@ -30,6 +30,7 @@ from rich.table import Table
 
 from mlb_edge.config import MISSING_SECRET, ConfigError, Settings
 from mlb_edge.config import load_settings as _load_settings_raw
+from mlb_edge.eval.adverse import MAX_PLAUSIBLE_GAP
 from mlb_edge.storage.rawcache import RawCache
 from mlb_edge.storage.warehouse import Warehouse
 from mlb_edge.timeutil import utcnow
@@ -1844,6 +1845,10 @@ def adverse_selection(
     half_spread: Annotated[float, typer.Option(help="Half the Kalshi spread, in probability.")] = 0.01,
     alignment: Annotated[float, typer.Option(help="Timing-error term added to the floor.")] = 0.0,
     min_gaps: Annotated[int, typer.Option(help="Below this, report underpowered and stop.")] = 50,
+    max_gap: Annotated[float, typer.Option(help="Gaps above this are excluded and counted. 0 disables.")] = MAX_PLAUSIBLE_GAP,
+    dump: Annotated[int, typer.Option(help="Print this many individual gap records, end to end.")] = 0,
+    dump_min: Annotated[float, typer.Option(help="Only dump gaps at or above this size.")] = 0.10,
+    include_in_play: Annotated[bool, typer.Option(help="Keep quotes after first pitch. Off by default.")] = False,
     flush_rows: Annotated[int, typer.Option(help="Rows held before spilling to staging.")] = 50_000,
     memory_budget_mb: Annotated[float, typer.Option(help="Stop cleanly above this RSS. 0 disables.")] = 0.0,
     keep_staging: Annotated[bool, typer.Option(help="Leave the staging files for inspection.")] = False,
@@ -1871,6 +1876,7 @@ def adverse_selection(
 
     from mlb_edge.eval.adverse import (
         Quote,
+        ScanCounts,
         attach_outcomes,
         breakeven_toward_rate,
         find_gaps,
@@ -1879,6 +1885,7 @@ def adverse_selection(
         summarise,
     )
     from mlb_edge.kalshi_tickers import canonical_name, parse_ticker
+    from mlb_edge.market.devig import devig_all
     from mlb_edge.market.prices import american_to_prob
     from mlb_edge.poll import PollArchive
     from mlb_edge.timeutil import parse_iso_utc
@@ -1956,6 +1963,13 @@ def adverse_selection(
                     buffer.append({
                         "pair": pair, "at": at,
                         "price": fair.get("shin", next(iter(fair.values()))),
+                        # The devigged price is the probability of the HOME
+                        # team. Recording whose it is turns a comparison that
+                        # was wrong by 1-2p into one that refuses when it
+                        # cannot tell.
+                        "team": canonical_name(str(home)),
+                        "home": str(home), "away": str(away),
+                        "raw_home": prices[0], "raw_away": prices[1],
                     })
                     raw = event.get("commence_time")
                     if raw and pair not in first_pitch:
@@ -1979,6 +1993,7 @@ def adverse_selection(
         spill(buffer, "sharp")
 
         files = archive.files("kalshi")
+        unsided: dict[str, int] = {}
         for number, path in enumerate(files, 1):
             frame = pl.read_parquet(
                 path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
@@ -1999,9 +2014,21 @@ def adverse_selection(
                 mid = kalshi_mid(pairs[0], pairs[1])
                 if mid is None:
                     continue
+                # Which team does YES pay on? Without this the mid is a number
+                # with no referent, and half of them are the complement of what
+                # the sharp leg holds.
+                side = parsed.side_team
+                if side is None:
+                    unsided[parsed.side_code or "(none)"] = (
+                        unsided.get(parsed.side_code or "(none)", 0) + 1
+                    )
+                    continue
                 buffer.append({
                     "pair": _pair_key(*sorted(parsed.teams), canonical_name),
-                    "at": at, "price": mid,
+                    "at": at, "price": mid, "team": side,
+                    "ticker": str(key),
+                    "best_yes": max(price for price, _ in pairs[0]),
+                    "best_no": max(price for price, _ in pairs[1]),
                 })
             if len(buffer) >= flush_rows:
                 spill(buffer, "kalshi")
@@ -2039,25 +2066,32 @@ def adverse_selection(
 
         # --- pass two: one matchup at a time -------------------------------
         gaps: list[Any] = []
+        counts = ScanCounts()
         paired = 0
         for number, pair in enumerate(pairs, 1):
             sharp_rows = (
                 sharp_scan.filter(pl.col("pair") == pair)
-                .select(["at", "price"]).collect()
+                .select(["at", "price", "team", "home", "away", "raw_home", "raw_away"])
+                .collect()
             )
             kalshi_rows = (
                 kalshi_scan.filter(pl.col("pair") == pair)
-                .select(["at", "price"]).collect()
+                .select(["at", "price", "team", "ticker", "best_yes", "best_no"])
+                .collect()
             )
             sharp_quotes = [
-                Quote(a, p) for a, p in zip(
-                    sharp_rows["at"].to_list(), sharp_rows["price"].to_list(), strict=False
-                )
+                Quote(row["at"], row["price"], team=row["team"], meta={
+                    "home": row["home"], "away": row["away"],
+                    "raw_home": row["raw_home"], "raw_away": row["raw_away"],
+                })
+                for row in sharp_rows.iter_rows(named=True)
             ]
             kalshi_quotes = [
-                Quote(a, p) for a, p in zip(
-                    kalshi_rows["at"].to_list(), kalshi_rows["price"].to_list(), strict=False
-                )
+                Quote(row["at"], row["price"], team=row["team"], meta={
+                    "ticker": row["ticker"], "best_yes": row["best_yes"],
+                    "best_no": row["best_no"], "yes_team": row["team"],
+                })
+                for row in kalshi_rows.iter_rows(named=True)
             ]
             paired += len(kalshi_quotes)
             start = first_pitch.get(pair) or (
@@ -2068,6 +2102,8 @@ def adverse_selection(
             found = find_gaps(
                 kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
                 half_spread=half_spread, alignment=alignment,
+                max_gap=max_gap or None, pregame_only=not include_in_play,
+                counts=counts,
             )
             attach_outcomes(found, kalshi_quotes, first_pitch=start)
             gaps.extend(found)
@@ -2091,6 +2127,40 @@ def adverse_selection(
         else:
             shutil.rmtree(staging, ignore_errors=True)
 
+    if unsided:
+        total = sum(unsided.values())
+        console.print(
+            f"[yellow]dropped {total:,} Kalshi quotes whose side could not be "
+            f"resolved[/yellow] -- codes: "
+            + ", ".join(f"{code}={n:,}" for code, n in sorted(
+                unsided.items(), key=lambda kv: -kv[1])[:8])
+        )
+        console.print(
+            "  A quote with no resolvable side has no referent. Comparing it "
+            "anyway is wrong by 1-2p on half of them.\n"
+        )
+
+    console.print("quotes excluded, by reason:")
+    console.print(f"  {counts.line()}")
+    if counts.in_play:
+        console.print(
+            f"  [dim]in-play: the sharp feed is pre-match, so its last quote "
+            f"stands frozen at first pitch while Kalshi keeps trading. Those "
+            f"{counts.in_play:,} comparisons measure the game, not a gap.[/dim]"
+        )
+    if counts.implausible:
+        console.print(
+            f"  [red]{counts.implausible:,} gaps exceeded the "
+            f"{(max_gap or 0) * 100:.0f}pp plausibility bound and were "
+            f"EXCLUDED.[/red] Two venues pricing the same game do not disagree "
+            "by this much. Treat a large count here as a bug report, not a "
+            "finding -- re-run with --dump to see the records."
+        )
+    console.print()
+
+    if dump and gaps:
+        _dump_gaps(gaps, dump, dump_min, devig_all, american_to_prob)
+
     console.print(f"qualifying gaps above the floor: [bold]{len(gaps):,}[/bold]\n")
     if len(gaps) < min_gaps:
         console.print(
@@ -2105,9 +2175,73 @@ def adverse_selection(
     _report_convergence(gaps, summarise, breakeven_toward_rate)
 
 
+def _dump_gaps(
+    gaps: list[Any], limit: int, floor_size: float, devig_all: Any, american_to_prob: Any
+) -> None:
+    """Print individual gap records end to end.
+
+    Every number that went into one comparison, in the order it was derived, so
+    a wrong answer can be traced to the step that produced it rather than
+    inferred from an aggregate. Aggregates are how a side inversion survived to
+    a verdict: 300,000 of them averaged to a number that looked like an edge.
+    """
+    large = sorted(
+        (g for g in gaps if g.size >= floor_size), key=lambda g: -g.size
+    )[:limit]
+    if not large:
+        console.print(
+            f"[dim]no gaps at or above {floor_size * 100:.0f}pp to dump.[/dim]\n"
+        )
+        return
+
+    console.print(
+        f"[bold]{len(large)} largest gaps at or above {floor_size * 100:.0f}pp"
+        f"[/bold] (of {sum(1 for g in gaps if g.size >= floor_size):,})\n"
+    )
+    for index, gap in enumerate(large, 1):
+        meta = gap.meta
+        console.print(f"[bold]--- {index} ---[/bold]")
+        console.print(f"  at                {gap.at:%Y-%m-%d %H:%M:%S} UTC"
+                      f"   ({gap.minutes_to_first_pitch:+.0f} min to first pitch)")
+        console.print(f"  matchup           {meta.get('away')} @ {meta.get('home')}")
+        console.print(f"  ticker            {meta.get('ticker')}")
+        console.print(f"  ticker YES side   {meta.get('yes_team')}")
+        console.print(f"  best yes bid      {meta.get('best_yes')}")
+        console.print(f"  best no bid       {meta.get('best_no')}"
+                      f"   (= yes ask {1.0 - float(meta.get('best_no') or 0):.4f})")
+        console.print(f"  kalshi mid (YES)  {meta.get('kalshi_as_quoted'):.4f}"
+                      f"   probability of {meta.get('kalshi_team')}")
+        console.print(f"  sharp raw         {meta.get('home')} {meta.get('raw_home')}"
+                      f"  /  {meta.get('away')} {meta.get('raw_away')}")
+        try:
+            probs = devig_all([
+                american_to_prob(meta["raw_home"]), american_to_prob(meta["raw_away"])
+            ])
+            console.print("  devigged (home)   " + "  ".join(
+                f"{name}={values[0]:.4f}" for name, values in probs.items()
+            ))
+        except Exception as error:  # noqa: BLE001 - provenance, not control flow
+            console.print(f"  devigged          [red]unavailable: {error}[/red]")
+        console.print(f"  compared as       P({meta.get('team')}): "
+                      f"kalshi {gap.kalshi:.4f} vs sharp {gap.sharp:.4f}")
+        console.print(f"  gap               [bold]{gap.size * 100:.2f}pp[/bold]"
+                      f"   floor {gap.floor * 100:.2f}pp")
+        close = gap.later.get("close")
+        console.print("  close             "
+                      + (f"{close:.4f}   convergence "
+                         f"{(gap.convergence('close') or 0) * 100:+.2f}pp"
+                         if close is not None else "[dim]none (see exclusions)[/dim]"))
+        console.print()
+
+
 def _pair_key(home: str, away: str, canonical: Any) -> str:
     """A stable string key for an unordered matchup."""
     return "|".join(sorted({canonical(home), canonical(away)}))
+
+
+def _pp(value: float) -> str:
+    """Probability points, with negative zero printed as zero."""
+    return f"{(0.0 if value == 0 else value) * 100:+.2f}pp"
 
 
 def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None:
@@ -2127,11 +2261,15 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
             verdict = "[red]NEGATIVE -- we are the slow side[/red]"
         elif result.clears_floor:
             verdict = "[green]clears the floor[/green]"
+        elif result.mean <= 0.0:
+            # Exactly zero is not "positive but small". Calling it positive is
+            # the same defect as a warning that misdescribes what it found.
+            verdict = "[yellow]flat -- no movement either way[/yellow]"
         else:
             verdict = "[yellow]positive but under the floor[/yellow]"
         table.add_row(
             horizon, f"{result.observations:,}",
-            f"{result.mean * 100:+.2f}pp", f"{result.median * 100:+.2f}pp",
+            f"{_pp(result.mean)}", f"{_pp(result.median)}",
             f"{result.toward_rate * 100:.1f}%", f"{result.floor * 100:.2f}pp", verdict,
         )
     console.print(table)
@@ -2139,7 +2277,11 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
     buckets = Table(title="toward-rate against its break-even, by gap size")
     for column in ("gap", "n", "observed", "break-even"):
         buckets.add_column(column, justify="right" if column != "gap" else "left")
-    for low, high in ((0.0, 0.04), (0.04, 0.06), (0.06, 0.10), (0.10, 1.0)):
+    # The top bucket stops at the plausibility bound, because nothing above it
+    # is in `gaps` any more. Labelling it 10-100pp would advertise a range the
+    # scan no longer admits.
+    top = MAX_PLAUSIBLE_GAP
+    for low, high in ((0.0, 0.04), (0.04, 0.06), (0.06, 0.10), (0.10, top)):
         inside = [
             g for g in gaps
             if low <= g.size < high and g.convergence("close") is not None

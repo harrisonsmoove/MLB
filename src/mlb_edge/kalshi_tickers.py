@@ -124,6 +124,32 @@ class ParsedTicker:
     start_hhmm: str | None
     codes: tuple[str, str]
     teams: tuple[str, str]
+    #: The code after the final dash, naming which team the YES side pays on.
+    #: ``KXMLBGAME-26SEP231835TORBAL-BAL`` is "Baltimore wins". Absent on
+    #: tickers that do not carry one.
+    side_code: str | None = None
+
+    @property
+    def side_team(self) -> str | None:
+        """Canonical name of the team the YES side pays on.
+
+        ``None`` when the ticker carries no side, or carries one this table
+        does not recognise. Both cases must refuse rather than default: a YES
+        price compared against the wrong team's probability is off by
+        ``1 - 2p``, which on a 60/40 game is twenty points -- large, plausible,
+        and in the direction that looks like an edge.
+        """
+        if self.side_code is None:
+            return None
+        return TEAM_ALIASES.get(self.side_code)
+
+    @property
+    def other_team(self) -> str | None:
+        side = self.side_team
+        if side is None:
+            return None
+        rest = [t for t in self.teams if t != side]
+        return rest[0] if len(rest) == 1 else None
 
     @property
     def team_set(self) -> frozenset[str]:
@@ -173,6 +199,12 @@ def parse_ticker(ticker: str) -> ParsedTicker | None:
     if len(splits) != 1:
         return None
     left, right = splits[0]
+    suffix = match.group("suffix")
+    side_code = None
+    if suffix:
+        candidate = suffix.rsplit("-", 1)[-1].strip().upper()
+        if candidate:
+            side_code = candidate
     return ParsedTicker(
         ticker=ticker,
         series=match.group("series"),
@@ -180,6 +212,7 @@ def parse_ticker(ticker: str) -> ParsedTicker | None:
         start_hhmm=match.group("time"),
         codes=(left, right),
         teams=(TEAM_ALIASES[left], TEAM_ALIASES[right]),
+        side_code=side_code,
     )
 
 

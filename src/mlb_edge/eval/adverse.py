@@ -30,12 +30,30 @@ def floor_for(price: float, *, half_spread: float = 0.01, alignment: float = 0.0
     return fee(price) + half_spread + alignment
 
 
+#: No honest pre-game gap between two venues pricing the same baseball game is
+#: this large. MLB moneylines live between about 0.25 and 0.80; two venues
+#: disagreeing by more than this are not disagreeing, they are being compared
+#: wrongly -- most often by orientation, where the error is exactly ``1 - 2p``
+#: and so looks like a huge, plausible, profitable edge. Gaps above the bound
+#: are excluded and counted, never silently included.
+MAX_PLAUSIBLE_GAP = 0.25
+
+
 @dataclass(frozen=True)
 class Quote:
-    """One side's price at one moment."""
+    """One side's price at one moment.
+
+    ``team`` is the canonical name of the team this price is the probability
+    **of**. It is not decoration: a Kalshi YES price and a devigged sharp price
+    are only comparable once both are known to refer to the same team, and
+    ``orient`` is the only sanctioned way to line them up.
+    """
 
     at: datetime
     price: float
+    team: str | None = None
+    #: Free-form provenance for the record dump: ticker, raw book, raw prices.
+    meta: dict = field(default_factory=dict, compare=False)
 
 
 @dataclass
@@ -50,6 +68,18 @@ class Gap:
     minutes_to_first_pitch: float
     #: Kalshi's price later, keyed by horizon label.
     later: dict[str, float] = field(default_factory=dict)
+    #: Provenance carried from the two quotes, for ``--dump``.
+    meta: dict = field(default_factory=dict)
+
+    @property
+    def in_play(self) -> bool:
+        """The game had already started when this gap was observed.
+
+        In-play Kalshi prices against a pre-match sharp quote are not a gap in
+        any tradeable sense -- the sharp quote stopped updating at first pitch,
+        so the "disagreement" is just the game happening.
+        """
+        return self.minutes_to_first_pitch <= 0.0
 
     @property
     def size(self) -> float:
@@ -118,6 +148,39 @@ def breakeven_toward_rate(gap: float, friction: float, *, adverse: bool = True) 
     return min(rate, 1.0)
 
 
+def orient(price: float, quote_team: str | None, reference_team: str | None) -> float | None:
+    """Restate ``price`` as the probability of ``reference_team`` winning.
+
+    A two-outcome market has two ways to name the same number, and they differ
+    by ``1 - 2p``. Returns ``None`` when either side is unknown: an unresolvable
+    orientation is a refusal, not a coin flip. Every comparison in this module
+    goes through here.
+    """
+    if quote_team is None or reference_team is None:
+        return None
+    if quote_team == reference_team:
+        return price
+    return 1.0 - price
+
+
+@dataclass
+class ScanCounts:
+    """Why quotes were dropped, so a shrinking n is always explainable."""
+
+    in_play: int = 0
+    unoriented: int = 0
+    stale: int = 0
+    implausible: int = 0
+    under_floor: int = 0
+
+    def line(self) -> str:
+        return (
+            f"in-play {self.in_play:,}   unoriented {self.unoriented:,}   "
+            f"stale {self.stale:,}   under floor {self.under_floor:,}   "
+            f"implausible {self.implausible:,}"
+        )
+
+
 def kalshi_mid(yes_levels: list[tuple[float, float]], no_levels: list[tuple[float, float]]) -> float | None:
     """Mid price implied by the two sides of a Kalshi book.
 
@@ -161,36 +224,69 @@ def find_gaps(
     half_spread: float = 0.01,
     alignment: float = 0.0,
     max_staleness: timedelta = timedelta(minutes=30),
+    max_gap: float | None = MAX_PLAUSIBLE_GAP,
+    pregame_only: bool = True,
+    counts: ScanCounts | None = None,
 ) -> list[Gap]:
     """Every moment where the two disagreed by more than the floor.
 
     Each Kalshi quote is paired with the most recent sharp quote at or before
     it -- never a later one, which would be looking into the future -- and
     dropped if that quote is older than ``max_staleness``.
+
+    Both prices are restated as the probability of the **sharp quote's** team
+    before they are subtracted. A Kalshi quote whose team cannot be resolved is
+    dropped and counted, because comparing it anyway would be wrong by
+    ``1 - 2p`` in whichever direction flatters the result.
+
+    ``pregame_only`` drops quotes at or after first pitch: the sharp side stops
+    updating there, so anything later measures the game, not a gap. ``max_gap``
+    excludes and counts disagreements too large to be real.
     """
     if not kalshi or not sharp:
         return []
+    tally = counts if counts is not None else ScanCounts()
     ordered = sorted(sharp, key=lambda q: q.at)
     gaps: list[Gap] = []
 
     index = 0
     for quote in sorted(kalshi, key=lambda q: q.at):
+        if pregame_only and quote.at >= first_pitch:
+            tally.in_play += 1
+            continue
         while index + 1 < len(ordered) and ordered[index + 1].at <= quote.at:
             index += 1
         reference = ordered[index]
         if reference.at > quote.at or quote.at - reference.at > max_staleness:
+            tally.stale += 1
             continue
-        bar = floor_for(quote.price, half_spread=half_spread, alignment=alignment)
-        if abs(reference.price - quote.price) <= bar:
+        price = orient(quote.price, quote.team, reference.team)
+        if price is None:
+            tally.unoriented += 1
+            continue
+        bar = floor_for(price, half_spread=half_spread, alignment=alignment)
+        difference = abs(reference.price - price)
+        if difference <= bar:
+            tally.under_floor += 1
+            continue
+        if max_gap is not None and difference > max_gap:
+            tally.implausible += 1
             continue
         gaps.append(
             Gap(
                 game_pk=game_pk,
                 at=quote.at,
-                kalshi=quote.price,
+                kalshi=price,
                 sharp=reference.price,
                 floor=bar,
                 minutes_to_first_pitch=(first_pitch - quote.at).total_seconds() / 60.0,
+                meta={
+                    "team": reference.team,
+                    "kalshi_as_quoted": quote.price,
+                    "kalshi_team": quote.team,
+                    **quote.meta,
+                    **reference.meta,
+                },
             )
         )
     return gaps
@@ -217,19 +313,32 @@ def attach_outcomes(
         return
     stamps = [q.at for q in ordered]
 
-    closing: float | None = None
+    def priced(quote: Quote, gap: Gap) -> float | None:
+        """The later price, stated as the probability of the gap's team.
+
+        The gap's own price was oriented on the way in; a later quote from the
+        same matchup can name the other side, so it is oriented too. Without
+        this, convergence would be measured against a number that flips sign.
+        """
+        return orient(quote.price, quote.team, gap.meta.get("team"))
+
+    closing: Quote | None = None
     closing_at: datetime | None = None
     cut = bisect.bisect_right(stamps, first_pitch)
     if cut:
-        closing, closing_at = ordered[cut - 1].price, stamps[cut - 1]
+        closing, closing_at = ordered[cut - 1], stamps[cut - 1]
 
     for gap in gaps:
         for label, delay in (("+1 snapshot", snapshot), ("+1 hour", snapshot * 4)):
             index = bisect.bisect_left(stamps, gap.at + delay)
             if index < len(ordered):
-                gap.later[label] = ordered[index].price
+                later = priced(ordered[index], gap)
+                if later is not None:
+                    gap.later[label] = later
         if closing is not None and closing_at is not None and closing_at > gap.at:
-            gap.later["close"] = closing
+            settled = priced(closing, gap)
+            if settled is not None:
+                gap.later["close"] = settled
 
 
 def summarise(gaps: list[Gap], horizon: str) -> ConvergenceResult:

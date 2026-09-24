@@ -149,3 +149,123 @@ Stated now so they are not discovered as excuses later.
   fraction of those. If the qualifying count is under 50 the study is
   underpowered, and the honest output is "not enough gaps yet", not a verdict.
   That number gets reported first, before any convergence figure.
+
+---
+
+# The 2026-09-24 run was a bug, not a finding
+
+The first run reported 303,372 qualifying gaps out of 450,115 paired quotes —
+67% of all observations clearing a 2.3pp floor, mean gap ~20pp — and a verdict
+that passed on the strength of a single bucket. **That result is withdrawn.**
+Two independent defects produced it. Both are fixed; both are now pinned by
+tests that fail if either is reintroduced.
+
+## Defect 1: side inversion
+
+`parse_ticker` captured the ticker's side suffix (`...TORBAL-BAL`) in its
+regex and then discarded it — `ParsedTicker` had no field for it and nothing
+read it. The study stored each Kalshi mid under `_pair_key(*sorted(teams))`,
+an **unordered** key that by construction throws away which team the price is
+the probability of. The sharp leg stored `probs[0]`, which is always the
+**home** team.
+
+So whenever a ticker's YES side was the away team, the study compared
+`P(away)` against `P(home)`. The error is exactly `1 − 2p`: on a 60/40 game,
+20 points. Large, plausible, and in the direction that looks like free money.
+
+Predicted signature versus what the run reported:
+
+| | predicted under full inversion | observed | fixed |
+|---|---|---|---|
+| mean gap | 13pp | ~20pp | — |
+| share clearing a 2.3pp floor | 91% | 67% | — |
+
+The observed numbers sit between "no inversion" and "total inversion", which
+is what a *mixture* looks like: roughly half the tickers name the home team
+and were fine, half name the away team and were backwards.
+
+**Fix.** `ParsedTicker` now carries `side_code` and resolves `side_team`
+through the same alias table as the matchup codes. `Quote` carries the team its
+price refers to. Every comparison goes through `orient()`, which restates one
+price as the probability of the other's team and returns `None` — a refusal,
+counted and reported — when either side is unknown. An unresolvable side is
+dropped, never guessed: half of those guesses would be backwards.
+
+## Defect 2: in-play contamination — and the answer to the n drop
+
+You asked why n fell from 302,793 at +1 snapshot to 97,061 at close. It is
+not sampling; it is the same defect twice.
+
+The study never filtered to pre-game quotes. The Odds API tier-0 h2h feed is
+**pre-match only**: its last quote stands frozen at first pitch. Kalshi keeps
+trading through all nine innings. So every in-play Kalshi snapshot was being
+differenced against a stale pre-game number, and as the game moves toward a
+result that difference widens without bound — which is a second, independent
+source of the implausibly large gaps.
+
+The n drop falls straight out of it. `attach_outcomes` defines the close as the
+last Kalshi quote *at or before* first pitch, and only assigns it when
+`closing_at > gap.at`. A gap observed after first pitch therefore has no close
+by construction:
+
+```
+302,793  gaps with a +1 snapshot horizon
+ 97,061  gaps with a close
+-------
+205,732  gaps that occurred after first pitch  (68%)
+```
+
+Two thirds of the sample was in-play. The close row was the only row that
+excluded it — which is why the close horizon disagreed with the others, and
+why the exclusion was invisible rather than reported.
+
+**Fix.** `find_gaps(pregame_only=True)` is the default; in-play quotes are
+excluded and counted. `--include-in-play` restores the old behaviour
+deliberately. The run now prints every exclusion reason before any verdict.
+
+## Defect 3 (latent): no sanity bound
+
+Neither defect had to survive to a verdict. Both produce gaps far outside what
+two venues pricing the same baseball game can disagree by, and nothing was
+checking.
+
+`MAX_PLAUSIBLE_GAP = 0.25`. MLB moneylines live roughly between 0.25 and 0.80;
+a 25-point disagreement between two venues on the same game is not a
+disagreement, it is a comparison error. Gaps above the bound are **excluded and
+reported in red**, with the count and the instruction to treat it as a bug
+report. `--max-gap 0` disables it deliberately. The gap-size table's top bucket
+is now labelled to the bound rather than 10–100pp, since nothing above it can
+be present.
+
+## What to run
+
+```bash
+mlb-edge adverse-selection --dump 20 --dump-min 0.10
+```
+
+`--dump` prints individual records end to end — timestamp and minutes to first
+pitch, matchup, ticker, resolved YES side, best bid on each side of the book
+and the implied ask, the mid and whose probability it is, the raw American
+prices, all four devig methods, the oriented comparison, the gap against its
+floor, and the close with its convergence. One case readable top to bottom,
+rather than an aggregate that has to be trusted.
+
+## What this cost, and the rule it argues for
+
+Three defects, and the one that mattered was not in the arithmetic.
+`find_gaps` was correct the whole time on quotes that carried their team. The
+inversion lived in the wiring between the archive and the arithmetic, in a key
+that was *designed* to discard orientation — `sorted(teams)` was deliberate,
+and correct for its original purpose of matching a matchup. It was reused for
+something that needed the thing it throws away.
+
+The unit tests could not see it because they constructed quotes directly.
+`tests/test_adverse_cli.py` now drives the whole path from a synthetic
+two-game archive, and seven tests across the two files fail if the inversion
+is reintroduced (verified by putting it back).
+
+Proposed as a third standing rule:
+
+> **Any price carries what it is the probability of.** A bare number with two
+> possible referents will eventually be read against the wrong one, and on a
+> binary market the error is `1 − 2p` — largest exactly where the money is.
