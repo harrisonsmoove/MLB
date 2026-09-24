@@ -365,3 +365,36 @@ The first two are the same line of code, reused twice for jobs that each
 needed one of the two things it drops. The standing rule now in the README
 covers the first. The second is the `game_pk` rule, which already existed and
 which I did not apply here.
+
+---
+
+# Pre-registration for the corrected run, 2026-09-24
+
+In the repo before either of us has seen the output.
+
+**Harrison, stated before seeing it:** the qualifying count collapses from
+303k to something small, and the plausible buckets stay near their observed
+52-56% — below break-even, meaning the trade is dead.
+
+**Claude, stated before seeing it:**
+
+1. Qualifying gaps land in the hundreds to low thousands from 25 days. I
+   think "not enough gaps yet" (under 50) is a live outcome and would not be
+   surprising.
+2. Mean convergence comes back small and positive but under the floor, or
+   flat. I do not expect it to clear.
+3. Sharp quotes after first pitch: near zero. This is a guess and it is the
+   one I was wrong to assert before.
+
+**One caveat on the 52-56% figures.** Those buckets are not a clean baseline
+to anchor on. They were computed with `convergence("close")`, and under the
+matchup collision the close came from a *different game* — the earliest
+meeting between those two teams in the archive. Every number from that run is
+withdrawn, including the ones that looked reassuringly like noise. If the
+corrected buckets land near 52-56%, that is a new measurement agreeing with an
+old artefact, not a confirmation.
+
+**What counts as dead.** Mean convergence at or below zero at the close
+horizon, or positive but under the floor with enough observations to say so.
+Either verdict gets reported plainly and the market-vs-market trade stops
+here. Underpowered is not a verdict: it means wait for archive.
