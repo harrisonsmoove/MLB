@@ -230,11 +230,44 @@ Two implications worth carrying forward:
 
 ---
 
-## 6. What the trade returns, bounded by depth
+## 6. What the trade returns — CORRECTED: depth was never the constraint
 
-Bankroll is not the constraint and neither is turnover. The constraint is **how
-many contracts fill near the dislocated price before it moves**, on a board
-thinner than Pinnacle's.
+> **CORRECTED 2026-09-24.** This section said depth was binding and computed
+> profit from it. Measured: the top ten levels alone hold a **median 63,405
+> contracts**, and quarter-Kelly at a $5,000 bankroll is **150–300 contracts**.
+> Depth exceeds required size by two to three orders of magnitude. The revenue
+> figures below happen to survive, because 300 assumed fills sits near the
+> Kelly number by coincidence — but the reasoning was wrong and the lever it
+> implied was wrong with it.
+
+### What binds instead
+
+| Constraint | Size at $5k bankroll | Binding? |
+|---|---|---|
+| Book depth, top 10 levels | 63,405 contracts | no, by ~200x |
+| Quarter-Kelly at 3 pp edge | 150 contracts | **yes** |
+| Quarter-Kelly at 6 pp edge | 300 contracts | **yes** |
+| Gap frequency | ~90 opportunities/month at 20% | **yes** |
+| Adverse selection | unmeasured | **possibly fatal** |
+
+Position size is set by **bankroll times Kelly fraction**, and Kelly at a 3 pp
+edge on a coin-flip contract is 6% of bankroll full, 1.5% at the quarter
+fraction this project uses. That is $75 a position. The board could be a tenth
+as deep and nothing would change.
+
+So the levers are, in order:
+
+1. **Bankroll.** Revenue scales linearly with it and nothing else in the stack
+   does. $5k to $25k is a 5x on every figure in this section.
+2. **Gap frequency.** How often a qualifying gap exists at all — the thing
+   stage one measures.
+3. **Adverse selection.** Not a lever, a gate: if gaps resolve against us the
+   edge is negative and the other two multiply a negative number.
+   `reports/adverse-selection.md` runs before stage one for that reason.
+
+Depth is not on the list. Raising `orderbook_depth` from 10 to 100 remains
+right — the archive should hold what the board holds — but it buys *evidence*,
+not capacity, and the pricing conclusions do not move.
 
 Monthly profit, 450 team-games, after fee and half-spread at $0.50:
 

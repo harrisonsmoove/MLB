@@ -364,10 +364,18 @@ sources:
     #                     "no_dollars":  [["0.0200","7002.00"], ...]}}
     # price/size pairs as decimal strings, and the size column is real,
     # substantial and has been collecting correctly the whole time.
-    # Still unverified: whether Kalshi returns MORE than 10 levels when asked.
-    # If it does, every snapshot so far is capped here permanently -- there is
-    # no historical orderbook endpoint.
-    orderbook_depth: 10
+    # MEASURED 2026-09-24 with `mlb-edge probe-depth --live`: real books run
+    # 22-30 levels. At 10 we recorded roughly a third of every book for 25
+    # days, and that loss is permanent -- there is no historical orderbook
+    # endpoint. 100 is comfortably above the observed maximum; Kalshi returns
+    # what exists rather than padding, so asking for more than a book holds
+    # costs nothing.
+    #
+    # Cost of the change: request COUNT is unchanged, so the rate-limit and
+    # sweep-duration arithmetic is untouched. Payloads grow with levels --
+    # roughly 60 MB/month to 170 MB/month compressed -- which lands on backup
+    # transfer and object storage, not on the poll cycle.
+    orderbook_depth: 100
     markets_page_size: 200
     max_pages: 25
     # VERIFIED against live payloads on 2026-08-30. These patterns read TITLES,
