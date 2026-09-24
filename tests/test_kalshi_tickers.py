@@ -643,3 +643,57 @@ def test_a_snapshot_at_the_cap_is_distinguishable_from_one_below_it() -> None:
 
     assert max(_orderbook_levels(capped)) == 10
     assert max(_orderbook_levels(shallow)) == 2
+
+
+def test_the_depth_scan_separates_missing_rows_from_unreadable_ones(tmp_path):
+    """A bare count made a zero mean two things needing opposite responses.
+
+    "No orderbook rows were ever written" and "rows are there and the reader
+    cannot parse them" are different problems. The first version of this probe
+    reported both as `0 orderbook snapshots` -- the exact defect it was written
+    to find, one level up.
+    """
+    import datetime as dt
+    import json as _json
+
+    from mlb_edge.cli import _orderbook_levels
+
+    # Shape the reader expects.
+    good = _json.dumps({"orderbook": {"yes": [[50, 10], [49, 5]], "no": [[51, 3]]}})
+    # A plausible alternative shape -- same data, different key.
+    other = _json.dumps({"book": {"yes": [[50, 10]], "no": []}})
+
+    assert _orderbook_levels(good) == (2, 1)
+    assert _orderbook_levels(other) is None, (
+        "an unexpected shape must read as unparseable, not as an empty book -- "
+        "returning (0, 0) here would report a real book as zero levels"
+    )
+    del dt
+
+
+def test_the_live_half_does_not_sweep_the_whole_board():
+    """It called poller.poll() to obtain five tickers: hundreds of requests and
+    minutes of rate-limited waiting, which read as a hang."""
+    import inspect
+
+    from mlb_edge import cli
+
+    # Comments in the function explain the old behaviour by name, so match
+    # against code only -- otherwise the test fails on its own rationale.
+    code = "\n".join(
+        line for line in inspect.getsource(cli.probe_depth).splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "poller.poll()" not in code
+    assert '"limit"' in code, "it lists one bounded page instead"
+
+
+def test_the_depth_scan_defaults_to_the_whole_archive():
+    """`files[-60:]` was fifteen hours, which can be entirely between slates --
+    and a window that excludes the data is indistinguishable from no data."""
+    import inspect
+
+    from mlb_edge import cli
+
+    signature = inspect.signature(cli.probe_depth)
+    assert signature.parameters["ticks"].default == 0

@@ -214,3 +214,51 @@ after all, in the direction nobody is watching for.
 This entry is the audit finding its own error. The original claim was written
 from the same habit it exists to catch: a number asserted from memory with
 nothing in place that would contradict it.
+
+---
+
+## G. `orderbook_depth` — the ranking rested on an unverified premise
+
+The audit put `orderbook_depth: 10` at number one on the grounds that every
+archived snapshot was being silently truncated. The first run of `probe-depth`
+reported **zero orderbook snapshots across the scanned window**, which does not
+confirm that premise and does not refute it either.
+
+**Is the setting decorative?** No. `KalshiPoller.poll` sends
+`params = {"depth": depth}` on every orderbook request, so the value is read
+and transmitted. It is not a number that describes nothing. But it only has
+*effect* on ticks where the orderbook loop runs at all, and whether that has
+been happening is now the open question.
+
+So the honest restatement: **the audit's #1 entry was ranked on a premise —
+that orderbook snapshots are being collected — which the audit did not itself
+check.** Same habit, one level up: a claim about the system asserted rather
+than measured. The ranking may well turn out right; it was not established.
+
+What the archived record does say, without another round trip: the poller
+writes 123–251 payloads a tick, and `kalshi_max_pages: 25` across three series
+caps market pages at 75. **At least 48 rows a tick must be something other than
+market pages**, and the only other thing the poller writes is orderbooks. That
+is evidence rows exist, which points at the reader or the scanned window rather
+than at a poller that never fetched.
+
+Three defects in the probe, all mine, all the same shape as what it hunts:
+
+1. **A bare count.** Zero meant either "no rows" or "rows this cannot read",
+   which need opposite responses. It now reports rows by endpoint, rows with
+   payloads, rows parsed, and a sample of anything unparseable.
+2. **`files[-60:]`.** Fifteen hours, a repo-chosen window, in an audit about
+   repo-chosen numbers. A window that excludes the data is indistinguishable
+   from no data. It now scans the whole archive by default.
+3. **`--live` called `poller.poll()`** to obtain five tickers — a full board
+   sweep, hundreds of rate-limited requests, which read as a hang and is why
+   that half never printed. It now lists one bounded page.
+
+### The third category
+
+The category named in review — *a config value that describes nothing at all* —
+is real and worth keeping in mind, and `orderbook_depth` is not an instance of
+it. Nothing in section B currently is: every value there is read by code that
+acts on it. Worth a future sweep of its own, since the failure is different
+again: an invented external fact costs whatever it invents, while a value
+nothing reads costs the false confidence of having configured something.

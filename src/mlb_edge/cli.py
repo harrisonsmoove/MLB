@@ -1468,20 +1468,21 @@ def _orderbook_levels(payload: str) -> tuple[int, int] | None:
 def probe_depth(
     depth: Annotated[int, typer.Option(help="Depth to request when probing live.")] = 100,
     live: Annotated[bool, typer.Option(help="Also ask Kalshi what it serves.")] = False,
+    ticks: Annotated[int, typer.Option(help="How many archived ticks to scan. 0 = all.")] = 0,
     root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
-    """How many orderbook levels Kalshi serves, versus the ten we ask for.
+    """What the archive actually holds, level by level, and what Kalshi serves.
 
-    `orderbook_depth: 10` is a number this repo chose. Nothing has ever checked
-    it against what Kalshi returns, and the consequence is not recoverable: the
-    poll archive has no historical endpoint, stage two's binding measurement is
-    realised depth at the dislocated price, and a snapshot truncated at
-    collection time is truncated for good.
+    `orderbook_depth: 10` is a number this repo chose and nothing has checked.
+    The cost of it being low is not recoverable: there is no historical
+    orderbook endpoint, and realised depth at the dislocated price is the
+    measurement stage two exists for.
 
-    Two halves. The archive scan needs no network and quantifies what has
-    already been taken: a snapshot sitting at exactly the configured depth was
-    cut off there, and one sitting below it was not. The live half asks Kalshi
-    directly.
+    The first version of this reported a bare count, so a zero could equally
+    mean "no orderbook rows were ever written" or "rows are there and this
+    cannot read them". Those need opposite responses, which is precisely the
+    defect this probe was written to find, one level up. It now reports the
+    breakdown that separates them.
     """
     import polars as pl
 
@@ -1491,7 +1492,6 @@ def probe_depth(
     configured = int(settings.source("kalshi").get("orderbook_depth", 10))
     console.print(f"configured orderbook_depth: [bold]{configured}[/bold]\n")
 
-    # --- what the archive already holds ------------------------------------
     poller_config = settings.section("poller")
     archive_root = Path(poller_config.get("archive_dir", "data/poll"))
     archive = PollArchive(
@@ -1501,72 +1501,133 @@ def probe_depth(
     if not files:
         console.print("[yellow]no kalshi archive to scan[/yellow]")
     else:
+        scanned = files if ticks <= 0 else files[-ticks:]
+        console.print(
+            f"scanning {len(scanned):,} of {len(files):,} ticks: "
+            f"{scanned[0].name} .. {scanned[-1].name}"
+        )
+
         from collections import Counter
 
+        by_endpoint: Counter[str] = Counter()
         levels: Counter[int] = Counter()
-        books = 0
-        for path in files[-60:]:            # a couple of days is plenty
-            frame = pl.read_parquet(path, columns=["endpoint", "payload"])
-            for endpoint, payload in zip(
-                frame["endpoint"].to_list(), frame["payload"].to_list(), strict=False
+        with_payload = parsed = 0
+        unparsed_samples: list[str] = []
+
+        for path in scanned:
+            frame = pl.read_parquet(path, columns=["endpoint", "payload", "error"])
+            for endpoint, payload, error in zip(
+                frame["endpoint"].to_list(),
+                frame["payload"].to_list(),
+                frame["error"].to_list(),
+                strict=False,
             ):
-                if endpoint != "orderbook" or not payload:
+                label = str(endpoint or "?") + ("" if not error else " (error)")
+                by_endpoint[label] += 1
+                if endpoint != "orderbook" or error:
                     continue
+                if not payload:
+                    continue
+                with_payload += 1
                 counted = _orderbook_levels(payload)
                 if counted is None:
+                    if len(unparsed_samples) < 3:
+                        unparsed_samples.append(str(payload)[:240])
                     continue
-                books += 1
+                parsed += 1
                 levels[max(counted)] += 1
 
-        saturated = sum(n for lv, n in levels.items() if lv >= configured)
-        console.print(f"archive: {books:,} orderbook snapshots over {len(files[-60:])} ticks")
-        table = Table(title="levels per snapshot (deepest side)")
-        table.add_column("levels", justify="right")
-        table.add_column("snapshots", justify="right")
-        table.add_column("share", justify="right")
-        for lv in sorted(levels):
-            share = levels[lv] / books * 100 if books else 0
-            mark = "  <- at the cap" if lv >= configured else ""
-            table.add_row(f"{lv}{mark}", f"{levels[lv]:,}", f"{share:.1f}%")
-        console.print(table)
-        if books:
-            pct = saturated / books * 100
+        # This breakdown is the whole point: it says which of the two states
+        # a zero means, without needing another round trip to find out.
+        shape = Table(title="rows by endpoint")
+        shape.add_column("endpoint")
+        shape.add_column("rows", justify="right")
+        for label, n in by_endpoint.most_common():
+            shape.add_row(label, f"{n:,}")
+        console.print(shape)
+
+        console.print(
+            f"\norderbook rows with a payload: [bold]{with_payload:,}[/bold]"
+            f"   parsed as a book: [bold]{parsed:,}[/bold]"
+        )
+
+        if with_payload and not parsed:
             console.print(
-                f"\n[bold]{saturated:,} of {books:,} snapshots ({pct:.1f}%) sit at "
-                f"the configured depth.[/bold]"
+                "\n[red]Rows exist and none parse.[/red] The payload is not the "
+                "shape this probe expects, so the archive may be fine and the "
+                "READER is wrong. Samples:"
+            )
+            for sample in unparsed_samples:
+                console.print(f"  {sample}")
+        elif not with_payload:
+            console.print(
+                "\n[red]No orderbook rows with payloads in this window.[/red]\n"
+                "Either the orderbook fetch is not running -- check whether the "
+                "markets response yields tickers -- or this window is entirely "
+                "between slates, when Kalshi has no open markets to book. "
+                "Re-run with --ticks 0 over the whole archive before concluding."
+            )
+        else:
+            table = Table(title="levels per snapshot (deepest side)")
+            table.add_column("levels", justify="right")
+            table.add_column("snapshots", justify="right")
+            table.add_column("share", justify="right")
+            for lv in sorted(levels):
+                mark = "  <- at the cap" if lv >= configured else ""
+                table.add_row(
+                    f"{lv}{mark}", f"{levels[lv]:,}", f"{levels[lv] / parsed * 100:.1f}%"
+                )
+            console.print(table)
+            saturated = sum(n for lv, n in levels.items() if lv >= configured)
+            pct = saturated / parsed * 100
+            console.print(
+                f"\n[bold]{saturated:,} of {parsed:,} ({pct:.1f}%) sit at the cap.[/bold]"
             )
             if pct > 5:
                 console.print(
-                    "[red]Those were cut off at collection time.[/red] Whatever "
-                    "depth existed beyond level "
-                    f"{configured} is not in the archive and cannot be fetched back."
-                )
-            else:
-                console.print(
-                    "[green]Few snapshots reach the cap[/green], so the books are "
-                    "mostly shallower than the limit and little has been lost -- "
-                    "but the live check below still decides whether the cap binds."
+                    "[red]Those were cut off at collection time[/red] and the depth "
+                    f"beyond level {configured} is not in the archive."
                 )
 
     if not live:
         console.print(
             "\n[yellow]archive scan only.[/yellow] Re-run with --live to ask "
-            "Kalshi what it actually serves."
+            "Kalshi what it serves."
         )
         return
 
     # --- what Kalshi actually serves ---------------------------------------
-    from mlb_edge.poll import KalshiPoller
+    from mlb_edge.poll import KalshiPoller, _tickers_from
 
     poller = KalshiPoller(settings)
-    records = poller.poll()
-    tickers = [r.key for r in records if r.endpoint == "orderbook" and not r.error][:5]
-    if not tickers:
-        console.print("[red]no orderbooks returned; cannot probe live depth[/red]")
-        raise typer.Exit(1)
-
     config = settings.source("kalshi")
-    path_template = (config.get("endpoints") or {})["orderbook"]
+    endpoints = config.get("endpoints") or {}
+    series = (config.get("series_tickers") or ["KXMLBGAME"])[0]
+
+    # One markets page for a handful of tickers. The first version called
+    # poller.poll() here, which sweeps the entire board -- hundreds of requests
+    # and minutes of rate-limited waiting -- to obtain five strings.
+    markets_path = endpoints["markets"]
+    try:
+        response = poller._client.get(
+            f"{config.base_url}{markets_path}",
+            params={"series_ticker": series, "status": "open", "limit": 20},
+            headers=poller._headers(markets_path),
+        )
+    except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+        console.print(f"[red]could not list markets:[/red] {exc}")
+        raise typer.Exit(1) from None
+
+    tickers = _tickers_from(response.text())[:5]
+    if not tickers:
+        console.print(
+            f"[red]no open markets under {series}.[/red]\n"
+            "That alone explains an empty archive scan: with no tickers there "
+            "are no orderbooks to fetch. Re-run during a slate."
+        )
+        raise typer.Exit(1)
+    console.print(f"\nprobing {len(tickers)} tickers: {', '.join(tickers)}")
+
     comparison = Table(title=f"levels returned: depth={configured} vs depth={depth}")
     comparison.add_column("ticker")
     comparison.add_column(f"at {configured}", justify="right")
@@ -1574,45 +1635,44 @@ def probe_depth(
     comparison.add_column("verdict")
 
     deeper = 0
+    path_template = endpoints["orderbook"]
     for ticker in tickers:
         path = path_template.format(ticker=ticker)
         url = f"{config.base_url}{path}"
-        counts = []
+        counts: list[int] = []
         for requested in (configured, depth):
             try:
-                response = poller._client.get(
+                reply = poller._client.get(
                     url, params={"depth": requested}, headers=poller._headers(path)
                 )
-                got = _orderbook_levels(response.text())
+                got = _orderbook_levels(reply.text())
                 counts.append(max(got) if got else 0)
-            except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+            except Exception as exc:  # noqa: BLE001
                 counts.append(-1)
                 console.print(f"[dim]{ticker}: {exc}[/dim]")
         shallow, deep = counts
         if deep > shallow:
             deeper += 1
-            verdict = f"[red]TRUNCATING -- {deep - shallow} levels lost per snapshot[/red]"
-        elif deep == shallow and shallow < configured:
+            verdict = f"[red]TRUNCATING -- {deep - shallow} levels lost[/red]"
+        elif shallow < configured:
             verdict = "[dim]book shallower than the cap; inconclusive[/dim]"
         else:
-            verdict = "[green]cap is not binding[/green]"
-        comparison.add_row(ticker or "-", str(shallow), str(deep), verdict)
+            verdict = "[green]cap not binding[/green]"
+        comparison.add_row(ticker, str(shallow), str(deep), verdict)
     console.print(comparison)
 
     if deeper:
         console.print(
             f"\n[bold red]orderbook_depth: {configured} is truncating "
             f"{deeper} of {len(tickers)} books.[/bold red]\n"
-            f"Raise it, and understand that every snapshot archived so far is "
-            "capped at the old value permanently. Tier 0 has no historical "
-            "orderbook endpoint; the depth beyond that cap was never recorded "
-            "and cannot be bought."
+            "Every snapshot archived so far is capped at the old value "
+            "permanently: there is no historical orderbook endpoint."
         )
         raise typer.Exit(1)
     console.print(
         "\n[green]No book returned more levels than the cap allows.[/green] "
-        "Either the cap is above what these books hold, or Kalshi itself caps "
-        "here. Re-run against a busier slate before treating it as settled."
+        "Either the cap is above what these books hold, or Kalshi caps here. "
+        "Re-run against a busier slate before treating it as settled."
     )
 
 
