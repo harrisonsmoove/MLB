@@ -176,8 +176,9 @@ def test_odds_failure_is_archived_as_a_row_not_a_gap(settings_with_keys):
 
 
 def test_free_tier_throttles_to_survive_the_month(settings_with_keys):
-    """500 credits is 2.6 days of 15-minute polling, so it must slow down."""
+    """A small quota must slow down rather than go dark mid-month."""
     poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.config.raw["bookmakers_from_consensus"] = False   # 2 credits/call
     poller.quota_remaining = 500
     # First of a month, so a full refill period lies ahead.
     interval = poller.next_interval_seconds(now=datetime(2026, 10, 1, 12, 0, tzinfo=UTC))
@@ -246,10 +247,19 @@ def test_unknown_quota_uses_the_configured_interval(settings_with_keys):
 
 
 def test_budget_forecast_matches_the_arithmetic(settings_with_keys):
+    """Five named books is one region-equivalent, so h2h costs 1 credit."""
+    forecast = budget_forecast(settings_with_keys, 500, NOW)
+    assert forecast["credits_per_call"] == 1, "5 books = 1 unit x markets=h2h"
+    assert forecast["calls_affordable"] == 500
+    assert forecast["days_at_configured_interval"] == pytest.approx(5.2, abs=0.2)
+
+
+def test_budget_forecast_on_the_regions_path(settings_with_keys):
+    """The arithmetic the regions path always had, still pinned."""
+    settings_with_keys.source("odds").raw["bookmakers_from_consensus"] = False
     forecast = budget_forecast(settings_with_keys, 500, NOW)
     assert forecast["credits_per_call"] == 2, "regions=us,eu x markets=h2h"
     assert forecast["calls_affordable"] == 250
-    assert forecast["days_at_configured_interval"] == pytest.approx(2.6, abs=0.1)
 
 
 # ---------------------------------------------------------------------------
@@ -515,3 +525,76 @@ def test_probe_billing_reports_the_real_plan_size(settings_with_keys, monkeypatc
 
     assert "plan size for this period: 20,000 credits" in result.output
     assert "config believes 500" in result.output
+
+
+# ---------------------------------------------------------------------------
+# Naming the books instead of buying regions
+# ---------------------------------------------------------------------------
+def test_the_request_names_the_consensus_books(settings_with_keys):
+    """Measured on the live plan at 1 credit, not taken from the docs.
+
+    `regions=us,eu` cost 2 credits for five books plus dozens that carry zero
+    consensus weight. Naming the five bills as one region-equivalent.
+    """
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    books = poller.request_bookmakers()
+
+    assert "pinnacle" in books
+    assert {"circasports", "bookmaker", "betonlineag", "lowvig"} <= set(books)
+    assert poller.credits_per_call == 1
+
+
+def test_the_book_list_comes_from_the_consensus_not_a_second_list(settings_with_keys):
+    """Two lists agree until one day they do not.
+
+    That is how `regions=eu` nearly became a Pinnacle-only consensus which
+    still satisfied min_books_for_consensus and warned about nothing.
+    """
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    weights = settings_with_keys.books["consensus"]["weights"]
+    known = {b["key"] for b in settings_with_keys.books["books"]}
+
+    assert set(poller.request_bookmakers()) == {
+        k for k, w in weights.items() if w and k in known
+    }
+
+
+def test_prediction_market_is_not_requested_as_a_bookmaker(settings_with_keys):
+    """It carries consensus weight and is not a book. Sending it would 400."""
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    assert "prediction_market" not in poller.request_bookmakers()
+
+
+def test_bookmakers_and_regions_are_never_sent_together(settings_with_keys):
+    """`bookmakers` takes priority at the API, so sending both leaves a regions
+    line that looks load-bearing and is not."""
+    client = StubClient({"/odds": []})
+    poller = OddsPoller(settings_with_keys, client=client)
+    poller.poll()
+
+    sent = client.calls[-1][1] if hasattr(client, "calls") else None
+    if sent is not None:
+        assert "bookmakers" in sent
+        assert "regions" not in sent
+
+
+def test_credits_scale_by_tens_of_books(settings_with_keys):
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.config.raw["bookmakers"] = [f"b{i}" for i in range(10)]
+    assert poller.credits_per_call == 1
+    poller.config.raw["bookmakers"] = [f"b{i}" for i in range(11)]
+    assert poller.credits_per_call == 2
+
+
+def test_credits_multiply_by_markets(settings_with_keys):
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.config.raw["markets_by_tier"] = {0: ["h2h", "totals", "h2h_h1", "totals_h1"]}
+    assert poller.credits_per_call == 4, "five books is one unit, times four markets"
+
+
+def test_regions_still_work_when_books_are_turned_off(settings_with_keys):
+    """The regions path is the fallback, not dead code."""
+    poller = OddsPoller(settings_with_keys, client=StubClient({}))
+    poller.config.raw["bookmakers_from_consensus"] = False
+    assert poller.request_bookmakers() == []
+    assert poller.credits_per_call == len(poller.regions)

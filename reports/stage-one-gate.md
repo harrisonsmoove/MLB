@@ -82,21 +82,88 @@ is the single most useful thing to know about a tail gap.
 
 ---
 
-## 3. Persistence
+## 3. Persistence — CORRECTED, and the constraint has flipped
 
-A gap present in one snapshot and absent from the next was never tradeable. At
-free-tier resolution (~40 minutes, `eu`-only h2h) the only persistence statement
-available is:
+The original version of this section assumed ~40-minute resolution from a
+500-credit plan. The plan is 20,000 credits and has been since 30 August. At
+1 credit a call — five named books, h2h — the sharp side sustains **about one
+minute** during the slate.
 
-> A qualifying gap must appear in **at least two consecutive snapshots**.
+So the sharp side is no longer the slow leg. **Kalshi is**, at its configured
+15-minute cadence. The binding constraint has flipped, and every conclusion
+that rested on the old ordering has to move with it.
 
-That means it survived ~40 minutes. It is a conservative proxy: it misses gaps
-that live 5 minutes, which is correct, because a 5-minute gap is not tradeable
-against 15-minute Kalshi polling either. It is the reason stage one does not
-need a paid feed — the resolution we lack is resolution we could not act on.
+### The persistence criterion
 
-Measuring persistence *below* 40 minutes is precisely what stage two buys, and
-only if stage one passes.
+> A qualifying gap must appear in **at least two consecutive Kalshi snapshots**.
+
+That is **15 minutes**, not 40. Gap observations happen when both legs have
+data, so they occur at the Kalshi cadence, each paired with a sharp quote at
+most ~1 minute stale.
+
+### What that fixes, beyond the number
+
+The alignment error falls from *up to 40 minutes* to *about 1 minute*. This
+matters more than the persistence threshold does. At 40 minutes a measured
+"gap" could be entirely staleness — Pinnacle moved half an hour ago and the
+archive had not seen it — and there was no way to tell that apart from a real
+disagreement. At 1 minute that confound is essentially gone.
+
+The old design would have measured its own latency and reported it as an edge.
+
+---
+
+## 3b. Does stage one still not need a paid feed?
+
+**Yes — and now for a much stronger reason.**
+
+The earlier argument was contingent: a gap dying inside 40 minutes was not
+tradeable against 15-minute Kalshi polling, so the resolution we lacked was
+resolution we could not act on. That reasoning is fine but it is no longer the
+operative one.
+
+The operative reason now: **the sharp side is already about fifteen times
+faster than the Kalshi side.** Money spent making it faster still would improve
+the leg that is not binding. A sub-second Pinnacle feed paired with 15-minute
+Kalshi polling measures gaps at 15-minute resolution, exactly as a one-minute
+feed does. The spend would buy nothing measurable.
+
+**Raising the Kalshi cadence is the actual next move, and it costs nothing.**
+
+Kalshi is not credit-metered. Its cadence is bounded by requests-per-minute
+times the orderbook fan-out, and the current configuration is conservative:
+
+| Tickers | at 60 req/min *(configured)* | at 600 req/min |
+|---|---|---|
+| 120 | 120 s | 12 s |
+| 200 | 200 s | 20 s |
+| 500 | 500 s | 50 s |
+
+`rate_limit_per_minute: 60` is a number this repo chose, not one Kalshi
+imposed. Even unchanged, a full sweep of ~200 tickers takes about 3.5 minutes,
+so **the 15-minute cadence is leaving a factor of four on the table for free**.
+
+Order of operations, revised:
+
+1. **Verify Kalshi's real rate limit**, the same way the billing was verified —
+   measured, not read off a page. Then raise `rate_limit_per_minute` toward it.
+2. **Lower `kalshi_interval_seconds`** to just above a full sweep at that rate.
+   A 5-minute cadence looks safe today; 2 minutes looks reachable.
+3. **Re-derive the persistence criterion** from whatever cadence results. It is
+   two consecutive snapshots at whatever the slower leg then is — the rule is
+   fixed, the number follows from the configuration.
+4. **Only then** consider the Kalshi WebSocket, which is what gets below the
+   REST fan-out floor, and only if stage one has passed.
+
+Nothing on the odds side is worth buying until steps 1 and 2 are done. Both are
+config changes against a plan already paid for.
+
+### What is still bought at stage two
+
+Not sharp resolution — that is in hand. Stage two buys **depth**: realised fill
+size walked down the Kalshi book at the dislocated price, which no amount of
+polling on either side reveals and which the pricing analysis showed is the
+binding term in every revenue estimate.
 
 ---
 

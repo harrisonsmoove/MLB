@@ -1,5 +1,13 @@
 # Pricing the sharp feed
 
+> **CORRECTED 2026-09-24 (second revision).** This document was written
+> believing the account was on the 500-credit free tier. It is not: the probe
+> reports `remaining=16,288 used=3,712`, a **20,000-credit plan**, and has been
+> since 30 August. Every resolution figure below was 40x too pessimistic. The
+> corrected numbers are in section 3a, and section 7's conclusion is rewritten
+> in `reports/stage-one-gate.md` section 8. The conclusion survives — for a
+> different and stronger reason.
+
 Written before any WebSocket code, because what is affordable on the sharp side
 decides what dislocation is measurable at all, and a measurement threshold
 pre-registered against an unaffordable feed pre-registers nothing.
@@ -118,9 +126,56 @@ Three things fall straight out:
 3. **At ~$249 the quota stops binding and the per-second rate limit takes over.**
    Beyond that tier you are buying rate limit, not credits.
 
+### 3a. CORRECTED: the plan is 20,000 credits, and `bookmakers` bills at 1
+
+Measured on the box, not taken from the docs:
+
+```
+regions=us,eu, h2h                  2 credits
+regions=eu, h2h                     1 credit
+bookmakers=5 consensus books, h2h   1 credit   <- full consensus, one unit
+```
+
+The `bookmakers` parameter bills at one region-equivalent per ten books, so
+naming the five consensus books costs what one region costs. That is now wired
+in, sourced from `books.yaml` so the request and the consensus cannot drift.
+
+Sustainable interval at **20,000 credits/month**, slate hours only:
+
+| Request shape | credits | regular season | postseason |
+|---|---|---|---|
+| 5 books, h2h *(now)* | 1 | **59 s** | 32 s |
+| 5 books, h2h + totals | 2 | 2.0 m | 1.1 m |
+| 5 books, h2h + spreads + totals | 3 | 3.0 m | 1.6 m |
+| 5 books, h2h + totals + F5 (2 mkts) | 4 | 4.0 m | 2.2 m |
+| `us,us2,eu,uk`, 4 markets *(tier 1 default)* | 16 | 15.8 m | 8.6 m |
+
+Observed burn before the change: 3,712 credits in ~24 days at 2 credits a call
+— 1,856 calls, about every 19 minutes on a 24-hour basis, roughly 4,600 credits
+a month against a 20,000 allowance. **The plan was three-quarters unused.**
+
+Two consequences:
+
+1. **Sub-minute sharp polling is already paid for.** The feed the plan wanted to
+   buy is in hand. Section 7's "do not buy a feed yet" holds, but the reason is
+   no longer "measure cheaply first" — it is that there is nothing left to buy
+   on this side until the other side moves.
+2. **`tier: 1` is not the right lever.** Its default regions are
+   `us,us2,eu,uk`, four regions times four markets is 16 credits a call, and
+   most of those books carry zero consensus weight. Name the books and choose
+   the markets explicitly instead; tier-indexed defaults conflate "what my plan
+   allows" with "what I choose to request", and those are different questions.
+
 ---
 
 ## 4. Markets by tier
+
+**`markets_by_tier` has restricted this account to `h2h` for 25 days on a plan
+that pays for more.** `tier: 0` was never corrected after the upgrade. Note
+also that tier 1's list is `[h2h, spreads, totals, team_totals]` — **F5 keys are
+not in this config at all**, so fixing the tier alone does not unlock them.
+They have to be added, and their availability on this plan has to be probed the
+same way the billing was.
 
 Reported, not verified: **MLB first-5-innings markets require the Business tier**
 on the provider that publishes a Free/Professional/Business structure. Totals

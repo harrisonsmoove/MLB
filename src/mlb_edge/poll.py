@@ -239,25 +239,69 @@ class OddsPoller:
         self.quota_used: int | None = None
         self._warned_missing_season_end = False
 
+    def request_bookmakers(self) -> list[str]:
+        """The books to name explicitly, drawn from the consensus weights.
+
+        The Odds API bills the ``bookmakers`` parameter at one region-equivalent
+        per ten books, measured on the live plan rather than taken from the
+        docs: naming the five consensus books costs 1 credit per market, the
+        same as one region, with the full consensus intact.
+
+        Sourced from ``books.yaml`` rather than duplicated in ``settings.yaml``
+        so the request and the consensus cannot drift. Adding a book to the
+        consensus automatically starts fetching it; the alternative is two
+        lists that agree until one day they do not, which is how ``regions=eu``
+        nearly became a Pinnacle-only consensus that still satisfied
+        ``min_books_for_consensus`` and warned about nothing.
+        """
+        explicit = list(self.config.get("bookmakers") or [])
+        if explicit:
+            return explicit
+        if not self.config.get("bookmakers_from_consensus", True):
+            return []
+        books = self.settings.books or {}
+        weights = (books.get("consensus", {}) or {}).get("weights", {}) or {}
+        # `prediction_market` carries weight but is not a bookmaker key, so the
+        # request is intersected with the real book list rather than trusting
+        # the weights to contain only books.
+        known = {b.get("key") for b in (books.get("books") or []) if b.get("key")}
+        return sorted(k for k, w in weights.items() if w and k in known)
+
+    @property
+    def markets(self) -> list[str]:
+        tier = int(self.config.get("tier", 0))
+        return list((self.config.get("markets_by_tier", {}) or {}).get(tier, ["h2h"]))
+
+    @property
+    def regions(self) -> list[str]:
+        tier = int(self.config.get("tier", 0))
+        return list((self.config.get("regions_by_tier", {}) or {}).get(tier, ["us"]))
+
     @property
     def credits_per_call(self) -> int:
-        tier = int(self.config.get("tier", 0))
-        regions = (self.config.get("regions_by_tier", {}) or {}).get(tier, ["us"])
-        markets = (self.config.get("markets_by_tier", {}) or {}).get(tier, ["h2h"])
-        return max(len(regions) * len(markets), 1)
+        markets = self.markets
+        books = self.request_bookmakers()
+        # One region-equivalent per ten books, measured on the live plan.
+        units = -(-len(books) // 10) if books else len(self.regions)
+        return max(units * len(markets), 1)
 
     def poll(self) -> list[PollRecord]:
-        tier = int(self.config.get("tier", 0))
-        regions = (self.config.get("regions_by_tier", {}) or {}).get(tier, ["us"])
-        markets = (self.config.get("markets_by_tier", {}) or {}).get(tier, ["h2h"])
+        markets = self.markets
+        books = self.request_bookmakers()
         url = self.config.endpoint("odds", sport=self.config.get("sport_key"))
         params = {
             "apiKey": self.config.require("api_key"),
-            "regions": ",".join(regions),
             "markets": ",".join(markets),
             "oddsFormat": "american",
             "dateFormat": "iso",
         }
+        # `bookmakers` takes priority over `regions` at the API, so send one or
+        # the other rather than both -- sending both invites a later reader to
+        # believe the regions line is doing something.
+        if books:
+            params["bookmakers"] = ",".join(books)
+        else:
+            params["regions"] = ",".join(self.regions)
         try:
             response = self._client.get(url, params=params)
         except UpstreamError as exc:
