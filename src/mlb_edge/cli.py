@@ -1320,6 +1320,132 @@ def probe_billing(
     )
 
 
+@app.command(name="probe-ratelimit")
+def probe_ratelimit(
+    venue: Annotated[str, typer.Option(help="Source to probe, e.g. kalshi.")] = "kalshi",
+    confirm: Annotated[bool, typer.Option(help="Actually send the bursts.")] = False,
+    ceiling: Annotated[int, typer.Option(help="Highest rate to try, req/min.")] = 600,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Measure the real request rate a venue allows, rather than inheriting ours.
+
+    `rate_limit_per_minute` is a number this repo picked. So was `tier: 0`, and
+    that one cost 25 days of h2h-only polling on a plan that paid for more. A
+    guess that the code then obeys as though it were the venue's rule is not a
+    safety margin, it is an invented constraint -- and this one bounds how fast
+    the slower leg of the whole measurement can run.
+
+    Ramps in steps and stops at the first 429, reporting the highest rate that
+    stayed clean. Reads any `x-ratelimit-*` headers first, which is free.
+
+    Run it between slates if you can. It sends real requests on the production
+    key, and tripping a limit during a live slate costs archive coverage that
+    cannot be re-fetched.
+    """
+    import time as _time
+
+    from mlb_edge.http import HttpClient, UpstreamError
+
+    settings = load_settings(root)
+    source = settings.source(venue)
+    configured = int(source.get("rate_limit_per_minute", 0) or 0)
+    endpoints = source.get("endpoints") or {}
+    # A cheap, idempotent, unauthenticated endpoint if one exists.
+    path = endpoints.get("exchange_status") or endpoints.get("status") or next(
+        (v for k, v in endpoints.items() if "{" not in str(v)), None
+    )
+    if not path:
+        console.print(f"[red]no parameter-free endpoint for {venue}[/red]")
+        raise typer.Exit(1)
+    url = f"{source.base_url}{path}"
+    console.print(f"probing [bold]{venue}[/bold] at {url}")
+    console.print(f"configured rate_limit_per_minute: [bold]{configured}[/bold]\n")
+
+    # One request, no rate limiting of our own, to read whatever the venue says
+    # about its own limits. Free information, and often conclusive.
+    probe_client = HttpClient(
+        user_agent=settings.section("http").get("user_agent", "mlb-edge/0.1"),
+        timeout_seconds=10.0,
+        max_attempts=1,
+        rate_limit_per_minute=0,
+    )
+    try:
+        response = probe_client.get(url)
+    except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+        console.print(f"[red]could not reach {venue}:[/red] {exc}")
+        raise typer.Exit(1) from None
+
+    advertised = {
+        k: v for k, v in response.headers.items() if "ratelimit" in k.lower()
+    }
+    if advertised:
+        console.print("[green]the venue advertises its limits:[/green]")
+        for k, v in sorted(advertised.items()):
+            console.print(f"  {k}: {v}")
+        console.print("\nUse these rather than the ramp below if they are clear.")
+    else:
+        console.print("[dim]no x-ratelimit-* headers; the ramp is the only source[/dim]")
+
+    if not confirm:
+        console.print(
+            "\n[yellow]stopping here.[/yellow] Re-run with --confirm to ramp "
+            "request rates until the venue pushes back."
+        )
+        return
+
+    table = Table(title=f"{venue}: measured rate ceiling")
+    table.add_column("req/min", justify="right")
+    table.add_column("sent", justify="right")
+    table.add_column("429s", justify="right")
+    table.add_column("result")
+
+    best_clean = 0
+    for rate in (30, 60, 120, 240, 480, 960):
+        if rate > ceiling:
+            break
+        burst, throttled, other = 12, 0, 0
+        gap = 60.0 / rate
+        started = _time.monotonic()
+        for index in range(burst):
+            try:
+                probe_client.get(url)
+            except UpstreamError as exc:
+                if exc.status == 429:
+                    throttled += 1
+                else:
+                    other += 1
+            except Exception:  # noqa: BLE001 - a probe reports, never raises
+                other += 1
+            # Pace against the wall clock from the burst's start rather than
+            # sleeping a fixed gap, so request time does not slow the burst
+            # below the rate being tested. Testing 240/min at an actual 180
+            # would report a ceiling that was never reached.
+            due = started + gap * (index + 1)
+            _time.sleep(max(0.0, due - _time.monotonic()))
+        if throttled:
+            table.add_row(str(rate), str(burst), str(throttled), "[red]throttled[/red]")
+            console.print(table)
+            console.print(
+                f"\n[bold]Highest clean rate: {best_clean} req/min.[/bold] "
+                f"Configured is {configured}."
+            )
+            console.print(
+                "Set rate_limit_per_minute below the clean rate, not at it -- the "
+                "ceiling is shared with whatever else uses this key."
+            )
+            return
+        note = "[green]clean[/green]" if not other else f"[yellow]{other} other errors[/yellow]"
+        table.add_row(str(rate), str(burst), "0", note)
+        best_clean = rate
+
+    console.print(table)
+    console.print(
+        f"\n[bold]No throttling up to {best_clean} req/min[/bold] "
+        f"(configured: {configured}). The ceiling is above what was tried; "
+        "raise --ceiling to find it, or stop here if this is already enough."
+    )
+
+
 @app.command(name="poll-sources")
 def poll_sources(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Which venues the poller would actually poll, and why the others are out.

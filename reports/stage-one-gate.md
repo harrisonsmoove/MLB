@@ -18,8 +18,13 @@ publishes its fee schedule, so most of this is arithmetic rather than judgement:
 
 ```
 fee(P)    = 0.07 · P · (1 − P)          dollars per $1 contract
-floor(P)  = fee(P) + s(P)/2
+floor(P)  = fee(P) + s(P)/2 + align(L)
 ```
+
+where `align(L)` is the timing-error term defined in section 3a. All three
+terms are costs of taking the trade: the fee is charged, the spread is crossed,
+and the alignment term is the part of an apparent gap that could be explained
+by the two legs having been sampled at different moments.
 
 where `P` is the Kalshi contract price and `s(P)` the bid-ask spread at that
 price. The fee term is exact and maximal at a coin flip, which is where most
@@ -110,6 +115,51 @@ archive had not seen it — and there was no way to tell that apart from a real
 disagreement. At 1 minute that confound is essentially gone.
 
 The old design would have measured its own latency and reported it as an edge.
+
+---
+
+## 3a. Residual alignment error, and the floor it adds
+
+A gap is computed from two quotes taken at different moments. The difference
+between those moments is measurement error, and **a gap smaller than the timing
+error is not a gap** — it is the archive describing its own latency.
+
+Worst-case staleness of each leg is its polling interval:
+
+| Kalshi cadence | Sharp cadence | Worst-case spacing |
+|---|---|---|
+| 15 min *(current)* | ~1 min | **~16 min** |
+| 5 min *(after the rate probe)* | ~1 min | ~6 min |
+| 2 min | ~1 min | ~3 min |
+
+What that spacing costs in probability points depends on how fast the sharp
+price moves, which is **measurable from the archive already held**: the
+distribution of |ΔP| over the odds archive at lag L is exactly the error a gap
+measured at spacing L inherits.
+
+So the alignment term is defined now and measured before the first gap:
+
+```
+align(L) = 90th percentile of |P(t) - P(t-L)| across the odds archive
+floor(P) = 0.07·P·(1-P) + s(P)/2 + align(L)
+```
+
+**A candidate gap must exceed `floor(P)` including the alignment term.** The
+90th percentile rather than the median because the question is not "how much
+does the price usually move in L minutes" but "could this particular gap be
+explained by movement".
+
+Indicative, to be replaced by the measurement: MLB moneylines move on the order
+of 1–2 pp an hour in quiet periods and far more on lineup and weather news, so
+at L = 16 min expect `align` in the region of 0.5 pp and at L = 3 min something
+near 0.1 pp. Recording the guesses so the measured values can be compared
+against them.
+
+This is why the cadence work comes first, and it is not a rounding detail: at
+the old 40-minute spacing the alignment term would plausibly have been 1–1.5 pp
+against a 2.75 pp floor, meaning **more than a third of the threshold would have
+been pure timing error**. Stage one would have spent October measuring its own
+staleness and reporting the residue as an edge.
 
 ---
 
