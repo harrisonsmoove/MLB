@@ -236,8 +236,41 @@ What the numbers do establish, and what changes the plan:
    being collected right now. Only if stage one passes does stage two — buying
    ~$30/month for sub-minute resolution to measure persistence — become worth
    anything.
-4. **Drop the `us` region today.** It halves credit consumption and buys nothing
-   the consensus weights do not already zero out.
+4. **Halve the credit cost — but not by dropping `us`.** See the correction
+   below.
+
+### CORRECTION (2026-09-24): `us` is not discarded data
+
+Section 7 of the first draft said the `us` region "buys nothing the consensus
+weights do not already zero out". That is wrong, and checking `books.yaml`
+rather than remembering it shows why:
+
+```yaml
+pinnacle: 0.55      # eu
+circasports: 0.15   # us
+bookmaker: 0.10     # us
+betonlineag: 0.10   # us
+lowvig: 0.05        # us
+```
+
+**Forty per cent of the consensus weight sits in `us`-region books.** They are
+low-vig and sharp, which is why they carry weight; the earlier claim confused
+them with the recreational books that are correctly zeroed. Dropping `us` does
+not discard ignored data, it reduces the consensus to Pinnacle alone.
+
+The right move is neither region. The Odds API bills the `bookmakers` parameter
+at **one region-equivalent per ten bookmakers**, so naming the five consensus
+books explicitly costs **1 credit per market** — the same as `eu` alone, with
+the full consensus intact, and it makes the region question moot:
+
+```
+bookmakers=pinnacle,circasports,bookmaker,betonlineag,lowvig
+```
+
+That halves the current cost without losing anything. It needs a small change
+to `OddsPoller.poll` and `credits_per_call`, which currently only understand
+regions. Verify the billing empirically before committing: one call, and read
+the `x-requests-remaining` delta from the response header.
 
 ### On the market-making fallback
 
