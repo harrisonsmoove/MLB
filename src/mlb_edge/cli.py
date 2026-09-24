@@ -1814,25 +1814,58 @@ def probe_depth(
     )
 
 
+def _resident_mb() -> float:
+    """Resident memory of this process, MB. Linux only; 0.0 elsewhere."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
+def _available_mb() -> float:
+    """MemAvailable, MB. What the kernel thinks can be handed out without swap."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
+
+
 @app.command(name="adverse-selection")
 def adverse_selection(
     reference: Annotated[str, typer.Option(help="Sharp book to price against.")] = "pinnacle",
     half_spread: Annotated[float, typer.Option(help="Half the Kalshi spread, in probability.")] = 0.01,
     alignment: Annotated[float, typer.Option(help="Timing-error term added to the floor.")] = 0.0,
     min_gaps: Annotated[int, typer.Option(help="Below this, report underpowered and stop.")] = 50,
+    flush_rows: Annotated[int, typer.Option(help="Rows held before spilling to staging.")] = 50_000,
+    memory_budget_mb: Annotated[float, typer.Option(help="Stop cleanly above this RSS. 0 disables.")] = 0.0,
+    keep_staging: Annotated[bool, typer.Option(help="Leave the staging files for inspection.")] = False,
     root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """When Kalshi disagreed with the sharp price, which way did it then move?
 
     Pre-registered in reports/adverse-selection.md, before any gap was measured.
-    Reads only the archive already on disk -- no network, no cost -- and answers
-    the question that makes stage one meaningless if it comes back wrong.
+    Reads only the archive already on disk -- no network, no cost.
+
+    Memory is bounded by construction, because the box has no swap and the
+    first version was OOM-killed after printing two numbers. Quotes are parsed
+    in one streaming pass and spilled to staging parquet; the analysis then
+    reads back ONE MATCHUP at a time. Peak is set by the flush size and the
+    largest single matchup, not by the archive.
 
     Reports the qualifying-gap COUNT first. Under --min-gaps the honest output
     is "not enough gaps yet", not a verdict read off thirty observations.
     """
     import json as _json
-    from collections import defaultdict
+    import shutil
+    import tempfile
 
     import polars as pl
 
@@ -1845,6 +1878,7 @@ def adverse_selection(
         sharp_fair,
         summarise,
     )
+    from mlb_edge.kalshi_tickers import canonical_name, parse_ticker
     from mlb_edge.market.prices import american_to_prob
     from mlb_edge.poll import PollArchive
     from mlb_edge.timeutil import parse_iso_utc
@@ -1856,108 +1890,208 @@ def adverse_selection(
         archive_root if archive_root.is_absolute() else settings.root / archive_root
     )
 
-    # --- the sharp leg ------------------------------------------------------
-    # Pinnacle alone, not a consensus: stripping the recreational books leaves
-    # a consensus of one anyway, and the weighted logit mean is step 7 of the
-    # plan. The sign of convergence does not need it.
-    sharp: dict[tuple[str, str], list[Quote]] = defaultdict(list)
-    first_pitch: dict[tuple[str, str], Any] = {}
-    for path in archive.files("odds"):
-        frame = pl.read_parquet(path, columns=["payload", "error", "fetched_at"])
-        for payload, error, at in zip(
-            frame["payload"].to_list(), frame["error"].to_list(),
-            frame["fetched_at"].to_list(), strict=False,
-        ):
-            if error or not payload:
-                continue
-            try:
-                events = _json.loads(payload)
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(events, list):
-                continue
-            for event in events:
-                if not isinstance(event, dict):
-                    continue
-                home, away = event.get("home_team"), event.get("away_team")
-                if not (home and away):
-                    continue
-                prices = _reference_prices(event, reference)
-                if prices is None:
-                    continue
-                fair = sharp_fair(american_to_prob(prices[0]), american_to_prob(prices[1]))
-                if not fair:
-                    continue
-                key = (str(home), str(away))
-                sharp[key].append(Quote(at, fair.get("shin", next(iter(fair.values())))))
-                raw = event.get("commence_time")
-                if raw and key not in first_pitch:
-                    with contextlib.suppress(ValueError, TypeError):
-                        first_pitch[key] = parse_iso_utc(str(raw))
-
-    if not sharp:
-        console.print(
-            f"[red]no {reference} prices in the odds archive.[/red] "
-            "Check the book key against books.yaml."
-        )
-        raise typer.Exit(1)
-
-    # --- the Kalshi leg -----------------------------------------------------
-    from mlb_edge.kalshi_tickers import parse_ticker
-
-    kalshi: dict[frozenset[str], list[Quote]] = defaultdict(list)
-    for path in archive.files("kalshi"):
-        frame = pl.read_parquet(
-            path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
-        )
-        for endpoint, key, payload, error, at in zip(
-            frame["endpoint"].to_list(), frame["key"].to_list(),
-            frame["payload"].to_list(), frame["error"].to_list(),
-            frame["fetched_at"].to_list(), strict=False,
-        ):
-            if endpoint != "orderbook" or error or not payload or not key:
-                continue
-            parsed = parse_ticker(str(key))
-            if parsed is None:
-                continue
-            book = _parse_orderbook(payload)
-            if book is None:
-                continue
-            raw = _orderbook_pairs(payload)
-            if raw is None:
-                continue
-            mid = kalshi_mid(raw[0], raw[1])
-            if mid is None:
-                continue
-            kalshi[parsed.team_set].append(Quote(at, mid))
-
+    # The budget is on GROWTH, not on total resident memory. The interpreter
+    # plus polars is already ~150 MB before a single row is read, so a budget
+    # set as a fraction of available memory would abort on the first check on a
+    # 2 GB box -- a guard that always trips is worse than no guard.
+    baseline = _resident_mb()
+    available = _available_mb()
+    budget = memory_budget_mb or (available * 0.5 if available else 0.0)
     console.print(
-        f"sharp series: {len(sharp):,} matchups   "
-        f"kalshi series: {len(kalshi):,} matchups"
+        f"memory: {baseline:.0f} MB resident at start, {available:.0f} MB available"
+        + (f", stopping after {budget:.0f} MB of growth" if budget else "")
     )
 
-    # --- join and measure ---------------------------------------------------
-    from mlb_edge.kalshi_tickers import canonical_name
+    staging = Path(tempfile.mkdtemp(prefix="mlb-adverse-"))
+    spilled = 0
 
-    gaps: list[Any] = []
-    matched = 0
-    for (home, away), sharp_quotes in sharp.items():
-        pair = frozenset({canonical_name(home), canonical_name(away)})
-        kalshi_quotes = kalshi.get(pair)
-        if not kalshi_quotes:
-            continue
-        matched += 1
-        start = first_pitch.get((home, away)) or max(q.at for q in kalshi_quotes)
-        found = find_gaps(
-            kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
-            half_spread=half_spread, alignment=alignment,
+    def spill(rows: list[dict[str, Any]], tag: str) -> None:
+        nonlocal spilled
+        if not rows:
+            return
+        pl.DataFrame(rows).write_parquet(staging / f"{tag}-{spilled:05d}.parquet")
+        spilled += 1
+        rows.clear()
+
+    def grown_mb() -> float:
+        return max(_resident_mb() - baseline, 0.0)
+
+    def over_budget() -> bool:
+        return bool(budget) and grown_mb() > budget
+
+    try:
+        # --- pass one: parse every row to four columns and spill -----------
+        first_pitch: dict[str, Any] = {}
+        buffer: list[dict[str, Any]] = []
+        files = archive.files("odds")
+        for number, path in enumerate(files, 1):
+            frame = pl.read_parquet(path, columns=["payload", "error", "fetched_at"])
+            for payload, error, at in zip(
+                frame["payload"].to_list(), frame["error"].to_list(),
+                frame["fetched_at"].to_list(), strict=False,
+            ):
+                if error or not payload:
+                    continue
+                try:
+                    events = _json.loads(payload)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(events, list):
+                    continue
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    home, away = event.get("home_team"), event.get("away_team")
+                    if not (home and away):
+                        continue
+                    prices = _reference_prices(event, reference)
+                    if prices is None:
+                        continue
+                    fair = sharp_fair(
+                        american_to_prob(prices[0]), american_to_prob(prices[1])
+                    )
+                    if not fair:
+                        continue
+                    pair = _pair_key(str(home), str(away), canonical_name)
+                    buffer.append({
+                        "pair": pair, "at": at,
+                        "price": fair.get("shin", next(iter(fair.values()))),
+                    })
+                    raw = event.get("commence_time")
+                    if raw and pair not in first_pitch:
+                        with contextlib.suppress(ValueError, TypeError):
+                            first_pitch[pair] = parse_iso_utc(str(raw))
+            if len(buffer) >= flush_rows:
+                spill(buffer, "sharp")
+            if number % 50 == 0 or number == len(files):
+                console.print(
+                    f"  odds {number:,}/{len(files):,} files   "
+                    f"+{grown_mb():.0f} MB", highlight=False
+                )
+            if over_budget():
+                spill(buffer, "sharp")
+                console.print(
+                    f"[red]stopping: grew {grown_mb():.0f} MB, past the "
+                    f"{budget:.0f} MB budget.[/red] Lower --flush-rows, or raise "
+                    "--memory-budget-mb if you know the box can take it."
+                )
+                raise typer.Exit(2)
+        spill(buffer, "sharp")
+
+        files = archive.files("kalshi")
+        for number, path in enumerate(files, 1):
+            frame = pl.read_parquet(
+                path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
+            )
+            for endpoint, key, payload, error, at in zip(
+                frame["endpoint"].to_list(), frame["key"].to_list(),
+                frame["payload"].to_list(), frame["error"].to_list(),
+                frame["fetched_at"].to_list(), strict=False,
+            ):
+                if endpoint != "orderbook" or error or not payload or not key:
+                    continue
+                parsed = parse_ticker(str(key))
+                if parsed is None:
+                    continue
+                pairs = _orderbook_pairs(payload)
+                if pairs is None:
+                    continue
+                mid = kalshi_mid(pairs[0], pairs[1])
+                if mid is None:
+                    continue
+                buffer.append({
+                    "pair": _pair_key(*sorted(parsed.teams), canonical_name),
+                    "at": at, "price": mid,
+                })
+            if len(buffer) >= flush_rows:
+                spill(buffer, "kalshi")
+            if number % 100 == 0 or number == len(files):
+                console.print(
+                    f"  kalshi {number:,}/{len(files):,} files   "
+                    f"+{grown_mb():.0f} MB", highlight=False
+                )
+            if over_budget():
+                spill(buffer, "kalshi")
+                console.print(
+                    f"[red]stopping: grew {grown_mb():.0f} MB, past the "
+                    f"{budget:.0f} MB budget.[/red] Lower --flush-rows."
+                )
+                raise typer.Exit(2)
+        spill(buffer, "kalshi")
+
+        sharp_files = sorted(staging.glob("sharp-*.parquet"))
+        kalshi_files = sorted(staging.glob("kalshi-*.parquet"))
+        if not sharp_files or not kalshi_files:
+            console.print(
+                f"[red]nothing to analyse[/red] -- sharp rows: {len(sharp_files)} "
+                f"staging files, kalshi: {len(kalshi_files)}. "
+                f"Check that {reference!r} appears in the odds payloads."
+            )
+            raise typer.Exit(1)
+
+        sharp_scan = pl.scan_parquet(sharp_files)
+        kalshi_scan = pl.scan_parquet(kalshi_files)
+        pairs = sorted(
+            set(sharp_scan.select("pair").unique().collect()["pair"].to_list())
+            & set(kalshi_scan.select("pair").unique().collect()["pair"].to_list())
         )
-        attach_outcomes(found, kalshi_quotes, first_pitch=start)
-        gaps.extend(found)
+        console.print(f"\nmatchups on both venues: [bold]{len(pairs):,}[/bold]")
 
-    console.print(f"matchups on both venues: [bold]{matched:,}[/bold]")
+        # --- pass two: one matchup at a time -------------------------------
+        gaps: list[Any] = []
+        paired = 0
+        for number, pair in enumerate(pairs, 1):
+            sharp_rows = (
+                sharp_scan.filter(pl.col("pair") == pair)
+                .select(["at", "price"]).collect()
+            )
+            kalshi_rows = (
+                kalshi_scan.filter(pl.col("pair") == pair)
+                .select(["at", "price"]).collect()
+            )
+            sharp_quotes = [
+                Quote(a, p) for a, p in zip(
+                    sharp_rows["at"].to_list(), sharp_rows["price"].to_list(), strict=False
+                )
+            ]
+            kalshi_quotes = [
+                Quote(a, p) for a, p in zip(
+                    kalshi_rows["at"].to_list(), kalshi_rows["price"].to_list(), strict=False
+                )
+            ]
+            paired += len(kalshi_quotes)
+            start = first_pitch.get(pair) or (
+                max(q.at for q in kalshi_quotes) if kalshi_quotes else None
+            )
+            if start is None:
+                continue
+            found = find_gaps(
+                kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
+                half_spread=half_spread, alignment=alignment,
+            )
+            attach_outcomes(found, kalshi_quotes, first_pitch=start)
+            gaps.extend(found)
+            del sharp_quotes, kalshi_quotes, sharp_rows, kalshi_rows
+            if number % 20 == 0 or number == len(pairs):
+                console.print(
+                    f"  matchup {number:,}/{len(pairs):,}   "
+                    f"{paired:,} quotes paired   {len(gaps):,} gaps   "
+                    f"+{grown_mb():.0f} MB", highlight=False
+                )
+            if over_budget():
+                console.print(
+                    f"[red]stopping at matchup {number}: grew {grown_mb():.0f} MB, "
+                    f"past the {budget:.0f} MB budget.[/red] This matchup has more "
+                    "quotes than the budget allows; raise it or narrow the archive."
+                )
+                raise typer.Exit(2)
+    finally:
+        if keep_staging:
+            console.print(f"[dim]staging kept at {staging}[/dim]")
+        else:
+            shutil.rmtree(staging, ignore_errors=True)
+
     console.print(f"qualifying gaps above the floor: [bold]{len(gaps):,}[/bold]\n")
-
     if len(gaps) < min_gaps:
         console.print(
             f"[yellow]NOT ENOUGH GAPS YET.[/yellow] {len(gaps)} qualifying gaps is "
@@ -1968,14 +2102,18 @@ def adverse_selection(
         )
         return
 
+    _report_convergence(gaps, summarise, breakeven_toward_rate)
+
+
+def _pair_key(home: str, away: str, canonical: Any) -> str:
+    """A stable string key for an unordered matchup."""
+    return "|".join(sorted({canonical(home), canonical(away)}))
+
+
+def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None:
     table = Table(title="realised convergence toward the sharp price")
-    table.add_column("horizon")
-    table.add_column("n", justify="right")
-    table.add_column("mean", justify="right")
-    table.add_column("median", justify="right")
-    table.add_column("toward", justify="right")
-    table.add_column("floor", justify="right")
-    table.add_column("verdict")
+    for column in ("horizon", "n", "mean", "median", "toward", "floor", "verdict"):
+        table.add_column(column, justify="right" if column != "horizon" else "left")
 
     gating = None
     for horizon in ("+1 snapshot", "+1 hour", "close"):
@@ -1998,20 +2136,21 @@ def adverse_selection(
         )
     console.print(table)
 
-    # The win rate is only meaningful beside the threshold it has to clear.
     buckets = Table(title="toward-rate against its break-even, by gap size")
-    buckets.add_column("gap")
-    buckets.add_column("n", justify="right")
-    buckets.add_column("observed", justify="right")
-    buckets.add_column("break-even", justify="right")
+    for column in ("gap", "n", "observed", "break-even"):
+        buckets.add_column(column, justify="right" if column != "gap" else "left")
     for low, high in ((0.0, 0.04), (0.04, 0.06), (0.06, 0.10), (0.10, 1.0)):
-        inside = [g for g in gaps if low <= g.size < high and g.convergence("close") is not None]
+        inside = [
+            g for g in gaps
+            if low <= g.size < high and g.convergence("close") is not None
+        ]
         if not inside:
             continue
         toward = sum(1 for g in inside if (g.convergence("close") or 0) > 0)
-        mid_gap = statistics.fmean([g.size for g in inside])
-        friction = statistics.fmean([g.floor for g in inside])
-        need = breakeven_toward_rate(mid_gap, friction)
+        need = breakeven(
+            statistics.fmean([g.size for g in inside]),
+            statistics.fmean([g.floor for g in inside]),
+        )
         buckets.add_row(
             f"{low * 100:.0f}-{high * 100:.0f}pp", f"{len(inside):,}",
             f"{toward / len(inside) * 100:.1f}%", f"{need * 100:.1f}%",
@@ -2019,12 +2158,9 @@ def adverse_selection(
     console.print(buckets)
 
     if gating is None or gating.observations == 0:
-        # A verdict from no observations is the failure this whole study exists
-        # to avoid, arriving in the study itself.
         console.print(
             "\n[yellow]No gap had a later Kalshi quote to compare against.[/yellow] "
-            "Gaps were found but none could be followed to a close -- check that "
-            "the archive spans past first pitch for these games. No verdict."
+            "Gaps were found but none could be followed to a close. No verdict."
         )
         return
     if gating.negative:

@@ -212,7 +212,9 @@ def test_no_followable_gap_yields_no_verdict() -> None:
 
     from mlb_edge import cli
 
-    source = inspect.getsource(cli.adverse_selection)
+    # The reporting moved into a helper during the streaming rewrite; check
+    # where the code is, not where it used to be.
+    source = inspect.getsource(cli._report_convergence)
     assert "gating.observations == 0" in source
     assert "No verdict" in source
 
@@ -232,3 +234,60 @@ def test_summarise_of_unfollowable_gaps_is_empty_not_positive() -> None:
     result = summarise([orphan], "close")
     assert result.observations == 0
     assert not result.clears_floor and not result.negative
+
+
+# --- memory, because the box has no swap -----------------------------------
+
+
+def test_the_budget_is_on_growth_not_on_total_resident() -> None:
+    """Found by running it: the interpreter plus polars is ~150 MB before a
+    single row is read.
+
+    A budget set as a fraction of available memory would abort on the first
+    check on a 2 GB box, and a guard that always trips is worse than no guard.
+    """
+    import inspect
+
+    from mlb_edge import cli
+
+    source = inspect.getsource(cli.adverse_selection)
+    assert "baseline = _resident_mb()" in source
+    assert "grown_mb" in source
+
+
+def test_resident_and_available_are_read_not_guessed() -> None:
+    from mlb_edge.cli import _available_mb, _resident_mb
+
+    resident = _resident_mb()
+    assert resident > 0, "this process occupies memory"
+    # Absent /proc these return 0.0 rather than raising, so the command still
+    # runs on a platform that does not expose it.
+    assert _available_mb() >= 0.0
+
+
+def test_outcomes_are_attached_by_binary_search_not_by_rescanning() -> None:
+    """The per-gap list comprehension allocated a fresh list of every quote in
+    the matchup, per gap, per horizon -- a large part of what made this
+    unrunnable on 465,176 rows."""
+    import inspect
+
+    from mlb_edge.eval import adverse
+
+    source = inspect.getsource(adverse.attach_outcomes)
+    assert "bisect" in source
+    assert "for q in ordered if" not in source
+
+
+def test_attach_outcomes_is_unchanged_by_the_rewrite() -> None:
+    """Behaviour-preserving: the bisect version must agree with the obvious one."""
+    start = datetime(2026, 9, 20, 21, 0, tzinfo=UTC)
+    kalshi = _series(start, [0.50, 0.52, 0.54, 0.56, 0.58])
+    sharp = _series(start, [0.60] * 5)
+
+    gaps = find_gaps(kalshi, sharp, game_pk=1, first_pitch=FIRST_PITCH)
+    attach_outcomes(gaps, kalshi, first_pitch=FIRST_PITCH)
+
+    first = gaps[0]
+    assert first.later["+1 snapshot"] == pytest.approx(0.52)
+    assert first.later["+1 hour"] == pytest.approx(0.58)
+    assert first.later["close"] == pytest.approx(0.58)

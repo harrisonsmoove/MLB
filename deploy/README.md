@@ -310,3 +310,43 @@ notice. Three distinct alerts, because they have three different fixes:
 | `backup:unconfigured` | no `push_command` — the archive has no off-box copy at all |
 | `backup:never` | a command is set and has never succeeded — credentials or bucket |
 | `backup:stale` | it worked once and has not for `max_age_hours` |
+
+
+## The box has no swap
+
+1,968 MB total, no swap file. A process that spikes is **killed outright** by
+the kernel, not slowed down — no traceback, no exit code, nothing on stdout.
+From the terminal, "still working", "hung" and "killed four minutes ago" look
+identical.
+
+`adverse-selection` was OOM-killed after printing two lines. It had
+materialised 465,176 orderbook rows as Python objects: 56 MB of `Quote` objects
+alone, before the dicts holding them, the payload strings, and polars' buffers,
+against roughly 254 MB free.
+
+**This is a constraint on every analysis command, not on that one.** Anything
+that reads the archive is bounded by construction or it is a future outage:
+
+* **Stream and spill.** Parse in one pass, keep a bounded buffer, write
+  compact staging parquet, then read back one unit of work at a time. Peak is
+  the flush size plus the largest single unit, never the archive.
+  `--flush-rows` exposes the first; `mlb_edge.features.pa_outcomes` is the same
+  pattern for Statcast.
+* **Budget growth, not total.** The interpreter plus polars is about 150 MB
+  before a row is read, so a budget expressed as a fraction of free memory
+  aborts on its first check. Measure resident memory at start and cap the
+  *increase*.
+* **Print progress with memory.** Every command that can run for minutes
+  reports units done and MB grown, so a stall is distinguishable from a crawl
+  without `dmesg`.
+* **Stop before the kernel does.** A clean message naming the limit and the
+  flag that changes it beats an OOM kill, which says nothing at all.
+
+Confirming a kill after the fact:
+
+```bash
+dmesg -T | grep -i -E "out of memory|oom-kill" | tail
+journalctl -k --since "10 min ago" | grep -i oom
+```
+
+Both are empty when a process exits normally, which is itself the answer.

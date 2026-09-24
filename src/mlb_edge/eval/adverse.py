@@ -203,18 +203,33 @@ def attach_outcomes(
     first_pitch: datetime,
     snapshot: timedelta = timedelta(minutes=15),
 ) -> None:
-    """Fill in where Kalshi's price went after each gap."""
+    """Fill in where Kalshi's price went after each gap.
+
+    Binary search over one sorted timestamp list. The first version ran a list
+    comprehension per gap per horizon, allocating a fresh list of up to every
+    quote in the matchup each time -- fine on a synthetic series, and a large
+    part of what made this unrunnable on 465,176 real rows.
+    """
+    import bisect
+
     ordered = sorted(kalshi, key=lambda q: q.at)
-    closing = [q for q in ordered if q.at <= first_pitch]
+    if not ordered:
+        return
+    stamps = [q.at for q in ordered]
+
+    closing: float | None = None
+    closing_at: datetime | None = None
+    cut = bisect.bisect_right(stamps, first_pitch)
+    if cut:
+        closing, closing_at = ordered[cut - 1].price, stamps[cut - 1]
 
     for gap in gaps:
         for label, delay in (("+1 snapshot", snapshot), ("+1 hour", snapshot * 4)):
-            target = gap.at + delay
-            later = [q for q in ordered if q.at >= target]
-            if later:
-                gap.later[label] = later[0].price
-        if closing and closing[-1].at > gap.at:
-            gap.later["close"] = closing[-1].price
+            index = bisect.bisect_left(stamps, gap.at + delay)
+            if index < len(ordered):
+                gap.later[label] = ordered[index].price
+        if closing is not None and closing_at is not None and closing_at > gap.at:
+            gap.later["close"] = closing
 
 
 def summarise(gaps: list[Gap], horizon: str) -> ConvergenceResult:
