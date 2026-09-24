@@ -1214,6 +1214,112 @@ def explain_coverage(
         )
 
 
+@app.command(name="probe-billing")
+def probe_billing(
+    root: Annotated[Path | None, typer.Option()] = None,
+    confirm: Annotated[bool, typer.Option(help="Actually spend the credits.")] = False,
+) -> None:
+    """Measure what a request actually costs, and how big the plan really is.
+
+    The Odds API documents `bookmakers` as billing one region-equivalent per
+    ten bookmakers, which would give the full five-book consensus for the price
+    of one region. Documentation is a claim; the response header is the fact.
+    This makes one call of each shape and reads the `x-requests-remaining`
+    delta, so the change is wired in against a measurement rather than a doc.
+
+    It also answers a question nobody asked: `x-requests-used` plus
+    `x-requests-remaining` is the plan size for the period, which is worth
+    knowing independently of what the config believes.
+
+    Costs about 3 credits. Requires --confirm, because a diagnostic that spends
+    from a budget this tight should be deliberate.
+    """
+    from mlb_edge.http import UpstreamError, client_for
+
+    settings = load_settings(root)
+    source = settings.source("odds")
+    client = client_for(settings, "odds")
+    sport = source.get("sport_key", "baseball_mlb")
+    odds_url = source.endpoint("odds", sport=sport)
+    base = source.base_url
+
+    def quota(url: str, params: dict[str, Any]) -> tuple[int | None, int | None, str]:
+        try:
+            response = client.get(url, params=params)
+        except UpstreamError as exc:
+            return None, None, f"HTTP {exc.status}: {exc}"
+        except Exception as exc:  # noqa: BLE001 - a probe reports, never raises
+            return None, None, f"{type(exc).__name__}: {exc}"
+        headers = {k.lower(): v for k, v in response.headers.items()}
+
+        def as_int(name: str) -> int | None:
+            try:
+                return int(headers[name])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        return as_int("x-requests-remaining"), as_int("x-requests-used"), ""
+
+    key = source.require("api_key")
+
+    # /sports is documented as free. Reading the quota through it costs nothing
+    # and establishes the baseline the two paid calls are measured against.
+    remaining, used, error = quota(f"{base}/sports", {"apiKey": key})
+    if error:
+        console.print(f"[red]could not read the quota:[/red] {error}")
+        raise typer.Exit(1)
+    console.print(f"quota now: remaining={remaining:,} used={used:,}")
+    if remaining is not None and used is not None:
+        console.print(
+            f"[bold]plan size for this period: {remaining + used:,} credits[/bold]  "
+            f"(config believes {source.get('monthly_request_budget')})"
+        )
+    if not confirm:
+        console.print(
+            "\n[yellow]stopping here.[/yellow] Re-run with --confirm to spend ~3 "
+            "credits measuring what each request shape actually bills."
+        )
+        return
+
+    consensus = [
+        b["key"]
+        for b in settings.books.get("books", [])
+        if settings.books.get("consensus", {}).get("weights", {}).get(b.get("key"), 0)
+    ]
+    shapes = [
+        ("regions=us,eu, h2h  (current)", {"regions": "us,eu", "markets": "h2h"}),
+        ("regions=eu, h2h", {"regions": "eu", "markets": "h2h"}),
+    ]
+    if consensus:
+        shapes.append(
+            (
+                f"bookmakers={len(consensus)} consensus books, h2h",
+                {"bookmakers": ",".join(consensus), "markets": "h2h"},
+            )
+        )
+
+    table = Table(title="measured cost per call")
+    table.add_column("request shape")
+    table.add_column("credits", justify="right")
+    table.add_column("note")
+
+    previous = remaining
+    for label, extra in shapes:
+        after, _, err = quota(odds_url, {"apiKey": key, "oddsFormat": "american", **extra})
+        if err or after is None or previous is None:
+            table.add_row(label, "-", f"[red]{err or 'no header'}[/red]")
+            continue
+        spent = previous - after
+        table.add_row(label, str(spent), "")
+        previous = after
+    console.print(table)
+    console.print(
+        "\nIf the bookmakers row bills more than 1, the documented "
+        "one-region-per-ten-bookmakers rule does not hold for this plan. "
+        "Report the number rather than wiring the change in."
+    )
+
+
 @app.command(name="poll-sources")
 def poll_sources(root: Annotated[Path | None, typer.Option()] = None) -> None:
     """Which venues the poller would actually poll, and why the others are out.

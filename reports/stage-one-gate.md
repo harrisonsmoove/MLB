@@ -128,7 +128,44 @@ uniform rate, and it points at market-making rather than at taking.
 
 ---
 
-## 5. What failure means
+## 5. What PASSING means
+
+**Passing stage one is not permission to trade. It is permission to buy
+resolution and run stage two.**
+
+Recorded here explicitly, before any number exists, because the failure mode is
+obvious in advance and invisible in the moment: a passing frequency in October
+becomes live size in October, on a board measured at 40-minute resolution, in
+the 35-game window the pricing analysis already showed returns about $26.
+
+What a pass licenses, in order:
+
+1. Buy sub-minute resolution on the sharp side.
+2. Measure **persistence below 40 minutes** — the thing stage one structurally
+   cannot see, and the thing that decides whether a gap is reachable.
+3. Measure **realised depth** at the dislocated price, walked down the book,
+   rather than assumed.
+4. Paper-log against live quotes until the paper log and the measurement agree.
+
+Only then, size. The gate answers "does a gap exist"; it does not answer "can I
+get filled at it", and those are different questions with different failure
+modes.
+
+## 6. Why the consensus stays at two credits
+
+An `eu`-only request would halve the spend and reduce the consensus to Pinnacle
+plus the prediction-market slot — which is **the venue being priced against**.
+`min_books_for_consensus: 2` would still be satisfied, so nothing would warn,
+and the gate would be comparing Kalshi to a reference that partly *is* Kalshi.
+
+A passing gate built on that would be an artifact of the circularity, not a
+finding, and it would look exactly like a real result.
+
+So the consensus keeps its four `us`-region sharp books at two credits a call
+until the `bookmakers` parameter is verified to bill at one. The halving is
+worth having; it is not worth having at the cost of the reference.
+
+## 7. What failure means
 
 Stage one failing does not mean try a different devig, a different floor, or a
 different window. The floor comes from a published fee schedule; the frequency

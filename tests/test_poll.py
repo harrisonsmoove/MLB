@@ -459,3 +459,59 @@ def test_config_places_season_end_under_the_poller(settings_with_keys):
     """Pins the key's location so the same misfiling is caught immediately."""
     assert settings_with_keys.section("poller").get("season_end_date")
     assert "season_end_date" not in settings_with_keys.section("backup")
+
+
+# ---------------------------------------------------------------------------
+# Measuring the plan rather than believing the config
+# ---------------------------------------------------------------------------
+def test_probe_billing_does_not_spend_without_confirm(settings_with_keys, monkeypatch):
+    """A diagnostic that spends from a 500-or-20,000 credit budget is
+    deliberate or it is a bug."""
+    from typer.testing import CliRunner
+
+    from mlb_edge.cli import app
+
+    calls: list[str] = []
+
+    class _Response:
+        status = 200
+        headers = {"x-requests-remaining": "19928", "x-requests-used": "72"}
+
+    class _Client:
+        def get(self, url, **kwargs):
+            calls.append(url)
+            return _Response()
+
+    monkeypatch.setattr("mlb_edge.http.client_for", lambda *a, **k: _Client())
+    result = CliRunner().invoke(app, ["probe-billing"])
+
+    assert result.exit_code == 0, result.output
+    # Exactly one call: the free /sports quota read. No odds call, no credits.
+    assert len(calls) == 1
+    assert calls[0].endswith("/sports")
+    assert "Re-run with --confirm" in result.output
+
+
+def test_probe_billing_reports_the_real_plan_size(settings_with_keys, monkeypatch):
+    """remaining + used is the plan for the period, whatever the config thinks.
+
+    Worth surfacing on its own: the config declares a 500-credit free tier, and
+    a box reporting 19,928 remaining is not on a 500-credit plan.
+    """
+    from typer.testing import CliRunner
+
+    from mlb_edge.cli import app
+
+    class _Response:
+        status = 200
+        headers = {"x-requests-remaining": "19928", "x-requests-used": "72"}
+
+    class _Client:
+        def get(self, url, **kwargs):
+            return _Response()
+
+    monkeypatch.setattr("mlb_edge.http.client_for", lambda *a, **k: _Client())
+    result = CliRunner().invoke(app, ["probe-billing"])
+
+    assert "plan size for this period: 20,000 credits" in result.output
+    assert "config believes 500" in result.output
