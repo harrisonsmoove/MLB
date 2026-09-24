@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 #: Ticker team code -> canonical MLB team name, as the schedule spells it.
@@ -407,13 +407,18 @@ def join_tickers(
             game = candidates[0]
             result.matched[game.game_pk] = parsed.ticker
             if parsed.start_hhmm:
-                samples.append(
-                    (
-                        game.start_ts.hour * 60 + game.start_ts.minute,
-                        int(parsed.start_hhmm[:2]) * 60 + int(parsed.start_hhmm[2:]),
-                    )
-                )
+                samples.append(_clock_sample(game, parsed))
             continue
+        # Contested on WHICH GAME, but not necessarily on what time of day.
+        # A three-game series starts at 19:05 every night, so all its
+        # candidates agree on the clock even though they disagree on the date.
+        # Learning the offset only from single-candidate matchups starves the
+        # inference on a multi-day archive -- almost every ticker has a
+        # neighbouring night inside the one-day window -- and with no offset
+        # every one of them is then refused as an ambiguous doubleheader.
+        # The clock is knowable here; only the date is not.
+        if parsed.start_hhmm and _same_time_of_day(candidates):
+            samples.append(_clock_sample(candidates[0], parsed))
         contested.append((parsed, candidates))
 
     result.clock_offset_minutes = infer_clock_offset(samples)
@@ -456,7 +461,10 @@ def _pick_by_start(
     ticker_minutes = int(parsed.start_hhmm[:2]) * 60 + int(parsed.start_hhmm[2:])
 
     if offset is not None:
-        picked = _best_under_offset(candidates, ticker_minutes, offset, tolerance_minutes)
+        picked = _best_under_offset(
+            candidates, ticker_minutes, offset, tolerance_minutes,
+            game_date=parsed.game_date,
+        )
         if picked is None:
             result.ambiguous.update(g.game_pk for g in candidates)
         return picked
@@ -480,10 +488,66 @@ def _pick_by_start(
     return None
 
 
+def _clock_sample(game: Any, parsed: ParsedTicker) -> tuple[int, int]:
+    """``(game UTC minutes, ticker clock minutes)`` for offset inference."""
+    start = _as_utc(game.start_ts)
+    return (
+        start.hour * 60 + start.minute,
+        int(parsed.start_hhmm[:2]) * 60 + int(parsed.start_hhmm[2:]),
+    )
+
+
+def _same_time_of_day(candidates: list[Any], tolerance: int = 2) -> bool:
+    """Whether every candidate starts at the same clock time.
+
+    When they do, the ticker's clock offset is measurable from any of them
+    even though the game is not yet decided.
+    """
+    minutes = [
+        _as_utc(g.start_ts).hour * 60 + _as_utc(g.start_ts).minute for g in candidates
+    ]
+    return max(minutes) - min(minutes) <= tolerance
+
+
+def _as_utc(stamp: datetime) -> datetime:
+    """A naive timestamp is treated as UTC rather than refused."""
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+
+
 def _best_under_offset(
-    candidates: list[Any], ticker_minutes: int, offset: int, tolerance: int
+    candidates: list[Any],
+    ticker_minutes: int,
+    offset: int,
+    tolerance: int,
+    game_date: date | None = None,
 ) -> Any | None:
-    """The single closest game under one clock offset, or ``None`` if tied."""
+    """The single closest game under one clock offset, or ``None`` if tied.
+
+    With ``game_date``, candidates are scored on the ABSOLUTE distance between
+    the ticker's start and the game's, rather than on time of day alone.
+
+    Time of day is enough for a one-day slate, which is what this was written
+    for. It is actively wrong across a multi-day archive: a three-game series
+    usually starts at the same local time every night, so Monday, Tuesday and
+    Wednesday all score identically, tie, and are refused as an ambiguous
+    doubleheader. That tie is manufactured -- the games are 24 hours apart and
+    trivially separable -- while a real doubleheader, hours apart on one date,
+    stays separable either way.
+    """
+    if game_date is not None:
+        start = datetime.combine(
+            game_date, time(ticker_minutes // 60, ticker_minutes % 60), tzinfo=UTC
+        ) + timedelta(minutes=offset)
+        absolute = sorted(
+            (abs((_as_utc(g.start_ts) - start).total_seconds()) / 60.0, g.game_pk, g)
+            for g in candidates
+        )
+        if absolute[0][0] > tolerance:
+            return None
+        if len(absolute) > 1 and absolute[0][0] == absolute[1][0]:
+            return None
+        return absolute[0][2]
+
     scored = sorted(
         (
             _circular_delta(

@@ -435,3 +435,126 @@ half what it was when those numbers were written. The prediction is not
 amended — it was made, and it stands as made — but the halving is recorded
 here so that a count at the low end is not read as a signal when it is partly
 arithmetic.
+
+---
+
+# The 2026-09-24 corrected run: three defects in the output, and the bucket pattern
+
+324 gaps, positive but under the floor. The verdict stands as stated, but
+three things in the output were larger than the headline and all three are
+now fixed.
+
+## Defect 5: 87% of the archive was never a moneyline
+
+297,859 quotes dropped for "unresolvable side", with codes 11, 10, 12, 9, 8,
+7, 6, 5. Those are not team codes and not price levels. They are **total-runs
+strikes**.
+
+`config/settings.yaml` has `series_tickers: [KXMLBGAME, KXMLBWINNER,
+KXMLBTOTAL]`. The poller collects all three. A totals market's ticker is
+`KXMLBTOTAL-26SEP231905TORBAL-11` — the suffix is the **strike**, eleven runs,
+not a side. `parse_ticker` matched the shape, read the suffix as a side code,
+failed to resolve it to a team, and the study reported it as a side failure.
+
+**The sample does not grow 8x.** This is the honest answer to "either surfaces
+larger gaps or confirms the result on a bigger sample" — it does neither.
+Only `KXMLBGAME` is a moneyline, and only a moneyline is comparable to a
+devigged h2h price. Tier 0 buys `h2h` alone, so there is no totals reference
+to price a totals market against; those rows are a different instrument, not
+lost moneyline data. The 324 gaps came from the correct universe.
+
+What was wrong was the **reporting**, which described a market-type filter as
+a parse failure and so implied 87% data loss. The study now filters on
+`--series` (default `KXMLBGAME`) before touching the orderbook, and prints a
+table of what was skipped, by series, with an example ticker and what that
+series is. The next run proves this rather than asserting it.
+
+## Defect 6: 258 manufactured ties against 200 real games
+
+MLB did not play 258 doubleheaders in 25 days. Two compounding faults in
+`join_tickers`, which was written for a **one-day slate** and reused across a
+25-day archive.
+
+**`_best_under_offset` compared time of day, ignoring the date.** Candidates
+are every game by the same two teams within one day of the ticker. A
+three-game series starts at 19:05 every night, so Monday, Tuesday and
+Wednesday scored identically, tied, and all three were refused. The games are
+24 hours apart and trivially separable. Now scored on absolute distance
+between the ticker's start and the game's; a real doubleheader, hours apart
+on one date, stays separable either way.
+
+**Offset inference starved.** Pass one learned the clock only from matchups
+with exactly one candidate. On a multi-day archive almost every ticker has a
+neighbouring night inside the window, so there was almost nothing to learn
+from — and with no offset, every contested ticker is refused. The fix is that
+a series contested on *which game* usually agrees on *what time of day*:
+19:05 every night. The clock is knowable there even when the date is not, so
+pass one now samples from any candidate set whose starts agree.
+
+Three tests pin it: a series must not be ambiguous, a real doubleheader must
+still separate, and a genuine tie must still be refused.
+
+## Defect 7: probe-inplay and adverse-selection measured different things
+
+`probe-inplay` said in-play quotes exist across nearly every book including
+Pinnacle, to 319 minutes past commence. `adverse-selection` said 2,675 sharp
+quotes after first pitch. Both were measuring; not the same thing.
+
+The probe counted a book whenever an h2h market was **listed** after first
+pitch. The study requires an h2h market with **two outcomes carrying prices**.
+A market that stays on the board with its outcomes suspended or empty counts
+in the first and not the second.
+
+The loose one was mine — the same defect as `probe-depth` counting rows it
+could not read. The probe now reports `listed after` and `PRICED after` as
+separate columns, keys its verdict off the priced count, and prints the priced
+total explicitly as the number that must equal the study's, with the
+instruction not to reconcile a disagreement by picking the convenient side.
+
+**Until that re-runs, the structural question is still open**, and 2,675 is
+the number to trust of the two.
+
+## The bucket pattern: 46.2% / 93.1% / 100.0%
+
+Not a real property of larger gaps. It is what a **noisy mid** produces when
+there is no edge at all, and two separate mechanisms make up the shape.
+
+**The low end, below a coin flip.** `toward` counts `convergence > 0`, so a
+close identical to the price at the gap counts as *not* toward. On a thin book
+that is the commonest outcome, and it is commonest at small gaps. Simulated
+with pure noise, no edge, and 45% of books never moving between snapshots:
+
+```
+    bucket       n   toward  no move
+   0-  4pp 298,926    37.7%    45.0%
+   4-  6pp  66,476    50.1%    45.2%
+   6- 10pp  32,902    53.5%    45.2%
+```
+
+That reproduces the climb and the sub-50% floor — but tops out near 54%, so
+it is not the whole story.
+
+**The high end, at 100%.** A book that is wide when the market opens and tight
+at the close. An early "gap" is then mostly noise in a mid nobody could trade
+on, and the book tightening toward first pitch reads as convergence at every
+gap size. Same simulation, no edge anywhere:
+
+```
+    bucket       n   toward   mean noise at gap
+   0-  4pp 203,497    93.6%              3.90pp
+   4-  6pp  48,457   100.0%              4.53pp
+   6- 10pp  38,529   100.0%              4.89pp
+```
+
+100% at every bucket above 4pp, with nothing to win.
+
+**The discriminator**, now in the bucket table: `sp@gap` and `sp@close`, the
+realised book spread at each moment. If `sp@gap` is much wider than
+`sp@close`, the pattern is the artefact above. If they are comparable and near
+the 2c the floor assumes, the convergence is real. Either one exceeding twice
+`--half-spread` also means the floor in the next column is understated and the
+break-even beside it is too low.
+
+Do not read the climb as good news until those two columns are in front of
+you. A monotonic rise to 100% is the signature of measurement noise in a
+tightening book, and that is the null hypothesis it has to beat.

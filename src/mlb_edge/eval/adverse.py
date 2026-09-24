@@ -339,6 +339,14 @@ def attach_outcomes(
             settled = priced(closing, gap)
             if settled is not None:
                 gap.later["close"] = settled
+                # The closing book's own spread. A book that is wide when the
+                # market opens and tight at the close produces a toward-rate
+                # near 100% with no edge present at all, because the early
+                # "gap" was mostly noise in a mid nobody could trade on. The
+                # two spreads side by side are what tells that apart from a
+                # real one.
+                gap.meta["close_best_yes"] = closing.meta.get("best_yes")
+                gap.meta["close_best_no"] = closing.meta.get("best_no")
 
 
 def summarise(gaps: list[Gap], horizon: str) -> ConvergenceResult:

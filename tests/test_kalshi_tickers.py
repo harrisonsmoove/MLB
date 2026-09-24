@@ -791,3 +791,83 @@ def test_a_named_container_with_null_sides_is_an_empty_book() -> None:
 
     book = _parse_orderbook('{"orderbook_fp":{"yes_dollars":null,"no_dollars":null}}')
     assert book is not None and book.deepest == 0
+
+
+# --- a series is not a doubleheader ----------------------------------------
+
+
+def test_a_three_game_series_is_not_ambiguous() -> None:
+    """Consecutive nights at the same local time must still separate.
+
+    The joiner was written for a one-day slate and scored candidates on time
+    of day alone. Across a multi-day archive that is actively wrong: a series
+    starts at 19:05 every night, so Monday, Tuesday and Wednesday score
+    identically, tie, and all three are refused as an ambiguous doubleheader.
+    The study saw 258 games refused against 200 joined -- more manufactured
+    ties than real games.
+    """
+    games = [
+        _game(1, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 21, 23, 5, tzinfo=UTC)),
+        _game(2, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(3, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 23, 23, 5, tzinfo=UTC)),
+    ]
+    tickers = [
+        "KXMLBGAME-26SEP211905TORBAL",
+        "KXMLBGAME-26SEP221905TORBAL",
+        "KXMLBGAME-26SEP231905TORBAL",
+    ]
+
+    join = join_tickers(tickers, games)
+
+    assert not join.ambiguous, f"manufactured ties: {join.ambiguous}"
+    assert join.matched == {
+        1: "KXMLBGAME-26SEP211905TORBAL",
+        2: "KXMLBGAME-26SEP221905TORBAL",
+        3: "KXMLBGAME-26SEP231905TORBAL",
+    }
+
+
+def test_a_real_doubleheader_is_still_separated() -> None:
+    """The fix must not cost what the old comparison bought.
+
+    Two games on one date, five hours apart, with the rest of the series
+    around them to keep the clock inferable.
+    """
+    games = [
+        _game(1, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 17, 5, tzinfo=UTC)),
+        _game(2, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(3, "Seattle Mariners", "New York Yankees",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+    ]
+    tickers = [
+        "KXMLBGAME-26SEP221305TORBAL",
+        "KXMLBGAME-26SEP221905TORBAL",
+        "KXMLBGAME-26SEP221905SEANYY",
+    ]
+
+    join = join_tickers(tickers, games)
+
+    assert join.matched.get(1) == "KXMLBGAME-26SEP221305TORBAL"
+    assert join.matched.get(2) == "KXMLBGAME-26SEP221905TORBAL"
+    assert not join.ambiguous
+
+
+def test_a_genuinely_tied_doubleheader_is_still_refused() -> None:
+    """Two games the clock cannot tell apart are refused, not guessed."""
+    games = [
+        _game(1, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(2, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(3, "Seattle Mariners", "New York Yankees",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+    ]
+    join = join_tickers(
+        ["KXMLBGAME-26SEP221905TORBAL", "KXMLBGAME-26SEP221905SEANYY"], games
+    )
+    assert {1, 2} <= join.ambiguous

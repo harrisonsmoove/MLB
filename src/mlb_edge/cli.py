@@ -1879,6 +1879,8 @@ def probe_inplay(
     events_seen = 0
     events_after = 0
     latest_by_book: dict[str, float] = defaultdict(float)
+    latest_priced: dict[str, float] = defaultdict(float)
+    priced_after: dict[str, int] = defaultdict(int)
     quotes_after: dict[str, int] = defaultdict(int)
     quotes_before: dict[str, int] = defaultdict(int)
     max_minutes = 0.0
@@ -1922,14 +1924,31 @@ def probe_inplay(
                     if not isinstance(bookmaker, dict):
                         continue
                     key = str(bookmaker.get("key"))
-                    if not any(
-                        isinstance(m, dict) and m.get("key") == "h2h"
-                        for m in bookmaker.get("markets") or []
-                    ):
+                    market = next(
+                        (
+                            m for m in bookmaker.get("markets") or []
+                            if isinstance(m, dict) and m.get("key") == "h2h"
+                        ),
+                        None,
+                    )
+                    if market is None:
                         continue
+                    # LISTED is not PRICED. A market can stay on the board
+                    # after first pitch with its outcomes suspended or empty,
+                    # and counting those as in-play coverage is the same defect
+                    # as probe-depth counting rows it could not read. The
+                    # study's own filter requires two outcomes with prices, so
+                    # the probe applies exactly that test and reports both.
+                    priced = sum(
+                        1 for o in market.get("outcomes") or []
+                        if isinstance(o, dict) and o.get("name") and o.get("price")
+                    ) >= 2
                     if after:
                         quotes_after[key] += 1
                         latest_by_book[key] = max(latest_by_book[key], minutes)
+                        if priced:
+                            priced_after[key] += 1
+                            latest_priced[key] = max(latest_priced[key], minutes)
                     else:
                         quotes_before[key] += 1
         if number % 100 == 0 or number == len(files):
@@ -1946,20 +1965,30 @@ def probe_inplay(
             "past its commence_time"
         )
 
-    table = Table(title="h2h quotes before and after first pitch, by book")
-    for column in ("book", "before", "after", "latest (min)", "reading"):
+    table = Table(title="h2h after first pitch, by book: listed vs actually priced")
+    for column in (
+        "book", "before", "listed after", "PRICED after", "latest (min)", "reading",
+    ):
         table.add_column(column, justify="right" if column != "book" else "left")
     for book in sorted(set(quotes_before) | set(quotes_after)):
-        after = quotes_after.get(book, 0)
-        reading = (
-            "[green]quotes in-play[/green]" if after
-            else "[yellow]pre-match only[/yellow]"
-        )
+        listed = quotes_after.get(book, 0)
+        priced = priced_after.get(book, 0)
+        if priced:
+            reading = "[green]priced[/green]"
+        elif listed:
+            reading = "[yellow]listed, unpriced[/yellow]"
+        else:
+            reading = "[yellow]pre-match only[/yellow]"
         table.add_row(
-            book, f"{quotes_before.get(book, 0):,}", f"{after:,}",
-            f"{latest_by_book.get(book, 0.0):.0f}" if after else "-", reading,
+            book, f"{quotes_before.get(book, 0):,}", f"{listed:,}", f"{priced:,}",
+            f"{latest_priced.get(book, 0.0):.0f}" if priced else "-", reading,
         )
     console.print(table)
+    console.print(
+        "  [dim]The PRICED column is the one that matters, and it is the "
+        "number adverse-selection counts. A market listed after first pitch "
+        "with suspended or empty outcomes is not a quote.[/dim]"
+    )
 
     if not events_after:
         console.print(
@@ -1968,10 +1997,11 @@ def probe_inplay(
             "in-play board keeps recording, but nothing in this archive can "
             "price it -- only a model can."
         )
-    elif not quotes_after:
+    elif not sum(priced_after.values()):
         console.print(
-            "\n[bold]Events survive first pitch but no book quotes h2h "
-            "in-play.[/bold] Same conclusion, different mechanism."
+            "\n[bold]Events survive first pitch, and h2h markets stay listed, "
+            "but none carry prices.[/bold] Pre-game only, by the measure that "
+            "matters. A listed-but-suspended market is not a reference price."
         )
     else:
         console.print(
@@ -1979,6 +2009,14 @@ def probe_inplay(
             "The open question is the alignment term: a line that moves on "
             "every pitch is far staler at a given cadence than a pre-game one."
         )
+    console.print(
+        f"\n[bold]Cross-check:[/bold] the PRICED total here "
+        f"({sum(priced_after.values()):,} across all books; "
+        f"{priced_after.get('pinnacle', 0):,} for pinnacle) is the same "
+        "quantity adverse-selection prints as 'sharp quotes observed AFTER "
+        "first pitch'. If the two disagree, one of them is wrong -- do not "
+        "reconcile them by picking the more convenient number."
+    )
     console.print(
         "\nRecord the answer in reports/odds-feed-pricing.md with today's "
         "date, per the provenance rule."
@@ -1991,6 +2029,7 @@ def adverse_selection(
     half_spread: Annotated[float, typer.Option(help="Half the Kalshi spread, in probability.")] = 0.01,
     alignment: Annotated[float, typer.Option(help="Timing-error term added to the floor.")] = 0.0,
     min_gaps: Annotated[int, typer.Option(help="Below this, report underpowered and stop.")] = 50,
+    series: Annotated[str, typer.Option(help="Kalshi series to price. Only the game-winner series is a moneyline.")] = "KXMLBGAME",
     max_gap: Annotated[float, typer.Option(help="Gaps above this are excluded and counted. 0 disables.")] = MAX_PLAUSIBLE_GAP,
     dump: Annotated[int, typer.Option(help="Print this many individual gap records, end to end.")] = 0,
     dump_min: Annotated[float, typer.Option(help="Only dump gaps at or above this size.")] = 0.10,
@@ -2157,6 +2196,9 @@ def adverse_selection(
 
         files = archive.files("kalshi")
         unsided: dict[str, int] = {}
+        skipped_series: dict[str, int] = {}
+        other_series: dict[str, str] = {}
+        unparsed = 0
         event_tickers: set[str] = set()
         for number, path in enumerate(files, 1):
             frame = pl.read_parquet(
@@ -2171,6 +2213,26 @@ def adverse_selection(
                     continue
                 parsed = parse_ticker(str(key))
                 if parsed is None:
+                    unparsed += 1
+                    other_series.setdefault("(unparseable)", str(key))
+                    skipped_series["(unparseable)"] = (
+                        skipped_series.get("(unparseable)", 0) + 1
+                    )
+                    continue
+                # The poller collects every MLB series it is configured for --
+                # KXMLBGAME, KXMLBWINNER, KXMLBTOTAL. Only the game-winner
+                # series is a moneyline, and only a moneyline is comparable to
+                # a devigged h2h price. A totals ticker's suffix is its STRIKE
+                # (`...-11` is eleven runs), which is why reading it as a side
+                # produced codes 5 through 12 rather than team codes.
+                #
+                # These are a different market, not lost moneyline data, and
+                # they are reported as such rather than as a parse failure.
+                if parsed.series != series:
+                    skipped_series[parsed.series] = (
+                        skipped_series.get(parsed.series, 0) + 1
+                    )
+                    other_series.setdefault(parsed.series, str(key))
                     continue
                 pairs = _orderbook_pairs(payload)
                 if pairs is None:
@@ -2350,11 +2412,33 @@ def adverse_selection(
         else:
             shutil.rmtree(staging, ignore_errors=True)
 
+    if skipped_series:
+        table = Table(title="orderbook rows skipped: not the game-winner market")
+        for column in ("series", "rows", "example ticker", "what it is"):
+            table.add_column(column, justify="right" if column == "rows" else "left")
+        meaning = {
+            "KXMLBTOTAL": "total runs; suffix is the strike, not a team",
+            "KXMLBWINNER": "season/series winner, not a single game",
+            "(unparseable)": "ticker did not match the game format",
+        }
+        for name, count in sorted(skipped_series.items(), key=lambda kv: -kv[1]):
+            table.add_row(
+                name, f"{count:,}", other_series.get(name, ""),
+                meaning.get(name, "a different market type"),
+            )
+        console.print(table)
+        console.print(
+            f"  [dim]These are not lost moneyline data. Only {series} is a "
+            "moneyline, and only a moneyline is comparable to a devigged h2h "
+            "price -- tier 0 buys no totals reference to price the others "
+            "against. Excluding them does not shrink the moneyline sample.[/dim]\n"
+        )
+
     if unsided:
         total = sum(unsided.values())
         console.print(
-            f"[yellow]dropped {total:,} Kalshi quotes whose side could not be "
-            f"resolved[/yellow] -- codes: "
+            f"[yellow]dropped {total:,} {series} quotes whose side could not "
+            f"be resolved[/yellow] -- codes: "
             + ", ".join(f"{code}={n:,}" for code, n in sorted(
                 unsided.items(), key=lambda kv: -kv[1])[:8])
         )
@@ -2535,7 +2619,9 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
     console.print(table)
 
     buckets = Table(title="toward-rate against its break-even, by gap size")
-    for column in ("gap", "n", "observed", "break-even"):
+    for column in (
+        "gap", "n", "toward", "b/e", "no move", "sp@gap", "sp@close", "floor",
+    ):
         buckets.add_column(column, justify="right" if column != "gap" else "left")
     # The top bucket stops at the plausibility bound, because nothing above it
     # is in `gaps` any more. Labelling it 10-100pp would advertise a range the
@@ -2549,6 +2635,21 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
         if not inside:
             continue
         toward = sum(1 for g in inside if (g.convergence("close") or 0) > 0)
+        # Exactly zero movement counts as NOT toward. On a thin book that is
+        # the commonest outcome at small gaps, and it drags the small-gap rate
+        # below the 50% a coin flip would give -- which is most of what makes
+        # the rate climb with gap size. Reported so the climb is not read as
+        # an edge that grows with size.
+        still = sum(1 for g in inside if (g.convergence("close") or 0) == 0.0)
+        def spread_of(gap: Any, prefix: str = "") -> float | None:
+            yes = gap.meta.get(f"{prefix}best_yes")
+            no = gap.meta.get(f"{prefix}best_no")
+            if yes is None or no is None:
+                return None
+            return (1.0 - float(no)) - float(yes)
+
+        spreads = [s for g in inside if (s := spread_of(g)) is not None]
+        at_close = [s for g in inside if (s := spread_of(g, "close_")) is not None]
         need = breakeven(
             statistics.fmean([g.size for g in inside]),
             statistics.fmean([g.floor for g in inside]),
@@ -2556,8 +2657,22 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
         buckets.add_row(
             f"{low * 100:.0f}-{high * 100:.0f}pp", f"{len(inside):,}",
             f"{toward / len(inside) * 100:.1f}%", f"{need * 100:.1f}%",
+            f"{still / len(inside) * 100:.1f}%",
+            f"{statistics.fmean(spreads) * 100:.2f}pp" if spreads else "-",
+            f"{statistics.fmean(at_close) * 100:.2f}pp" if at_close else "-",
+            f"{statistics.fmean([g.floor for g in inside]) * 100:.2f}pp",
         )
     console.print(buckets)
+    console.print(
+        "  [dim]'no move' is the share whose close was IDENTICAL to the price "
+        "at the gap; those count as not-toward. The two spread columns are the "
+        "test that matters: if spread@gap is much WIDER than spread@close, "
+        "the gap was noise in a mid nobody could trade on, and the book "
+        "tightening toward first pitch will read as convergence at any gap "
+        "size. A toward-rate near 100% is that pattern, not an edge. Either "
+        "spread exceeding twice --half-spread also means the floor beside it "
+        "is understated.[/dim]"
+    )
 
     if gating is None or gating.observations == 0:
         console.print(
@@ -2574,11 +2689,22 @@ def _report_convergence(gaps: list[Any], summarise: Any, breakeven: Any) -> None
         )
         raise typer.Exit(1)
     if not gating.clears_floor:
-        console.print(
-            "\n[yellow]Convergence is positive but does not clear the floor.[/yellow] "
-            "The signal points the right way and does not pay for the fee and "
-            "the spread. Not a hard stop; not a business yet either."
-        )
+        if gating.mean <= 0.0:
+            # Exactly zero is flat, not positive. Same defect as the table
+            # verdict, which was fixed while this line was not.
+            console.print(
+                "\n[yellow]Convergence is FLAT.[/yellow] Kalshi's close sits "
+                "where it was when the gap opened, on average. No signal in "
+                "either direction, and nothing to pay the fee and the spread "
+                "with."
+            )
+        else:
+            console.print(
+                "\n[yellow]Convergence is positive but does not clear the "
+                "floor.[/yellow] The signal points the right way and does not "
+                "pay for the fee and the spread. Not a hard stop; not a "
+                "business yet either."
+            )
 
 
 def _reference_prices(event: dict[str, Any], book_key: str) -> tuple[float, float] | None:

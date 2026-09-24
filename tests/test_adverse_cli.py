@@ -87,6 +87,32 @@ def _build(
         }])
 
 
+def _run_probe(tmp_path: Path) -> str:
+    shutil.copytree(REPO / "config", tmp_path / "config", dirs_exist_ok=True)
+    (tmp_path / "config" / "local.yaml").write_text(
+        f"poller:\n  archive_dir: {tmp_path / 'poll'}\n"
+    )
+    result = CliRunner().invoke(
+        app, ["probe-inplay", "--root", str(tmp_path)]
+    )
+    assert result.exit_code in (0, 1), result.output
+    return result.output
+
+
+def _suspended_payload(start: datetime) -> str:
+    """The market is still on the board, with nothing quoted on it."""
+    return json.dumps([{
+        "id": "susp",
+        "home_team": "Toronto Blue Jays",
+        "away_team": "Baltimore Orioles",
+        "commence_time": start.isoformat().replace("+00:00", "Z"),
+        "bookmakers": [{
+            "key": "pinnacle",
+            "markets": [{"key": "h2h", "outcomes": []}],
+        }],
+    }])
+
+
 def _run(tmp_path: Path, **options: object) -> str:
     # The real config tree, with only the archive location overridden -- so
     # this exercises the same settings the box runs with.
@@ -234,3 +260,109 @@ def test_both_sides_of_one_game_are_not_two_observations(archive: Path) -> None:
     assert count(doubled) == count(single), (
         f"both sides counted separately: {count(doubled)} vs {count(single)}"
     )
+
+
+# --- the poller collects more than moneylines ------------------------------
+
+
+def test_totals_markets_are_a_different_market_not_a_parse_failure(
+    archive: Path,
+) -> None:
+    """The 297,859 "unresolvable side" drops, explained.
+
+    The poller collects KXMLBGAME, KXMLBWINNER and KXMLBTOTAL. A totals
+    ticker's suffix is its STRIKE -- ``...-11`` is eleven runs -- so reading it
+    as a side yields codes 5 through 12 and no team. Reporting that as a side
+    failure implies lost moneyline data; it is a different market, and tier 0
+    buys no totals reference to price it against.
+    """
+    base = archive / "totals"
+    _build(base, "BAL", 1.0 - TORONTO_FAIR - 0.12, tag="a")
+    # The same game's totals ladder, which must not be read as sides.
+    root = base / "poll"
+    for index, strike in enumerate((8, 9, 10, 11, 12)):
+        stamp = FIRST_PITCH - timedelta(minutes=90 - index * 15)
+        _write(root, "kalshi", stamp.date().isoformat(), f"t{index:02d}", [{
+            "endpoint": "orderbook",
+            "key": f"KXMLBTOTAL-26SEP231905TORBAL-{strike}",
+            "payload": _book(0.45), "error": None, "fetched_at": stamp,
+        }])
+
+    output = _run(base)
+
+    assert "not the game-winner market" in output
+    assert "KXMLBTOTAL" in output
+    assert "strike" in output  # the table wraps the full phrase
+    # And the moneyline result is untouched by their presence.
+    assert "1 joined on both venues" in output
+    assert "qualifying gaps above the floor: 0" not in output
+
+
+def test_a_totals_ladder_is_not_reported_as_unresolvable_sides(
+    archive: Path,
+) -> None:
+    base = archive / "nosides"
+    _build(base, "BAL", 1.0 - TORONTO_FAIR, tag="a")
+    root = base / "poll"
+    for index, strike in enumerate((8, 9, 10)):
+        stamp = FIRST_PITCH - timedelta(minutes=90 - index * 15)
+        _write(root, "kalshi", stamp.date().isoformat(), f"t{index:02d}", [{
+            "endpoint": "orderbook",
+            "key": f"KXMLBTOTAL-26SEP231905TORBAL-{strike}",
+            "payload": _book(0.45), "error": None, "fetched_at": stamp,
+        }])
+
+    output = _run(base)
+
+    assert "could not be resolved" not in output, (
+        "totals strikes were reported as failed side resolution"
+    )
+
+
+# --- probe-inplay: listed is not priced ------------------------------------
+
+
+def test_a_listed_but_suspended_market_is_not_an_in_play_quote(
+    archive: Path,
+) -> None:
+    """Why the two outputs disagreed.
+
+    probe-inplay counted a book whenever an h2h market was LISTED after first
+    pitch, and reported in-play coverage across nearly every book up to 319
+    minutes past commence. adverse-selection counts only markets with two
+    priced outcomes, and saw 2,675. Both were measuring, but not the same
+    thing, and the looser one was mine.
+    """
+    base = archive / "suspended"
+    _build(base, "BAL", 1.0 - TORONTO_FAIR, tag="a")
+    root = base / "poll"
+    for index in range(3):
+        stamp = FIRST_PITCH + timedelta(minutes=20 * (index + 1))
+        _write(root, "odds", stamp.date().isoformat(), f"z{index}", [{
+            "payload": _suspended_payload(FIRST_PITCH),
+            "error": None, "fetched_at": stamp,
+        }])
+
+    output = _run_probe(base)
+
+    # Assert on the verdict lines, not the table: rich wraps narrow cells.
+    assert "none carry prices" in output
+    assert "(0 across all books; 0 for pinnacle)" in output
+    assert "In-play quotes exist" not in output
+
+
+def test_a_genuinely_priced_in_play_market_reads_as_such(archive: Path) -> None:
+    base = archive / "livequotes"
+    _build(base, "BAL", 1.0 - TORONTO_FAIR, tag="a")
+    root = base / "poll"
+    for index in range(3):
+        stamp = FIRST_PITCH + timedelta(minutes=20 * (index + 1))
+        _write(root, "odds", stamp.date().isoformat(), f"z{index}", [{
+            "payload": _odds_payload(FIRST_PITCH),
+            "error": None, "fetched_at": stamp,
+        }])
+
+    output = _run_probe(base)
+
+    assert "In-play quotes exist" in output
+    assert "(3 across all books; 3 for pinnacle)" in output
