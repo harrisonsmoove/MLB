@@ -658,14 +658,14 @@ def test_the_depth_scan_separates_missing_rows_from_unreadable_ones(tmp_path):
 
     from mlb_edge.cli import _orderbook_levels
 
-    # Shape the reader expects.
     good = _json.dumps({"orderbook": {"yes": [[50, 10], [49, 5]], "no": [[51, 3]]}})
-    # A plausible alternative shape -- same data, different key.
-    other = _json.dumps({"book": {"yes": [[50, 10]], "no": []}})
+    # A container the reader has never seen. `book` and `orderbook_fp` are both
+    # recognised now, so the unknown case needs a genuinely unknown key.
+    unknown = _json.dumps({"depth_chart": {"bids": [[50, 10]]}})
 
     assert _orderbook_levels(good) == (2, 1)
-    assert _orderbook_levels(other) is None, (
-        "an unexpected shape must read as unparseable, not as an empty book -- "
+    assert _orderbook_levels(unknown) is None, (
+        "an unrecognised shape must read as unparseable, not as an empty book -- "
         "returning (0, 0) here would report a real book as zero levels"
     )
     del dt
@@ -697,3 +697,97 @@ def test_the_depth_scan_defaults_to_the_whole_archive():
 
     signature = inspect.signature(cli.probe_depth)
     assert signature.parameters["ticks"].default == 0
+
+
+# --- the real payload shape, measured from the archive ---------------------
+
+
+REAL_BOOK = (
+    '{"orderbook_fp": {"no_dollars": [["0.0200","7002.00"],["0.0300","120.00"]],'
+    ' "yes_dollars": [["0.5400","3012.00"]]}}'
+)
+
+
+def test_the_reader_handles_the_shape_kalshi_actually_sends() -> None:
+    """Measured from 464,917 archived payloads.
+
+    Price/size pairs as decimal STRINGS, split by side, nested under
+    `orderbook_fp`. The first reader assumed `orderbook` with numeric pairs,
+    matched nothing, and reported zero snapshots -- which read as "the poller
+    never fetched orderbooks" for a quarter of a million rows that were there
+    the whole time.
+    """
+    from mlb_edge.cli import _parse_orderbook
+
+    book = _parse_orderbook(REAL_BOOK)
+    assert book is not None
+    assert book.shape == "orderbook_fp"
+    assert book.levels == {"no": 2, "yes": 1}
+    assert book.contracts == {"no": 7122.0, "yes": 3012.0}
+    assert book.deepest == 2
+
+
+def test_the_older_shape_still_parses() -> None:
+    """Kept because one shape change already happened without warning."""
+    from mlb_edge.cli import _parse_orderbook
+
+    book = _parse_orderbook('{"orderbook": {"yes": [[50,10],[49,5]], "no": [[51,3]]}}')
+    assert book is not None and book.shape == "orderbook"
+    assert book.deepest == 2
+
+
+def test_an_unknown_shape_reads_as_unparseable_not_as_empty() -> None:
+    """The distinction that cost a run: "cannot read this" and "this book is
+    empty" are different facts, and a zero-level book is a real thing."""
+    from mlb_edge.cli import _parse_orderbook
+
+    assert _parse_orderbook('{"depth_chart": {"bids": []}}') is None
+    assert _parse_orderbook("not json") is None
+    # A genuinely empty book under a known shape still parses, as zero.
+    empty = _parse_orderbook('{"orderbook_fp": {"yes_dollars": [], "no_dollars": []}}')
+    assert empty is not None and empty.deepest == 0
+
+
+def test_sizes_are_summed_as_contracts() -> None:
+    """The size column is stage two's depth measurement, not decoration."""
+    from mlb_edge.cli import _parse_orderbook
+
+    assert _parse_orderbook(REAL_BOOK).total_contracts == 10134.0
+
+
+def test_malformed_levels_are_skipped_not_fatal() -> None:
+    """One bad row must not discard a book of 464,917."""
+    from mlb_edge.cli import _parse_orderbook
+
+    book = _parse_orderbook(
+        '{"orderbook_fp": {"yes_dollars": [["0.50","100.00"],["bad"],["0.49","x"]]}}'
+    )
+    assert book is not None
+    assert book.levels["yes"] == 1
+    assert book.contracts["yes"] == 100.0
+
+
+def test_a_bare_key_starting_with_no_is_not_an_orderbook() -> None:
+    """Found while fixing the reader, not by the failing case.
+
+    Accepting the payload root as a container made any JSON whose key begins
+    "no" or "yes" parse as an empty book -- `{"note": "..."}` becomes a
+    zero-level snapshot in the denominator. At the root there is no container
+    name vouching for the shape, so a side key must actually hold a list.
+    """
+    from mlb_edge.cli import _parse_orderbook
+
+    assert _parse_orderbook('{"note":"rain delay"}') is None
+    assert _parse_orderbook('{"no_orderbook_here":1}') is None
+    assert _parse_orderbook('{"yes_really":true}') is None
+    # A real root-level book still parses.
+    assert _parse_orderbook('{"yes":[[50,10]],"no":[]}') is not None
+
+
+def test_a_named_container_with_null_sides_is_an_empty_book() -> None:
+    """Kalshi sends null for a side with no resting orders. Reading that as
+    unparseable would drop real empty books out of the denominator."""
+    from mlb_edge.cli import _parse_orderbook
+
+    book = _parse_orderbook('{"orderbook_fp":{"yes_dollars":null,"no_dollars":null}}')
+    assert book is not None and book.deepest == 0

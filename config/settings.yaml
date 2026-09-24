@@ -357,11 +357,16 @@ sources:
       orderbook: "/markets/{ticker}/orderbook"
       fee_schedule: "/exchange/schedule"
     series_tickers: [KXMLBGAME, KXMLBWINNER, KXMLBTOTAL]
-    # UNVERIFIED -- probe with `mlb-edge probe-depth --live`. Nothing has
-    # checked this against what Kalshi actually serves, and the cost of it
-    # being low is not recoverable: a snapshot truncated at collection time
-    # stays truncated, there is no historical orderbook endpoint, and realised
-    # depth at the dislocated price is the measurement stage two exists for.
+    # UNVERIFIED against what Kalshi will SERVE -- probe with
+    # `mlb-edge probe-depth --live`. What is measured (2026-09-24, 464,917
+    # archived snapshots): the payload shape is
+    #   {"orderbook_fp": {"yes_dollars": [["0.5400","3012.00"], ...],
+    #                     "no_dollars":  [["0.0200","7002.00"], ...]}}
+    # price/size pairs as decimal strings, and the size column is real,
+    # substantial and has been collecting correctly the whole time.
+    # Still unverified: whether Kalshi returns MORE than 10 levels when asked.
+    # If it does, every snapshot so far is capped here permanently -- there is
+    # no historical orderbook endpoint.
     orderbook_depth: 10
     markets_page_size: 200
     max_pages: 25

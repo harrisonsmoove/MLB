@@ -219,6 +219,15 @@ nothing in place that would contradict it.
 
 ## G. `orderbook_depth` — the ranking rested on an unverified premise
 
+> **RESOLVED 2026-09-24: it was the reader.** 464,917 orderbook rows, all with
+> payloads, none parsed. The live shape is
+> `{"orderbook_fp": {"no_dollars": [["0.0200","7002.00"], ...], "yes_dollars": [...]}}`
+> — price/size pairs as decimal strings, nested under `orderbook_fp`. My reader
+> assumed `orderbook` with numeric pairs. The archive was never the problem, and
+> the size column has been collecting correctly for 25 days: this is stage
+> two's depth measurement and it is intact. Whether the 10-level cap binds is
+> still open and `--live` is what settles it.
+
 The audit put `orderbook_depth: 10` at number one on the grounds that every
 archived snapshot was being silently truncated. The first run of `probe-depth`
 reported **zero orderbook snapshots across the scanned window**, which does not

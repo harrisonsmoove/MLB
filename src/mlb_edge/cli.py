@@ -17,6 +17,7 @@ data. That is the half of Milestone 1 this environment could not prove.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Annotated, Any
@@ -1446,22 +1447,111 @@ def probe_ratelimit(
     )
 
 
-def _orderbook_levels(payload: str) -> tuple[int, int] | None:
-    """``(yes levels, no levels)`` in a Kalshi orderbook payload."""
+#: Container keys a Kalshi orderbook has been seen under, newest first.
+#: MEASURED 2026-09-24 from 464,917 archived payloads: the live shape is
+#: ``{"orderbook_fp": {"yes_dollars": [["0.5400","3012.00"], ...],
+#:                     "no_dollars":  [["0.0200","7002.00"], ...]}}``
+#: -- price/size pairs as decimal STRINGS, split by side, nested under
+#: ``orderbook_fp``. The earlier reader assumed ``orderbook`` with numeric
+#: pairs, found nothing, and reported zero snapshots rather than an unknown
+#: shape. The alternatives are kept because one shape change already happened.
+ORDERBOOK_CONTAINERS = ("orderbook_fp", "orderbook", "book")
+
+
+def _side_of(key: Any) -> str | None:
+    """``yes``/``no`` for a side key, whatever suffix it carries."""
+    lowered = str(key).lower()
+    if lowered.startswith("yes"):
+        return "yes"
+    if lowered.startswith("no"):
+        return "no"
+    return None
+
+
+@dataclass(frozen=True)
+class OrderbookSnapshot:
+    """One archived book, parsed. ``shape`` names which container matched."""
+
+    shape: str
+    levels: dict[str, int]
+    contracts: dict[str, float]
+
+    @property
+    def deepest(self) -> int:
+        return max(self.levels.values(), default=0)
+
+    @property
+    def total_contracts(self) -> float:
+        return sum(self.contracts.values())
+
+
+def _parse_orderbook(payload: str) -> OrderbookSnapshot | None:
+    """Parse a Kalshi orderbook payload, tolerating the shapes we have seen.
+
+    Returns ``None`` when nothing recognisable is found -- deliberately not an
+    empty book, because "we could not read this" and "this book is empty" are
+    different facts and conflating them is what cost a run.
+    """
     import json as _json
 
     try:
         data = _json.loads(payload)
     except (ValueError, TypeError):
         return None
-    book = data.get("orderbook") if isinstance(data, dict) else None
-    if not isinstance(book, dict):
+    if not isinstance(data, dict):
         return None
 
-    def count(side: Any) -> int:
-        return len(side) if isinstance(side, list) else 0
+    for container in (*ORDERBOOK_CONTAINERS, None):
+        node = data.get(container) if container else data
+        if not isinstance(node, dict):
+            continue
+        # At the root there is no container name vouching for the shape, so a
+        # side key alone is not enough: `{"note": "..."}` starts with "no" and
+        # would otherwise parse as an empty book, quietly turning arbitrary
+        # JSON into a zero-level snapshot in the denominator.
+        if container is None and not any(
+            isinstance(v, list) and _side_of(k) for k, v in node.items()
+        ):
+            continue
+        levels: dict[str, int] = {}
+        contracts: dict[str, float] = {}
+        for key, value in node.items():
+            side = _side_of(key)
+            if side is None:
+                continue
+            if not isinstance(value, list):
+                # A recognised container with a null side is an EMPTY book, not
+                # an unreadable one. Kalshi sends null for a side with no
+                # resting orders, and treating that as unparseable would drop
+                # real empty books out of the denominator.
+                levels.setdefault(side, 0)
+                contracts.setdefault(side, 0.0)
+                continue
+            size = 0.0
+            counted = 0
+            for entry in value:
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                try:
+                    size += float(entry[1])
+                except (TypeError, ValueError):
+                    continue
+                counted += 1
+            levels[side] = counted
+            contracts[side] = size
+        if levels:
+            return OrderbookSnapshot(
+                shape=container or "(root)", levels=levels, contracts=contracts
+            )
+    return None
 
-    return count(book.get("yes")), count(book.get("no"))
+
+def _orderbook_levels(payload: str) -> tuple[int, int] | None:
+    """``(yes levels, no levels)``. Thin view over :func:`_parse_orderbook`."""
+    book = _parse_orderbook(payload)
+    if book is None:
+        return None
+    return book.levels.get("yes", 0), book.levels.get("no", 0)
 
 
 @app.command(name="probe-depth")
@@ -1511,6 +1601,8 @@ def probe_depth(
 
         by_endpoint: Counter[str] = Counter()
         levels: Counter[int] = Counter()
+        shapes: Counter[str] = Counter()
+        contracts: list[float] = []
         with_payload = parsed = 0
         unparsed_samples: list[str] = []
 
@@ -1529,13 +1621,15 @@ def probe_depth(
                 if not payload:
                     continue
                 with_payload += 1
-                counted = _orderbook_levels(payload)
-                if counted is None:
+                book = _parse_orderbook(payload)
+                if book is None:
                     if len(unparsed_samples) < 3:
                         unparsed_samples.append(str(payload)[:240])
                     continue
                 parsed += 1
-                levels[max(counted)] += 1
+                shapes[book.shape] += 1
+                levels[book.deepest] += 1
+                contracts.append(book.total_contracts)
 
         # This breakdown is the whole point: it says which of the two states
         # a zero means, without needing another round trip to find out.
@@ -1568,25 +1662,67 @@ def probe_depth(
                 "Re-run with --ticks 0 over the whole archive before concluding."
             )
         else:
-            table = Table(title="levels per snapshot (deepest side)")
+            if len(shapes) > 1:
+                console.print(
+                    "[yellow]more than one payload shape in the archive:[/yellow] "
+                    + ", ".join(f"{k}={v:,}" for k, v in shapes.most_common())
+                )
+            else:
+                console.print(f"payload shape: [bold]{next(iter(shapes))}[/bold]")
+
+            table = Table(title="levels per snapshot (deepest side), whole archive")
             table.add_column("levels", justify="right")
             table.add_column("snapshots", justify="right")
             table.add_column("share", justify="right")
+            table.add_column("", justify="left")
             for lv in sorted(levels):
+                share = levels[lv] / parsed * 100
+                bar = "#" * int(share / 2)
                 mark = "  <- at the cap" if lv >= configured else ""
-                table.add_row(
-                    f"{lv}{mark}", f"{levels[lv]:,}", f"{levels[lv] / parsed * 100:.1f}%"
-                )
+                table.add_row(f"{lv}{mark}", f"{levels[lv]:,}", f"{share:.1f}%", bar)
             console.print(table)
+
             saturated = sum(n for lv, n in levels.items() if lv >= configured)
             pct = saturated / parsed * 100
+            modal = max(levels, key=lambda lv: levels[lv])
             console.print(
-                f"\n[bold]{saturated:,} of {parsed:,} ({pct:.1f}%) sit at the cap.[/bold]"
+                f"\nmodal depth: [bold]{modal}[/bold] levels    "
+                f"at the cap: [bold]{saturated:,} of {parsed:,} ({pct:.1f}%)[/bold]"
             )
-            if pct > 5:
+            if modal >= configured or pct > 50:
                 console.print(
-                    "[red]Those were cut off at collection time[/red] and the depth "
-                    f"beyond level {configured} is not in the archive."
+                    f"[red]The cap is binding.[/red] Most books reach level "
+                    f"{configured} and stop, which is what a truncated book looks "
+                    "like. Depth beyond it was never recorded and cannot be "
+                    "fetched back -- raise orderbook_depth now, then confirm with "
+                    "--live what Kalshi actually serves."
+                )
+            elif pct < 5:
+                console.print(
+                    f"[green]The cap is not binding.[/green] Books are genuinely "
+                    f"thinner than {configured} levels, so orderbook_depth was "
+                    "never the constraint and little or nothing has been lost."
+                )
+            else:
+                console.print(
+                    f"[yellow]The cap binds on {pct:.1f}% of snapshots.[/yellow] "
+                    "Real but partial loss, concentrated in the deepest books -- "
+                    "which are the ones that matter most for size."
+                )
+
+            if contracts:
+                ordered = sorted(contracts)
+                def pctile(q: float) -> float:
+                    return ordered[min(int(q * len(ordered)), len(ordered) - 1)]
+
+                console.print(
+                    "\n[bold]resting size per snapshot, both sides "
+                    "(this is stage two's depth measurement):[/bold]"
+                )
+                console.print(
+                    f"  median {pctile(0.5):>10,.0f} contracts    "
+                    f"p25 {pctile(0.25):>10,.0f}    p75 {pctile(0.75):>10,.0f}    "
+                    f"p95 {pctile(0.95):>10,.0f}"
                 )
 
     if not live:
