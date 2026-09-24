@@ -205,3 +205,32 @@ def test_both_meetings_are_counted_as_games(archive: Path) -> None:
     output = _run(base)
     assert "2 joined on both venues" in output, output
     assert "qualifying gaps above the floor: 0" in output
+
+
+# --- one game, two markets -------------------------------------------------
+
+
+def test_both_sides_of_one_game_are_not_two_observations(archive: Path) -> None:
+    """Kalshi lists a market per side; both share an event ticker.
+
+    Counting both doubles n with observations that are near-complements of
+    each other, not independent. The gap count must match the single-market
+    case, not twice it.
+    """
+    one = archive / "one"
+    _build(one, "BAL", 1.0 - TORONTO_FAIR - 0.12, tag="a")
+    single = _run(one)
+
+    two = archive / "two"
+    _build(two, "BAL", 1.0 - TORONTO_FAIR - 0.12, tag="a")
+    _build(two, "TOR", TORONTO_FAIR + 0.12, tag="b")
+    doubled = _run(two)
+
+    def count(output: str) -> str:
+        return output.split("qualifying gaps above the floor:")[1].split()[0]
+
+    assert "1 joined on both venues" in doubled, doubled
+    assert "game(s) had a market on both sides" in doubled
+    assert count(doubled) == count(single), (
+        f"both sides counted separately: {count(doubled)} vs {count(single)}"
+    )

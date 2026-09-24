@@ -398,3 +398,40 @@ old artefact, not a confirmation.
 horizon, or positive but under the floor with enough observations to say so.
 Either verdict gets reported plainly and the market-vs-market trade stops
 here. Underpowered is not a verdict: it means wait for archive.
+
+---
+
+# Defect 4, found while preparing the deploy: both sides counted twice
+
+Kalshi lists **one market per side**, and both carry the same event ticker:
+
+```
+KXMLBGAME-26SEP231905TORBAL-TOR  ->  event=KXMLBGAME-26SEP231905TORBAL
+KXMLBGAME-26SEP231905TORBAL-BAL  ->  event=KXMLBGAME-26SEP231905TORBAL
+```
+
+Fixing the game key correctly collapsed both onto one game — and then used
+both. Every moment was measured twice, from two books that are near
+complements of each other rather than two independent observations.
+
+The archive size says this is real, not hypothetical:
+
+```
+25 days x ~720 ticks x ~15 games   one market per game  ~270,000
+                                   two markets per game ~540,000
+                                   observed              464,917
+```
+
+An n twice the true one, with every confidence interval built on it.
+
+**Fix.** One market per game, preferring the side the sharp leg is already
+stated in so no reorientation is needed. The count of games that had both is
+printed. `tests/test_adverse_cli.py` asserts the gap count for a two-market
+game equals the single-market case, and fails without the fix.
+
+**Effect on the pre-registered count.** Both of us predicted "hundreds to low
+thousands" before this was found. The universe of paired quotes is now about
+half what it was when those numbers were written. The prediction is not
+amended — it was made, and it stands as made — but the halving is recorded
+here so that a count at the low end is not read as a signal when it is partly
+arithmetic.

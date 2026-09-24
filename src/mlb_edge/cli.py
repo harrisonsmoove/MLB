@@ -2277,6 +2277,7 @@ def adverse_selection(
         # --- pass two: one matchup at a time -------------------------------
         gaps: list[Any] = []
         counts = ScanCounts()
+        both_sides = 0
         paired = 0
         for number, (pair, event_ticker, start) in enumerate(matched, 1):
             sharp_rows = (
@@ -2303,6 +2304,23 @@ def adverse_selection(
                 })
                 for row in kalshi_rows.iter_rows(named=True)
             ]
+            # Kalshi lists ONE MARKET PER SIDE, and both resolve to the same
+            # event ticker. Keeping both counts every moment twice, and the
+            # two counts are near-complements of each other rather than
+            # independent observations -- an n twice the real one, with a
+            # confidence interval built on it. Keep one market per game,
+            # preferring the side the sharp leg is already stated in so no
+            # arithmetic is needed to line them up.
+            by_side: dict[str, list[Any]] = {}
+            for quote in kalshi_quotes:
+                by_side.setdefault(str(quote.team), []).append(quote)
+            if len(by_side) > 1:
+                both_sides += 1
+                sharp_team = sharp_quotes[0].team if sharp_quotes else None
+                kalshi_quotes = by_side.get(str(sharp_team)) or max(
+                    by_side.values(), key=len
+                )
+
             paired += len(kalshi_quotes)
             found = find_gaps(
                 kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
@@ -2343,6 +2361,13 @@ def adverse_selection(
         console.print(
             "  A quote with no resolvable side has no referent. Comparing it "
             "anyway is wrong by 1-2p on half of them.\n"
+        )
+
+    if both_sides:
+        console.print(
+            f"[dim]{both_sides:,} game(s) had a market on both sides; one was "
+            "used. Two sides of the same game are near-complements, not two "
+            "observations.[/dim]\n"
         )
 
     total_sharp = after_first_pitch

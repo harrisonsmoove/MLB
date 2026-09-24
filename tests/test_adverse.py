@@ -411,7 +411,7 @@ def test_an_implausible_gap_is_excluded_and_counted() -> None:
 
     assert gaps == []
     assert counts.implausible == 6
-    assert 0.37 > MAX_PLAUSIBLE_GAP
+    assert MAX_PLAUSIBLE_GAP < 0.37
 
 
 def test_the_bound_can_be_lifted_deliberately() -> None:
