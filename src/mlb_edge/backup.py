@@ -289,20 +289,40 @@ def push(
     return result.returncode == 0, output.strip()[-4000:]
 
 
-def prune(backup_root: Path, *, keep: int) -> list[Path]:
-    """Delete all but the newest ``keep`` dated backup directories."""
+def prune(backup_root: Path, *, keep: int) -> tuple[list[Path], list[str]]:
+    """Delete all but the newest ``keep`` dated backup directories.
+
+    Returns ``(removed, problems)`` and never raises. Failing to delete an old
+    copy is not a failure to back up, and it must not be able to say otherwise.
+
+    Observed live: a directory created while the job still ran as root, then a
+    switch to the service user, and ``shutil.rmtree`` raising PermissionError on
+    MANIFEST.json -- *after* the push had already succeeded. The backup was
+    safely off-box and the command exited non-zero, so the systemd timer read
+    red on a run that worked.
+
+    That is this project's usual bug reflected: normally the exit code is green
+    when something failed, here it was red when everything succeeded. Both
+    destroy the same thing, which is the exit code meaning what it says. A timer
+    that cries wolf gets muted exactly like an alert that does.
+    """
     backup_root = Path(backup_root)
     if not backup_root.is_dir():
-        return []
+        return [], []
     dated = sorted(
         (p for p in backup_root.iterdir() if p.is_dir() and (p / MANIFEST_NAME).is_file()),
         key=lambda p: p.name,
     )
     removed: list[Path] = []
+    problems: list[str] = []
     for path in dated[: max(len(dated) - keep, 0)]:
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            problems.append(f"{path.name}: {type(exc).__name__}: {exc}")
+            continue
         removed.append(path)
-    return removed
+    return removed, problems
 
 
 # ---------------------------------------------------------------------------

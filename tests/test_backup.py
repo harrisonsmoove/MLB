@@ -217,10 +217,53 @@ def test_prune_keeps_the_newest(live_root, tmp_path):
     for day in ("2026-08-26", "2026-08-27", "2026-08-28", "2026-08-29"):
         backup.create(root=root, destination=backup_root / day, warehouse_path=None)
 
-    removed = backup.prune(backup_root, keep=2)
+    removed, problems = backup.prune(backup_root, keep=2)
     remaining = sorted(p.name for p in backup_root.iterdir())
     assert len(removed) == 2
+    assert problems == []
     assert remaining == ["2026-08-28", "2026-08-29"]
+
+
+def test_an_unremovable_backup_is_a_warning_not_a_failure(live_root, tmp_path):
+    """Observed live: a directory left root-owned after the job switched to the
+    service user, rmtree raising PermissionError -- AFTER the push succeeded.
+
+    The backup was safely off-box and the command exited non-zero, so the timer
+    read red on a run that worked. That is the usual bug reflected: normally the
+    exit code is green when something failed; here it was red when everything
+    succeeded. Both destroy the exit code meaning what it says.
+    """
+    import shutil
+
+    root, _ = live_root
+    backup_root = tmp_path / "backups"
+    for day in ("2026-08-26", "2026-08-27", "2026-08-28"):
+        backup.create(root=root, destination=backup_root / day, warehouse_path=None)
+
+    real_rmtree = shutil.rmtree
+
+    def refuse(path, *args, **kwargs):
+        if path.name == "2026-08-26":
+            raise PermissionError(13, "Operation not permitted", "MANIFEST.json")
+        return real_rmtree(path, *args, **kwargs)
+
+    shutil.rmtree = refuse
+    try:
+        removed, problems = backup.prune(backup_root, keep=1)
+    finally:
+        shutil.rmtree = real_rmtree
+
+    # It did not raise, it kept going, and it named what it could not remove.
+    assert [p.name for p in removed] == ["2026-08-27"]
+    assert len(problems) == 1
+    assert "2026-08-26" in problems[0]
+    assert "PermissionError" in problems[0]
+    assert (backup_root / "2026-08-26").is_dir()
+
+
+def test_prune_reports_rather_than_raises_on_a_missing_root(tmp_path):
+    removed, problems = backup.prune(tmp_path / "nope", keep=3)
+    assert removed == [] and problems == []
 
 
 def test_backup_uses_hardlinks_where_it_can(live_root, tmp_path):
@@ -358,3 +401,48 @@ def test_the_poller_rereads_state_rather_than_caching_it():
     source = inspect.getsource(PollDaemon)
     assert "BackupState.load(self.backup_state_path)" in source
     assert "self.backup_state =" not in source
+
+
+def test_a_failed_prune_does_not_fail_the_backup(live_root, tmp_path, monkeypatch):
+    """The whole point, at the level where it actually broke.
+
+    prune runs after the push, so a crash there exits non-zero on a backup that
+    is already safely off-box. Past that push nothing is allowed to change the
+    exit code -- the same ordering the poller uses for its archive writes.
+    """
+    import shutil
+    from pathlib import Path
+
+    from typer.testing import CliRunner
+
+    from mlb_edge.cli import app
+
+    root, _ = live_root
+    repo = Path(__file__).resolve().parents[1]
+    (root / "config").mkdir(parents=True, exist_ok=True)
+    for name in ("settings.yaml", "parks.yaml", "books.yaml"):
+        shutil.copy(repo / "config" / name, root / "config" / name)
+    # keep_local: 0 forces a prune attempt on everything already there.
+    (root / "config" / "local.yaml").write_text(
+        "backup:\n  keep_local: 0\n", encoding="utf-8"
+    )
+    for day in ("2026-08-26", "2026-08-27"):
+        backup.create(
+            root=root, destination=root / "data" / "backups" / day, warehouse_path=None
+        )
+
+    real_rmtree = shutil.rmtree
+
+    def refuse(path, *args, **kwargs):
+        raise PermissionError(13, "Operation not permitted", "MANIFEST.json")
+
+    monkeypatch.setattr(shutil, "rmtree", refuse)
+
+    result = CliRunner().invoke(
+        app, ["backup", "create", "--root", str(root), "--no-push"]
+    )
+    shutil.rmtree = real_rmtree
+
+    assert result.exit_code == 0, result.output
+    assert "WARN" in result.output
+    assert "could not prune" in result.output

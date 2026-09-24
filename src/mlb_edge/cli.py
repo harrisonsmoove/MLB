@@ -427,9 +427,21 @@ def backup_create(
     else:
         state.save()
 
-    removed = backup_module.prune(backup_root, keep=int(config.get("keep_local", 3)))
+    # Past this point the bytes are safely off-box, so nothing below may change
+    # the exit code. Same ordering the poller uses for its archive writes:
+    # the thing that matters happens first, and the housekeeping after it is not
+    # allowed to overrule it.
+    removed, problems = backup_module.prune(
+        backup_root, keep=int(config.get("keep_local", 3))
+    )
     if removed:
         console.print(f"pruned {len(removed)} older local backups")
+    for line in problems:
+        console.print(
+            f"[yellow]WARN[/yellow] could not prune {line}\n"
+            "  The backup itself succeeded. Old local copies are using disk; "
+            "check ownership under the backup directory."
+        )
 
 
 def _backup_state_path(settings: Settings) -> Path:

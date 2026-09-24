@@ -220,12 +220,22 @@ curl https://rclone.org/install.sh | sudo bash
 sudo -u mlbedge rclone config    # new remote, type "s3", provider "DigitalOcean"
 ```
 
+**Two things about Spaces keys that cost time if you meet them cold:**
+
+1. **A key scoped to a bucket defaults to Read-only.** The permission has to be
+   set to Read/Write explicitly when you create it. A read-only key fails at
+   upload with an access error that reads like a wrong secret.
+2. **rclone calls CreateBucket before its first upload.** A scoped key has no
+   bucket-creation right, so it gets a 403 *before any data moves* — and the
+   error points at credentials when the credentials are fine. Pass
+   `--s3-no-check-bucket` to skip that probe.
+
 Then in `/opt/mlb-edge/config/local.yaml` — **not** `settings.yaml`, which every
 deploy resets:
 
 ```yaml
 backup:
-  push_command: "rclone copy {src} spaces:your-bucket/mlb-edge/ --checksum"
+  push_command: "rclone copy {src} spaces:your-bucket/mlb-edge/ --checksum --s3-no-check-bucket"
   max_age_hours: 48
 ```
 
@@ -255,6 +265,25 @@ Exit codes: `backup create` exits **2** if a push was wanted and no command is
 configured, so the systemd timer goes red instead of green. Pass `--no-push` if
 local-only is genuinely what you want; there is no longer a way to mean it by
 accident.
+
+Once the push has succeeded, nothing afterwards changes the exit code. Pruning
+old local copies can fail — mixed ownership under `data/backups/` from a run
+that happened as root, say — and that is a WARN, not a failure. Failing to
+delete an old copy is not a failure to back up, and a timer that goes red on a
+run that worked gets muted exactly like an alert that cries wolf.
+
+### Remote retention
+
+`keep_local` prunes **locally only**. Each backup is a fresh dated tree, so the
+remote grows without bound until you tell it not to:
+
+```bash
+s3cmd expire s3://your-bucket --expiry-days 30 --expiry-prefix mlb-edge/
+```
+
+or set a lifecycle rule in the Spaces control panel. The poll archive is
+append-only and hard-linked locally, so successive backups are cheap on disk
+here and full copies there.
 
 ### Verify the restore, once
 
