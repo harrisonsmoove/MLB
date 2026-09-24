@@ -247,3 +247,27 @@ def test_the_readme_does_not_send_edits_to_settings_yaml() -> None:
             continue
         command, _, _comment = line.partition("#")
         assert "settings.yaml" not in command, line
+
+
+def test_deploy_never_greps_the_shipped_config_for_settings() -> None:
+    """The shipped file is not the config the process runs on.
+
+    deploy grepped settings.yaml for an empty push_command -- where it is
+    always empty, because the real value lives in local.yaml -- and warned on
+    every deploy of a correctly configured box. A warning that misdescribes
+    reality trains you to skim past warnings, which is the one thing this
+    project cannot afford.
+    """
+    text = DEPLOY.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if "grep" in stripped and "settings.yaml" in stripped:
+            raise AssertionError(f"deploy greps the shipped config: {line}")
+
+
+def test_deploy_asks_the_cli_about_backups() -> None:
+    """The CLI reads the merged config. Anything checking config must too."""
+    text = DEPLOY.read_text(encoding="utf-8")
+    assert "backup status" in text

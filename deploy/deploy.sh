@@ -132,8 +132,6 @@ else
   [[ -n "${ODDS_API_KEY:-}"     ]] || warn "ODDS_API_KEY is empty; the odds poller will not start"
   [[ -n "${KALSHI_API_KEY_ID:-}" ]] || warn "KALSHI_API_KEY_ID is empty; Kalshi polling may be limited"
   [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] || warn "TELEGRAM_BOT_TOKEN is empty; alerts go to the journal only"
-  grep -q '^\s*push_command:\s*""' "$APP_DIR/config/settings.yaml" 2>/dev/null && \
-    warn "backup.push_command is empty; backups stay on this box and will not survive it"
 fi
 
 # --- 5b. deployment-local config -------------------------------------------
@@ -206,6 +204,21 @@ if [[ "$NEEDS_SECRETS" -eq 0 ]]; then
     warn "no pollable source resolved as enabled."
     warn "  The service will start, find nothing to poll and restart on a loop."
     warn "  Edit ${LOCAL_CONFIG} and re-run, or check the credentials in ${ENV_FILE}."
+  fi
+
+  # Ask the CLI, which reads the MERGED config, rather than grepping
+  # settings.yaml. The old check grepped the shipped file for an empty
+  # push_command -- where it is always empty, because the real value lives in
+  # local.yaml -- so it warned on every deploy of a correctly configured box.
+  # A warning that misdescribes reality trains you to skim past warnings, which
+  # is the one thing this project cannot afford.
+  BACKUP_OUT="$(sudo -u "$SERVICE_USER" "$APP_DIR/.venv/bin/mlb-edge" \
+      backup status --root "$APP_DIR" 2>&1)" && BACKUP_RC=0 || BACKUP_RC=$?
+  if [[ "$BACKUP_RC" -ne 0 ]]; then
+    warn "no off-box backup yet:"
+    printf '%s\n' "$BACKUP_OUT" | sed 's/^/    /'
+  else
+    log "backups: $(printf '%s' "$BACKUP_OUT" | grep -m1 'off-box push' || echo 'OK')"
   fi
 fi
 
