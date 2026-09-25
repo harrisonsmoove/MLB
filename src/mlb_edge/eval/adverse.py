@@ -134,6 +134,32 @@ class ConvergenceResult:
         )
 
 
+def episodes(gaps: list[Gap], quiet: timedelta = timedelta(minutes=45)) -> int:
+    """How many distinct gap EVENTS these observations represent.
+
+    A gap that persists across snapshots is one opportunity observed several
+    times, not several opportunities. At a 15-minute cadence a 90-minute
+    dislocation is six rows; at two minutes it is forty-five. The row count
+    therefore scales with polling frequency while the information does not,
+    and a count threshold like ``--min-gaps`` can be satisfied purely by
+    polling faster. This collapses runs within one game separated by less than
+    ``quiet`` into a single episode.
+    """
+    if not gaps:
+        return 0
+    by_game: dict[int, list[datetime]] = {}
+    for gap in gaps:
+        by_game.setdefault(gap.game_pk, []).append(gap.at)
+    total = 0
+    for stamps in by_game.values():
+        stamps.sort()
+        total += 1
+        for earlier, later in zip(stamps, stamps[1:], strict=False):
+            if later - earlier > quiet:
+                total += 1
+    return total
+
+
 def breakeven_toward_rate(gap: float, friction: float, *, adverse: bool = True) -> float:
     """The resolve-toward rate a gap of this size needs to break even.
 
@@ -172,6 +198,10 @@ class ScanCounts:
     stale: int = 0
     implausible: int = 0
     under_floor: int = 0
+    #: ``(difference, price)`` for every gap that fell under the floor, so the
+    #: near-misses can be reported by band and by price. Bounded by the
+    #: under-floor count, which is tens of thousands of float pairs.
+    near_misses: list[tuple[float, float]] = field(default_factory=list)
 
     def line(self) -> str:
         return (
@@ -268,6 +298,7 @@ def find_gaps(
         difference = abs(reference.price - price)
         if difference <= bar:
             tally.under_floor += 1
+            tally.near_misses.append((difference, price))
             continue
         if max_gap is not None and difference > max_gap:
             tally.implausible += 1

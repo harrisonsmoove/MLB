@@ -1842,6 +1842,8 @@ def _available_mb() -> float:
 @app.command(name="adverse-selection")
 @app.command("probe-inplay")
 def probe_inplay(
+    reference: Annotated[str, typer.Option(help="Book whose in-play coverage decides it.")] = "pinnacle",
+    game_minutes: Annotated[float, typer.Option(help="How long a game is assumed to last.")] = 180.0,
     root: Annotated[Path | None, typer.Option()] = None,
 ) -> None:
     """Does the odds feed carry prices after first pitch?
@@ -1878,6 +1880,9 @@ def probe_inplay(
 
     events_seen = 0
     events_after = 0
+    fetch_times: set[Any] = set()
+    starts: dict[tuple[str, str, Any], Any] = {}
+    past_commence: dict[str, int] = defaultdict(int)
     latest_by_book: dict[str, float] = defaultdict(float)
     latest_priced: dict[str, float] = defaultdict(float)
     priced_after: dict[str, int] = defaultdict(int)
@@ -1915,6 +1920,11 @@ def probe_inplay(
                 except (ValueError, TypeError):
                     continue
                 events_seen += 1
+                fetch_times.add(at)
+                starts.setdefault(
+                    (str(event.get("home_team")), str(event.get("away_team")), start),
+                    start,
+                )
                 minutes = (at - start).total_seconds() / 60.0
                 after = minutes > 0
                 if after:
@@ -1949,6 +1959,8 @@ def probe_inplay(
                         if priced:
                             priced_after[key] += 1
                             latest_priced[key] = max(latest_priced[key], minutes)
+                            if key == reference:
+                                past_commence[_minute_band(minutes)] += 1
                     else:
                         quotes_before[key] += 1
         if number % 100 == 0 or number == len(files):
@@ -1990,24 +2002,125 @@ def probe_inplay(
         "with suspended or empty outcomes is not a quote.[/dim]"
     )
 
-    if not events_after:
+    # --- the denominator ---------------------------------------------------
+    #
+    # 2,715 is not "many" and not "near zero". The question is what fraction of
+    # the in-play moments the poller actually observed carried a price, and
+    # that needs the moments counted, not assumed. Every odds fetch timestamp
+    # is in the archive, so the opportunity count is measurable: for each
+    # fetch, how many games were live at that instant.
+    # The first fifteen minutes past a SCHEDULED start are not in-play: a 19:05
+    # that actually throws at 19:12 leaves the pre-game price standing. They are
+    # excluded from BOTH sides of the ratio, because counting them in the
+    # numerator alone reports full coverage built entirely out of slack.
+    slack = timedelta(minutes=15)
+    ordered_fetches = sorted(fetch_times)
+    opportunities = 0
+    live_games: set[Any] = set()
+    for stamp in ordered_fetches:
+        live = [
+            key for key, start in starts.items()
+            if start + slack < stamp <= start + timedelta(minutes=game_minutes)
+        ]
+        opportunities += len(live)
+        live_games.update(live)
+
+    cadence = None
+    if len(ordered_fetches) > 1:
+        deltas = [
+            (b - a).total_seconds() / 60.0
+            for a, b in zip(ordered_fetches, ordered_fetches[1:], strict=False)
+        ]
+        cadence = statistics.median(deltas)
+
+    total_priced = sum(past_commence.values())
+    slack_priced = sum(past_commence.get(b, 0) for b in ("0-5 min", "5-15 min"))
+    priced_reference = total_priced - slack_priced
+    console.print(
+        f"\n[bold]Denominator[/bold] (game_minutes={game_minutes:.0f}, "
+        f"median odds cadence "
+        + (f"{cadence:.1f} min" if cadence is not None else "unknown") + ")"
+    )
+    console.print(f"  games the feed listed:              {len(starts):,}")
+    console.print(f"  games observed live past the slack:  {len(live_games):,}")
+    console.print(f"  in-play (game, fetch) moments:       {opportunities:,}")
+    console.print(
+        f"  first-pitch slack (<=15 min):         {slack_priced:,} "
+        "[dim](excluded from both sides)[/dim]"
+    )
+    coverage = priced_reference / opportunities if opportunities else 0.0
+    console.print(
+        f"  {reference} priced, genuinely in-play: [bold]{priced_reference:,}"
+        f"[/bold] = [bold]{coverage * 100:.1f}%[/bold] of moments"
+    )
+
+    if past_commence:
+        spread = Table(title=f"when {reference}'s in-play prices occur")
+        for column in ("minutes past commence", "priced quotes", "share"):
+            spread.add_column(
+                column, justify="right" if column != "minutes past commence" else "left"
+            )
+        for band in _MINUTE_BANDS:
+            count = past_commence.get(band, 0)
+            if not count:
+                continue
+            spread.add_row(
+                band, f"{count:,}", f"{count / total_priced * 100:.1f}%"
+            )
+        console.print(spread)
         console.print(
-            "\n[bold]The feed drops an event at first pitch.[/bold] The "
-            "market-vs-market trade is pre-game only, structurally. Kalshi's "
-            "in-play board keeps recording, but nothing in this archive can "
-            "price it -- only a model can."
+            "  [dim]If these cluster in the first few minutes, they are first-"
+            "pitch slack -- a scheduled start the game did not keep, and the "
+            "pre-game price still standing -- not in-play coverage. Genuine "
+            "in-play quoting is spread across the whole window.[/dim]"
         )
-    elif not sum(priced_after.values()):
+
+    early_share = slack_priced / total_priced if total_priced else 0.0
+    console.print("\n[bold]Verdict on the fraction, not on an adjective.[/bold]")
+    if coverage >= 0.50:
         console.print(
-            "\n[bold]Events survive first pitch, and h2h markets stay listed, "
-            "but none carry prices.[/bold] Pre-game only, by the measure that "
-            "matters. A listed-but-suspended market is not a reference price."
+            f"  {reference} prices [green]most[/green] in-play moments "
+            f"({coverage * 100:.1f}%), spread across the game. In-play is "
+            "reachable with this feed, and the binding constraint is the "
+            "alignment term, not coverage."
+        )
+    elif coverage >= 0.10:
+        console.print(
+            f"  [yellow]Partial coverage[/yellow] ({coverage * 100:.1f}%). "
+            "Enough to study, not enough to trade on continuously -- a "
+            "reference that exists a tenth of the time is not a reference "
+            "price, it is an occasional one. Treat in-play as model territory "
+            "and re-check as the archive grows."
         )
     else:
         console.print(
-            "\n[bold]In-play quotes exist.[/bold] The limit is not structural. "
-            "The open question is the alignment term: a line that moves on "
-            "every pitch is far staler at a given cadence than a pre-game one."
+            f"  [yellow]Effectively no in-play coverage[/yellow] "
+            f"({coverage * 100:.1f}% of in-play moments carry a price"
+            + (f"; {early_share * 100:.0f}% of every priced quote past "
+               "commence sits inside the first fifteen minutes, which is "
+               "first-pitch slack, not in-play quoting" if early_share >= 0.5 else "")
+            + "). Pre-game only, for practical purposes. Kalshi's in-play "
+            "board is unpriced by this feed and only a model can price it."
+        )
+    console.print(
+        "  [dim]This supersedes the earlier listed-vs-priced verdict, which "
+        "was still an adjective on a bare count.[/dim]"
+    )
+
+    console.print("\n[bold]Mechanism[/bold], for the record:")
+    if not events_after:
+        console.print(
+            "  The feed drops an event at first pitch entirely."
+        )
+    elif not sum(priced_after.values()):
+        console.print(
+            "  Events survive first pitch and h2h markets stay listed, but "
+            "none carry prices. A listed-but-suspended market is not a quote."
+        )
+    else:
+        console.print(
+            "  Events survive first pitch and some h2h markets carry prices. "
+            "How often is what the fraction above answers."
         )
     console.print(
         f"\n[bold]Cross-check:[/bold] the PRICED total here "
@@ -2064,7 +2177,9 @@ def adverse_selection(
         ScanCounts,
         attach_outcomes,
         breakeven_toward_rate,
+        episodes,
         find_gaps,
+        floor_for,
         kalshi_mid,
         sharp_fair,
         summarise,
@@ -2200,6 +2315,7 @@ def adverse_selection(
         other_series: dict[str, str] = {}
         unparsed = 0
         event_tickers: set[str] = set()
+        kalshi_seen: list[Any] = []
         for number, path in enumerate(files, 1):
             frame = pl.read_parquet(
                 path, columns=["endpoint", "key", "payload", "error", "fetched_at"]
@@ -2250,6 +2366,8 @@ def adverse_selection(
                     )
                     continue
                 event_tickers.add(parsed.event_ticker)
+                if len(kalshi_seen) < 1 or at > kalshi_seen[-1]:
+                    kalshi_seen.append(at)
                 buffer.append({
                     # The event ticker IS the game -- date and start time
                     # included. The team pair is not: it repeats every series.
@@ -2320,10 +2438,29 @@ def adverse_selection(
                 "Refused rather than guessed."
             )
         if join.unlisted:
-            console.print(
-                f"  [dim]{len(join.unlisted)} game(s) the Kalshi board does not "
-                "list[/dim]"
+            # A game the board has not listed YET is a different thing from one
+            # it never listed. The odds feed publishes days ahead; Kalshi lists
+            # closer in. Split on the last Kalshi observation so the two are
+            # not read as the same shortfall.
+            horizon = max(kalshi_seen) if kalshi_seen else None
+            future = sum(
+                1 for pk in join.unlisted
+                if pk in by_pk and horizon is not None
+                and games[by_pk[pk]].start_ts > horizon
             )
+            console.print(
+                f"  [dim]{len(join.unlisted)} game(s) not on the Kalshi board: "
+                f"{future} start after the last Kalshi snapshot in the archive "
+                f"(not listed YET), {len(join.unlisted) - future} inside the "
+                "archive window (not listed at all).[/dim]"
+            )
+        console.print(
+            f"  [dim]accounting: {len(join.matched):,} joined + "
+            f"{len(join.ambiguous):,} ambiguous + {len(join.unlisted):,} "
+            f"unlisted + {len(join.unmatched):,} unmatched = "
+            f"{len(join.matched) + len(join.ambiguous) + len(join.unlisted) + len(join.unmatched):,}"
+            f" of {len(games):,} games priced by {reference}[/dim]"
+        )
         if undated:
             console.print(
                 f"  [yellow]{undated:,} odds rows had no commence_time[/yellow] "
@@ -2339,6 +2476,8 @@ def adverse_selection(
         # --- pass two: one matchup at a time -------------------------------
         gaps: list[Any] = []
         counts = ScanCounts()
+        per_day: dict[str, dict[str, int]] = {}
+        under_floor_sizes: list[tuple[float, float]] = []
         both_sides = 0
         paired = 0
         for number, (pair, event_ticker, start) in enumerate(matched, 1):
@@ -2384,14 +2523,24 @@ def adverse_selection(
                 )
 
             paired += len(kalshi_quotes)
+            local = ScanCounts()
             found = find_gaps(
-                kalshi_quotes, sharp_quotes, game_pk=0, first_pitch=start,
+                kalshi_quotes, sharp_quotes, game_pk=number, first_pitch=start,
                 half_spread=half_spread, alignment=alignment,
                 max_gap=max_gap or None, pregame_only=not include_in_play,
-                counts=counts,
+                counts=local,
             )
             attach_outcomes(found, kalshi_quotes, first_pitch=start)
             gaps.extend(found)
+            day = start.date().isoformat()
+            tally = per_day.setdefault(day, {"games": 0, "stale": 0, "usable": 0, "gaps": 0})
+            tally["games"] += 1
+            tally["stale"] += local.stale
+            tally["usable"] += local.under_floor + local.implausible + len(found)
+            tally["gaps"] += len(found)
+            for field_ in ("in_play", "unoriented", "stale", "implausible", "under_floor"):
+                setattr(counts, field_, getattr(counts, field_) + getattr(local, field_))
+            under_floor_sizes.extend(local.near_misses)
             del sharp_quotes, kalshi_quotes, sharp_rows, kalshi_rows
             if number % 20 == 0 or number == len(matched):
                 console.print(
@@ -2459,10 +2608,12 @@ def adverse_selection(
         f"sharp quotes observed AFTER first pitch: [bold]{total_sharp:,}[/bold]"
     )
     console.print(
-        "  [dim]This is the measurement, not an assumption: if the sharp feed "
-        "carried in-play prices there would be many. Near zero means the feed "
-        "is pre-match only, and the market-vs-market trade is pre-game only. "
-        "See reports/odds-feed-pricing.md.[/dim]\n"
+        "  [dim]A COUNT, with no verdict attached. 2,715 is not 'many' or "
+        "'near zero' -- those are adjectives, and the same number carried "
+        "both in two outputs of this repo. What decides it is the fraction of "
+        "in-play moments that carried a price, which needs a denominator this "
+        "command does not build. Run `mlb-edge probe-inplay`, which does, and "
+        "read its verdict. This number must equal the PRICED total there.[/dim]\n"
     )
 
     console.print("quotes excluded, by reason:")
@@ -2486,7 +2637,71 @@ def adverse_selection(
     if dump and gaps:
         _dump_gaps(gaps, dump, dump_min, devig_all, american_to_prob)
 
-    console.print(f"qualifying gaps above the floor: [bold]{len(gaps):,}[/bold]\n")
+    console.print(f"qualifying gaps above the floor: [bold]{len(gaps):,}[/bold]")
+    distinct = len({g.game_pk for g in gaps})
+    runs = episodes(gaps)
+    console.print(
+        f"  in [bold]{distinct:,}[/bold] distinct games, as "
+        f"[bold]{runs:,}[/bold] separate episodes "
+        f"({len(gaps) / runs:.1f} snapshots per episode)"
+        if runs else "  no episodes"
+    )
+    console.print(
+        "  [dim]The EPISODE count is the unit of independent information. A "
+        "dislocation that lasts ninety minutes is six rows at a 15-minute "
+        "cadence and forty-five at two minutes, so the gap count scales with "
+        "polling frequency while the information does not. --min-gaps is a "
+        "row threshold and can be met by polling faster; that is not more "
+        "evidence.[/dim]\n"
+    )
+
+    if per_day:
+        days = Table(title="by game date: is the rate constant, or did it change?")
+        for column in ("date", "games", "usable quotes", "stale", "stale %", "gaps"):
+            days.add_column(column, justify="right" if column != "date" else "left")
+        for day in sorted(per_day):
+            row = per_day[day]
+            total = row["usable"] + row["stale"]
+            days.add_row(
+                day, f"{row['games']:,}", f"{row['usable']:,}", f"{row['stale']:,}",
+                f"{row['stale'] / total * 100:.0f}%" if total else "-",
+                f"{row['gaps']:,}",
+            )
+        console.print(days)
+        console.print(
+            "  [dim]STALE means the most recent SHARP quote was older than the "
+            "staleness limit -- it is set by the ODDS cadence, not the Kalshi "
+            "one. If the stale column falls sharply partway down this table, "
+            "the early archive was collected at a slower odds cadence and the "
+            "headline rate understates the forward rate. Read the last few "
+            "days, not the average.[/dim]\n"
+        )
+
+    if under_floor_sizes:
+        bands = Table(title="under-floor near misses: would a cheaper fee have helped?")
+        for column in ("band", "n", "mean price", "mean floor", "would qualify at P=0.80"):
+            bands.add_column(column, justify="right" if column != "band" else "left")
+        for low, high in ((0.010, 0.015), (0.015, 0.020), (0.020, 0.0275)):
+            inside = [(d, p) for d, p in under_floor_sizes if low <= d < high]
+            if not inside:
+                continue
+            tail_floor = floor_for(0.80, half_spread=half_spread, alignment=alignment)
+            would = sum(1 for d, _ in inside if d > tail_floor)
+            bands.add_row(
+                f"{low * 100:.1f}-{high * 100:.2f}pp", f"{len(inside):,}",
+                f"{statistics.fmean([p for _, p in inside]):.3f}",
+                f"{statistics.fmean([floor_for(p, half_spread=half_spread, alignment=alignment) for _, p in inside]) * 100:.2f}pp",
+                f"{would:,}",
+            )
+        console.print(bands)
+        console.print(
+            "  [dim]The fee is 0.07*P*(1-P), maximal at a coin flip. MLB "
+            "moneylines live between about 0.35 and 0.65, where the fee is "
+            "within 0.2pp of its maximum, so tail pricing buys almost no "
+            "relief: even a P=0.80 favourite only lowers the floor by 0.63pp, "
+            "and baseball rarely goes past that.[/dim]\n"
+        )
+
     if len(gaps) < min_gaps:
         console.print(
             f"[yellow]NOT ENOUGH GAPS YET.[/yellow] {len(gaps)} qualifying gaps is "
@@ -2498,6 +2713,22 @@ def adverse_selection(
         return
 
     _report_convergence(gaps, summarise, breakeven_toward_rate)
+
+
+#: Where an in-play price sits relative to the scheduled start. The first two
+#: bands are first-pitch slack, not in-play coverage: a scheduled 19:05 that
+#: actually throws at 19:12 leaves the pre-game price standing for minutes.
+_MINUTE_BANDS = (
+    "0-5 min", "5-15 min", "15-30 min", "30-60 min",
+    "60-120 min", "120-180 min", "180+ min",
+)
+
+
+def _minute_band(minutes: float) -> str:
+    for edge, name in zip((5, 15, 30, 60, 120, 180), _MINUTE_BANDS, strict=False):
+        if minutes <= edge:
+            return name
+    return _MINUTE_BANDS[-1]
 
 
 def _dump_gaps(

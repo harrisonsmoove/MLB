@@ -558,3 +558,132 @@ break-even beside it is too low.
 Do not read the climb as good news until those two columns are in front of
 you. A monotonic rise to 100% is the signature of measurement noise in a
 tightening book, and that is the null hypothesis it has to beat.
+
+---
+
+# 2026-09-25: the contradiction, and what limits 39 gaps
+
+## The cross-check: same number, two adjectives
+
+2,715 carried opposite verdicts in two outputs of this repo. The arithmetic
+agreed; both conclusions were adjectives on a bare count, and one of them was
+bound to be wrong. Neither is kept.
+
+`probe-inplay` now builds the denominator instead. Every odds fetch timestamp
+is in the archive, so the opportunity count is measurable rather than assumed:
+for each fetch, how many games were live at that instant. It also reports the
+**measured** median odds cadence, so no cadence is assumed anywhere.
+
+**First-pitch slack is excluded from both sides.** A scheduled 19:05 that
+actually throws at 19:12 leaves the pre-game price standing for minutes. Those
+quotes are past `commence_time` and are not in-play coverage. Counting them in
+the numerator alone would report full coverage built entirely out of slack,
+which is how "in-play quotes exist" got said in the first place. Quotes at or
+under 15 minutes past the scheduled start are reported separately and excluded
+from the ratio.
+
+Pre-registered thresholds, before the number is seen:
+
+| Coverage of in-play moments | Reading |
+|---|---|
+| >= 50% | In-play is reachable with this feed; the binding constraint is the alignment term, not coverage. |
+| 10-50% | Enough to study, not to trade continuously. A reference that exists a tenth of the time is an occasional price, not a reference price. |
+| < 10% | Pre-game only for practical purposes. The in-play board is unpriced by this feed and only a model can price it. |
+
+The minutes-past-commence histogram sits beside it: genuine in-play quoting is
+spread across the window, while slack clusters at the front.
+
+The study now prints 2,715 as a **count with no verdict attached**, and points
+at the probe. A command that cannot build the denominator should not be
+rendering the verdict.
+
+## What limits the count: the answer is the ODDS cadence, not the Kalshi one
+
+**Stale is about the sharp leg, not Kalshi.** `find_gaps` pairs each Kalshi
+quote with the most recent sharp quote at or before it and drops the pair when
+that quote is older than 30 minutes. The age being tested is the **odds**
+quote's. Kalshi's cadence does not enter it.
+
+So 53,546 stale says the odds feed was slower than 30 minutes at those
+moments. `monthly_request_budget: 500` — one of the invented constraints
+already found and corrected — throttles the odds poller to roughly one request
+every 86 minutes, which would strand most Kalshi snapshots with no sharp quote
+inside the staleness window. That is consistent with stale being about three
+quarters of the usable universe, and it means **most of the archive was
+collected under a throttle that has since been lifted**.
+
+The per-day table now reports stale share and gap count by game date. If the
+stale column falls sharply partway down it, 39 is an artefact of the early
+archive and the forward rate is materially higher. Read the last few days, not
+the average. That is a measurement, not a prediction.
+
+## Raising the Kalshi cadence would inflate n without adding evidence
+
+15 minutes to 2 would produce roughly seven times the Kalshi rows, and
+therefore roughly seven times the qualifying gaps — from the same
+dislocations. A 90-minute gap is six rows at 15 minutes and forty-five at two.
+
+`--min-gaps 50` is a **row** threshold. It can be satisfied by polling faster,
+and passing it that way is not evidence. The run now reports:
+
+* qualifying gaps (rows),
+* the number of **distinct games** they occur in,
+* the number of **episodes** — runs within one game separated by more than 45
+  minutes of quiet — and snapshots per episode.
+
+The episode count is the unit of independent information. 39 rows in 39 games
+is a very different position from 39 rows in 5 games, and only the second is
+mostly autocorrelation.
+
+**Proposed, to be pre-registered before the next run rather than after:** the
+gate carries an episode threshold as well as a row threshold, so no future
+cadence change can buy a pass. A number needs choosing now, while nothing is
+known about which side of it the data falls.
+
+## The fee gives almost no tail relief in baseball
+
+The fee is `0.07 * P * (1-P)`, maximal at a coin flip. Measured across the
+range MLB moneylines occupy:
+
+```
+     P      fee   floor @ 1c half-spread   relief vs 0.50
+  0.50    1.75pp                  2.75pp           0.00pp
+  0.60    1.68pp                  2.68pp           0.07pp
+  0.65    1.59pp                  2.59pp           0.16pp
+  0.75    1.31pp                  2.31pp           0.44pp
+  0.80    1.12pp                  2.12pp           0.63pp
+  0.90    0.63pp                  1.63pp           1.12pp
+```
+
+A -300 favourite is P=0.75 and a -400 is P=0.80. Baseball rarely goes past
+that, and most games sit between 0.35 and 0.65 where the fee is within 0.2pp
+of its maximum. **Tail pricing is not a lever here.** The 1.5-2.7pp band buys
+back at most 0.63pp of floor, and only on the small share of games priced like
+heavy favourites.
+
+The new near-miss table reports the exact counts by band, with the mean price
+and mean floor in each, and how many would clear the floor at P=0.80. That
+turns the arithmetic above into the actual number from the archive.
+
+## An accounting fix I started, then reverted, and why
+
+`join.unlisted` did not account for a game in a matchup with only one game: a
+lone unmatched game landed in no bucket, so the totals did not add up to the
+games that went in.
+
+The obvious fix — mark every unmatched game unlisted — is **wrong**, and it is
+worth recording. `not_listed` **removes a game from the completeness
+denominator**, deliberately, so a doubleheader the board declines to publish
+does not read as a shortfall forever. Widening it would turn every matcher
+failure into "not expected" and shrink the denominator silently. That is the
+defect this repo has spent a week removing, reintroduced as a tidiness fix.
+
+So `unlisted` keeps its narrow definition, and a separate `unmatched` bucket
+takes the remainder. Those stay in the denominator, because they are bugs.
+Two tests pin it: a lone matcher failure must not be excused as not-listed,
+and the four buckets must account for every game that went in.
+
+The study also now splits the unlisted count into games starting **after** the
+last Kalshi snapshot in the archive (not listed yet — the odds feed publishes
+days ahead, Kalshi lists closer in) and games inside the archive window (not
+listed at all). Those are different facts and the single number conflated them.

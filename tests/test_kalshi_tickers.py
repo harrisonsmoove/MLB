@@ -871,3 +871,48 @@ def test_a_genuinely_tied_doubleheader_is_still_refused() -> None:
         ["KXMLBGAME-26SEP221905TORBAL", "KXMLBGAME-26SEP221905SEANYY"], games
     )
     assert {1, 2} <= join.ambiguous
+
+
+def test_a_lone_matcher_failure_does_not_leave_the_denominator() -> None:
+    """`unlisted` shrinks the completeness denominator, so it must stay narrow.
+
+    A matchup where the board lists fewer tickers than there are games is
+    evidence the venue declined to publish one -- that leaves the denominator.
+    A single game nothing matched is a MATCHER failure (an alias gap, a date
+    disagreement) and must not, or every such bug reads as "not expected" and
+    the denominator quietly shrinks to whatever still works.
+    """
+    games = [
+        _game(1, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(2, "Seattle Mariners", "New York Yankees",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+    ]
+    # Only the second game's ticker is on the board.
+    join = join_tickers(["KXMLBGAME-26SEP221905SEANYY"], games)
+
+    assert join.matched_pks == {2}
+    assert 1 not in join.unlisted, "a matcher failure was excused as not-listed"
+    assert join.unmatched == {1}
+
+
+def test_the_buckets_account_for_every_game() -> None:
+    """Whatever went in comes out in exactly one bucket."""
+    games = [
+        _game(1, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(2, "Toronto Blue Jays", "Baltimore Orioles",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(3, "Seattle Mariners", "New York Yankees",
+              datetime(2026, 9, 22, 23, 5, tzinfo=UTC)),
+        _game(4, "Chicago Cubs", "St. Louis Cardinals",
+              datetime(2026, 9, 22, 20, 5, tzinfo=UTC)),
+    ]
+    join = join_tickers(
+        ["KXMLBGAME-26SEP221905TORBAL", "KXMLBGAME-26SEP221905SEANYY"], games
+    )
+    buckets = join.matched_pks | join.ambiguous | join.unlisted | join.unmatched
+    assert buckets == {1, 2, 3, 4}
+    assert len(join.matched_pks) + len(join.ambiguous) + len(
+        join.unlisted
+    ) + len(join.unmatched) == 4

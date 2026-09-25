@@ -349,6 +349,10 @@ class TickerJoin:
     unlisted: set[int] = field(default_factory=set)
     #: Games that could not be told apart even with a known clock offset.
     ambiguous: set[int] = field(default_factory=set)
+    #: Games in none of the buckets above: no ticker matched and the matchup
+    #: gives no evidence the venue declined to list it. A matcher failure, kept
+    #: separate from `unlisted` because these stay in the denominator.
+    unmatched: set[int] = field(default_factory=set)
     clock_offset_minutes: int | None = None
 
     @property
@@ -430,6 +434,13 @@ def join_tickers(
             result.matched[game.game_pk] = parsed.ticker
 
     # --- what the venue simply does not list --------------------------------
+    #
+    # Only a matchup where the board lists FEWER tickers than there are games:
+    # that is evidence the venue chose not to publish one. The guard on group
+    # size is deliberate and must stay. `unlisted` leaves the completeness
+    # DENOMINATOR, so widening it to every unmatched game would turn each
+    # matcher failure into "not expected" and shrink the denominator silently --
+    # the same defect as a filter that drops rows without saying so.
     for group in by_pair.values():
         if len(group) < 2:
             continue
@@ -438,6 +449,18 @@ def join_tickers(
             for game in group:
                 if game.game_pk not in result.matched and game.game_pk not in result.ambiguous:
                     result.unlisted.add(game.game_pk)
+
+    # Whatever is left belongs in no bucket above, and belongs in one of its
+    # own rather than nowhere. These are matcher failures -- an alias gap, a
+    # date the board disagrees about -- and they stay in the denominator.
+    for game in games:
+        if (
+            game.game_pk in result.matched
+            or game.game_pk in result.ambiguous
+            or game.game_pk in result.unlisted
+        ):
+            continue
+        result.unmatched.add(game.game_pk)
     return result
 
 

@@ -347,8 +347,8 @@ def test_a_listed_but_suspended_market_is_not_an_in_play_quote(
 
     # Assert on the verdict lines, not the table: rich wraps narrow cells.
     assert "none carry prices" in output
-    assert "(0 across all books; 0 for pinnacle)" in output
-    assert "In-play quotes exist" not in output
+    assert "Effectively no in-play coverage" in output
+    assert "reachable with this feed" not in output
 
 
 def test_a_genuinely_priced_in_play_market_reads_as_such(archive: Path) -> None:
@@ -364,5 +364,30 @@ def test_a_genuinely_priced_in_play_market_reads_as_such(archive: Path) -> None:
 
     output = _run_probe(base)
 
-    assert "In-play quotes exist" in output
-    assert "(3 across all books; 3 for pinnacle)" in output
+    assert "reachable with this feed" in output
+    assert "100.0% of moments" in output
+
+
+def test_first_pitch_slack_is_not_in_play_coverage(archive: Path) -> None:
+    """A scheduled 19:05 that throws at 19:12 is not in-play quoting.
+
+    The pre-game price stands for a few minutes past the scheduled start. Count
+    that in the numerator and the feed looks fully covered, built entirely out
+    of slack. Excluded from both sides of the ratio.
+    """
+    base = archive / "slack"
+    _build(base, "BAL", 1.0 - TORONTO_FAIR, tag="a")
+    root = base / "poll"
+    for index, delay in enumerate((2, 7)):
+        stamp = FIRST_PITCH + timedelta(minutes=delay)
+        _write(root, "odds", stamp.date().isoformat(), f"z{index}", [{
+            "payload": _odds_payload(FIRST_PITCH),
+            "error": None, "fetched_at": stamp,
+        }])
+
+    output = _run_probe(base)
+
+    assert "first-pitch slack (<=15 min)" in output
+    assert "Effectively no in-play coverage" in output
+    assert "first fifteen minutes" in output
+    assert "reachable with this feed" not in output
