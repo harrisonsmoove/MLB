@@ -331,6 +331,10 @@ sources:
       sports: "/sports"
       odds: "/sports/{sport}/odds"
       event_odds: "/sports/{sport}/events/{event_id}/odds"
+      # UNVERIFIED -- player props are requested per EVENT, not in bulk, so the
+      # event list is needed first. Settle the path, its cost, and whether this
+      # plan serves props at all with `mlb-edge probe-props --confirm`.
+      events: "/sports/{sport}/events"
       historical_odds: "/historical/sports/{sport}/odds"
     sport_key: baseball_mlb
     # Tier 0 (free) = moneyline only, forward archive, no historical backfill.
@@ -341,6 +345,17 @@ sources:
     markets_by_tier:
       0: [h2h]
       1: [h2h, spreads, totals, team_totals]
+    # UNVERIFIED -- every one of these is a GUESS at how this API spells the
+    # pitcher-strikeout prop, recorded here so the probe has something to try
+    # and so no other module mistakes a guess for a fact. `probe-props` asks
+    # the API to enumerate its own valid keys first and reports which of these
+    # exist, what they cost, and which books quote them. Replace this list with
+    # the measured answer and a `# measured <date>` comment.
+    prop_market_candidates:
+      - pitcher_strikeouts
+      - pitcher_strikeouts_alternate
+      - player_strikeouts
+      - batter_strikeouts
     rate_limit_per_minute: 10
     monthly_request_budget: 500     # free tier; the poller refuses to exceed it
 

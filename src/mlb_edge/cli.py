@@ -2136,6 +2136,217 @@ def probe_inplay(
     )
 
 
+@app.command("probe-props")
+def probe_props(
+    market: Annotated[str | None, typer.Option(help="Test only this market key.")] = None,
+    region: Annotated[str, typer.Option(help="Single region, to keep the cost to one unit.")] = "us",
+    cadence_minutes: Annotated[float, typer.Option(help="Polling cadence for the cost projection.")] = 15.0,
+    games_per_day: Annotated[float, typer.Option(help="Slate size for the cost projection.")] = 15.0,
+    root: Annotated[Path | None, typer.Option()] = None,
+    confirm: Annotated[bool, typer.Option(help="Actually spend the credits.")] = False,
+) -> None:
+    """Does this plan serve player props, and what does a strikeout line cost?
+
+    Two questions the documentation cannot answer for this account: whether the
+    plan includes props at all, and what one call actually bills. Both are in
+    the response -- the market keys in the body, the cost in the
+    `x-requests-remaining` delta -- so neither is taken on trust.
+
+    The market key is not assumed either. Step one sends a deliberately invalid
+    key, because an API that validates the parameter usually enumerates the
+    legal values in the error body, and that list is authoritative in a way a
+    guess never is. Only then are the configured candidates tried.
+
+    Props bill PER EVENT, not per slate, so the projection at the end is the
+    number that decides the pivot: one call for one game, multiplied out to a
+    season at your cadence, against the credits actually remaining.
+
+    Costs a handful of credits. Requires --confirm.
+    """
+    from mlb_edge.http import UpstreamError, client_for
+
+    settings = load_settings(root)
+    source = settings.source("odds")
+    sport = source.get("sport_key", "baseball_mlb")
+
+    candidates = (
+        [market] if market else list(source.get("prop_market_candidates") or [])
+    )
+    if not candidates:
+        console.print(
+            "[red]no candidate market keys.[/red] Set "
+            "odds.prop_market_candidates in settings.yaml, or pass --market."
+        )
+        raise typer.Exit(1)
+
+    if not confirm:
+        console.print(
+            f"Would test {len(candidates) + 1} request shapes against one event "
+            f"in region {region!r}: one invalid key to make the API list its "
+            f"legal values, then {', '.join(candidates)}.\n"
+            "Props bill per event, so the exact cost is unknown until measured "
+            "-- that is the point. Re-run with --confirm to spend it."
+        )
+        return
+
+    # Credentials and the client are only needed once we are actually spending,
+    # so the dry run above works on a box that has no key yet.
+    client = client_for(settings, "odds")
+    key = source.require("api_key")
+
+    def call(url: str, params: dict[str, Any]) -> tuple[int | None, str, Any]:
+        """``(remaining, note, parsed_body_or_none)`` for one request."""
+        try:
+            response = client.get(url, params={"apiKey": key, **params})
+        except UpstreamError as exc:
+            # The error BODY is the valuable part: an invalid market key or a
+            # plan restriction is usually spelled out there, and that text is
+            # authoritative where a guess is not.
+            return None, f"HTTP {exc.status}: {exc}", None
+        headers = {k.lower(): v for k, v in response.headers.items()}
+        remaining = None
+        with contextlib.suppress(TypeError, ValueError, KeyError):
+            remaining = int(headers["x-requests-remaining"])
+        used = headers.get("x-requests-used")
+        note = f"used={used} remaining={remaining}"
+        try:
+            return remaining, note, response.json()
+        except ValueError:
+            return remaining, note, None
+
+    # --- the event list, which props are addressed through -------------------
+    events_url = source.endpoint("events", sport=sport)
+    remaining, note, events = call(events_url, {})
+    console.print(f"\n[bold]events[/bold] {events_url}\n  {note}")
+    if not isinstance(events, list) or not events:
+        console.print(
+            "[red]no event list.[/red] Props are requested per event, so "
+            "nothing further can be measured. The note above is the reason."
+        )
+        raise typer.Exit(1)
+    baseline = remaining
+    console.print(f"  {len(events)} events listed")
+
+    event = events[0]
+    event_id = str(event.get("id"))
+    console.print(
+        f"  using {event.get('away_team')} @ {event.get('home_team')} "
+        f"({event.get('commence_time')})  id={event_id}"
+    )
+    odds_url = source.endpoint("event_odds", sport=sport, event_id=event_id)
+
+    # --- step one: let the API name its own legal market keys ---------------
+    _, invalid_note, _ = call(
+        odds_url, {"markets": "__probe_invalid_market__", "regions": region}
+    )
+    console.print(
+        "\n[bold]invalid-key probe[/bold] (asks the API to enumerate what it "
+        f"does accept)\n  {invalid_note}"
+    )
+    console.print(
+        "  [dim]Read that line carefully. If it lists market keys, THAT is the "
+        "authoritative spelling and the config candidates are guesses to "
+        "discard. If it mentions the plan or a subscription, props are not on "
+        "this tier.[/dim]"
+    )
+
+    # --- step two: the candidates -------------------------------------------
+    table = Table(title=f"strikeout prop candidates, one event, region={region}")
+    for column in ("market key", "credits", "books quoting", "sample line", "result"):
+        table.add_column(column, justify="right" if column == "credits" else "left")
+
+    measured: dict[str, int] = {}
+    for candidate in candidates:
+        before = baseline
+        remaining, note, body = call(
+            odds_url, {"markets": candidate, "regions": region}
+        )
+        cost = (before - remaining) if (before is not None and remaining is not None) else None
+        baseline = remaining if remaining is not None else baseline
+
+        books: list[str] = []
+        sample = ""
+        if isinstance(body, dict):
+            for bookmaker in body.get("bookmakers") or []:
+                if not isinstance(bookmaker, dict):
+                    continue
+                for mk in bookmaker.get("markets") or []:
+                    if not isinstance(mk, dict) or mk.get("key") != candidate:
+                        continue
+                    books.append(str(bookmaker.get("key")))
+                    outcomes = mk.get("outcomes") or []
+                    if outcomes and not sample and isinstance(outcomes[0], dict):
+                        first = outcomes[0]
+                        sample = (
+                            f"{first.get('description') or first.get('name')} "
+                            f"{first.get('name')} {first.get('point')} "
+                            f"@ {first.get('price')}"
+                        )
+        if books:
+            result = "[green]SERVED[/green]"
+            measured[candidate] = cost if cost is not None else 0
+        elif body is None:
+            result = f"[red]{note}[/red]"
+        else:
+            result = "[yellow]accepted, no book quoted it[/yellow]"
+        table.add_row(
+            candidate,
+            str(cost) if cost is not None else "?",
+            ", ".join(sorted(set(books))[:4]) or "-",
+            sample or "-",
+            result,
+        )
+    console.print(table)
+
+    if not measured:
+        console.print(
+            "\n[bold yellow]No candidate was served.[/bold yellow] Either this "
+            "plan does not include player props, or none of the guessed keys "
+            "is the right spelling. The invalid-key line above distinguishes "
+            "those two, and it is the only place that can: a plan message "
+            "means the tier is wrong, a list of keys means the guesses were.\n"
+            "Do not buy a tier on the strength of this output alone -- read "
+            "that error text first."
+        )
+        return
+
+    # --- what a season costs ------------------------------------------------
+    per_call = max(measured.values())
+    console.print(
+        f"\n[bold]Cost of props, measured[/bold] ({per_call} credits per event "
+        "per market per call)"
+    )
+    costs = Table()
+    for column in ("cadence", "credits/day", "credits/30 days", "vs remaining"):
+        costs.add_column(column, justify="right" if column != "cadence" else "left")
+    for minutes in sorted({cadence_minutes, 5.0, 15.0, 30.0, 60.0}):
+        daily = per_call * games_per_day * (24 * 60 / minutes)
+        monthly = daily * 30
+        verdict = (
+            "[red]over budget[/red]"
+            if baseline is not None and monthly > baseline
+            else "[green]fits[/green]"
+        )
+        costs.add_row(
+            f"every {minutes:.0f} min", f"{daily:,.0f}", f"{monthly:,.0f}", verdict
+        )
+    console.print(costs)
+    console.print(
+        f"  [dim]{games_per_day:.0f} games/day, one market, one region. Props "
+        "bill per EVENT, so this scales with the slate as well as the cadence "
+        "-- unlike the moneyline, where one call covered the whole board. "
+        "Credits remaining now: "
+        + (f"{baseline:,}" if baseline is not None else "unknown") + ".[/dim]"
+    )
+    console.print(
+        "\n[bold]Record the measured key and cost[/bold] in "
+        "config/settings.yaml, replacing prop_market_candidates with a "
+        "`# measured 2026-09-25` comment, and in "
+        "reports/props-feasibility.md. Per the provenance rule, a number this "
+        "decision rests on does not stay UNVERIFIED."
+    )
+
+
 @app.command("adverse-selection")
 def adverse_selection(
     reference: Annotated[str, typer.Option(help="Sharp book to price against.")] = "pinnacle",
